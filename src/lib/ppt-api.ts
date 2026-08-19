@@ -310,6 +310,77 @@ export interface ActionJobResponse {
   agent_run_id: string;
 }
 
+export type ModelRole = 'context' | 'svg' | 'search';
+export type SearchMode = 'bocha' | 'llm';
+export type ReaderMode = 'tavily' | 'firecrawl' | 'web_fetch';
+
+export interface ModelProvider {
+  provider_id: string;
+  name: string;
+  base_url: string;
+  model: string;
+  api_path: string;
+  timeout_seconds: number;
+  api_key_masked: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ModelBindingItem {
+  role: ModelRole;
+  label: string;
+  provider_id: string | null;
+  provider: ModelProvider | null;
+}
+
+export interface ModelBindingsResponse {
+  items: ModelBindingItem[];
+  needs_setup: boolean;
+}
+
+export interface SearchSettings {
+  mode: SearchMode;
+  bocha_configured: boolean;
+  bocha_auth_header_masked: string;
+  bocha_from_env: boolean;
+}
+
+export interface ReaderSettings {
+  mode: ReaderMode;
+  tavily_configured: boolean;
+  tavily_api_key_masked: string;
+  tavily_api_url: string;
+  tavily_from_env: boolean;
+  firecrawl_configured: boolean;
+  firecrawl_api_key_masked: string;
+  firecrawl_api_url: string;
+  firecrawl_from_env: boolean;
+  ready: boolean;
+}
+
+export interface ModelProviderPayload {
+  name: string;
+  base_url: string;
+  api_key?: string;
+  model: string;
+  api_path?: string;
+  timeout_seconds?: number;
+}
+
+export interface ModelTestResult {
+  ok: boolean;
+  latency_ms: number;
+  model: string;
+  detail?: string;
+}
+
+export interface ModelCatalogPayload {
+  base_url?: string;
+  api_key?: string;
+  provider_id?: string;
+  api_path?: string;
+}
+
 export interface ProjectEvent {
   stream_id: number;
   event_id: string;
@@ -378,8 +449,20 @@ export async function createProject(requestText: string, title?: string): Promis
   });
 }
 
+export async function deleteProject(projectId: string): Promise<{status: string; project_id: string}> {
+  return request<{status: string; project_id: string}>(`/projects/${projectId}`, {
+    method: 'DELETE',
+  });
+}
+
 export async function getProject(projectId: string): Promise<ProjectSummary> {
   return request<ProjectSummary>(`/projects/${projectId}`);
+}
+
+export async function retryBootstrap(projectId: string): Promise<ProjectSummary> {
+  return request<ProjectSummary>(`/projects/${projectId}/bootstrap:retry`, {
+    method: 'POST',
+  });
 }
 
 export async function listMessages(projectId: string): Promise<MessageListResponse> {
@@ -542,6 +625,92 @@ export async function runBatchAction(
   return request<ActionJobResponse>(`/projects/${projectId}/actions/batch`, {
     method: 'POST',
     body: JSON.stringify({action_type: actionType}),
+  });
+}
+
+export async function cancelProjectTasks(
+  projectId: string,
+  pageId?: string,
+): Promise<{status: string; canceled: number}> {
+  return request<{status: string; canceled: number}>(`/projects/${projectId}/tasks:cancel`, {
+    method: 'POST',
+    body: JSON.stringify(pageId ? {page_id: pageId} : {}),
+  });
+}
+
+export async function listModelProviders(): Promise<{items: ModelProvider[]}> {
+  return request<{items: ModelProvider[]}>('/settings/models');
+}
+
+export async function createModelProvider(payload: ModelProviderPayload): Promise<ModelProvider> {
+  return request<ModelProvider>('/settings/models', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function patchModelProvider(providerId: string, payload: ModelProviderPayload): Promise<ModelProvider> {
+  return request<ModelProvider>(`/settings/models/${providerId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteModelProvider(providerId: string): Promise<{status: string; provider_id: string}> {
+  return request<{status: string; provider_id: string}>(`/settings/models/${providerId}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function testModelProvider(providerId: string): Promise<ModelTestResult> {
+  return request<ModelTestResult>(`/settings/models/${providerId}/test`, {
+    method: 'POST',
+  });
+}
+
+export async function catalogRemoteModels(payload: ModelCatalogPayload): Promise<{items: string[]}> {
+  return request<{items: string[]}>('/settings/models:catalog', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getModelBindings(): Promise<ModelBindingsResponse> {
+  return request<ModelBindingsResponse>('/settings/model-bindings');
+}
+
+export async function putModelBindings(payload: Partial<Record<ModelRole, string | null>>): Promise<ModelBindingsResponse> {
+  return request<ModelBindingsResponse>('/settings/model-bindings', {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getSearchSettings(): Promise<SearchSettings> {
+  return request<SearchSettings>('/settings/search');
+}
+
+export async function putSearchSettings(payload: {mode?: SearchMode; bocha_auth_header?: string}): Promise<SearchSettings> {
+  return request<SearchSettings>('/settings/search', {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getReaderSettings(): Promise<ReaderSettings> {
+  return request<ReaderSettings>('/settings/reader');
+}
+
+export async function putReaderSettings(payload: {
+  mode?: ReaderMode;
+  tavily_api_key?: string;
+  tavily_api_url?: string;
+  firecrawl_api_key?: string;
+  firecrawl_api_url?: string;
+}): Promise<ReaderSettings> {
+  return request<ReaderSettings>('/settings/reader', {
+    method: 'PUT',
+    body: JSON.stringify(payload),
   });
 }
 

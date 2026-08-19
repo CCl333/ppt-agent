@@ -276,11 +276,17 @@ export function AgentActivityCard({
   accent = 'blue',
   onRecommendationClick,
   recommendationsDisabled = false,
+  onFailedRetry,
+  failedRetrying = false,
+  failedRetryLabel = '重试',
 }: {
   run: AgentRunView;
   accent?: 'blue' | 'emerald';
   onRecommendationClick?: (recommendation: AgentRecommendation) => void;
   recommendationsDisabled?: boolean;
+  onFailedRetry?: () => void;
+  failedRetrying?: boolean;
+  failedRetryLabel?: string;
 }) {
   const tone = getRunTone(run, accent);
   const visibleStepResults = run.live
@@ -372,6 +378,17 @@ export function AgentActivityCard({
       ) : null}
 
       {run.content_md ? <p className="text-sm text-slate-600 leading-relaxed whitespace-pre-wrap">{run.content_md}</p> : null}
+
+      {run.run_status === 'failed' && onFailedRetry ? (
+        <button
+          type="button"
+          disabled={failedRetrying || recommendationsDisabled}
+          onClick={onFailedRetry}
+          className="w-full rounded-xl border border-rose-200 bg-rose-50 px-3 py-3 text-left text-sm font-medium text-rose-700 transition-colors hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {failedRetrying ? '正在重新入队...' : failedRetryLabel}
+        </button>
+      ) : null}
 
       {run.next_recommendations.length ? (
         <div className="space-y-2">

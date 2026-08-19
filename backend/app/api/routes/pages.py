@@ -5,7 +5,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.schemas.api import BatchActionRequest, ExportCreateRequest, PageActionRequest, PageOutlinePatchRequest, SummaryPatchRequest
+from app.schemas.api import BatchActionRequest, CancelTasksRequest, ExportCreateRequest, PageActionRequest, PageOutlinePatchRequest, SummaryPatchRequest
 from app.services.orchestrator import PptAgentService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["pages"])
@@ -138,6 +138,15 @@ def run_batch_action(
     service: PptAgentService = Depends(get_service),
 ) -> dict:
     return service.queue_batch_action(project_id, payload.action_type)
+
+
+@router.post("/tasks:cancel")
+def cancel_project_tasks(
+    project_id: str,
+    payload: CancelTasksRequest,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.cancel_tasks(project_id, page_id=payload.page_id)
 
 
 @router.post("/exports")

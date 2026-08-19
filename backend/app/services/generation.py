@@ -6,6 +6,7 @@ from typing import Any
 
 from app.services.model_gateway import ModelGateway
 from app.services.prompt_contracts import get_prompt_text, render_prompt
+from app.services.svg import prepare_page_svg
 
 STYLE_PACKS: dict[str, dict[str, Any]] = {
     "minimalism": {
@@ -171,6 +172,43 @@ class GenerationService:
             "ai_questions": ai_questions,
         }
 
+    def refine_init_questions_with_retrieval(
+        self,
+        *,
+        project_title: str,
+        request_text: str,
+        latest_instruction: str,
+        current_questions: list[dict[str, Any]],
+        current_page_count_options: list[dict[str, Any]],
+        init_corpus_evidence: list[dict[str, Any]],
+        question_patch: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not init_corpus_evidence:
+            raise RuntimeError("init.question_refine_with_retrieval 缺少 init_corpus 证据")
+        result = self.models.context_json(
+            get_prompt_text("init.question_refine_with_retrieval.system"),
+            render_prompt(
+                "init.question_refine_with_retrieval.user",
+                {
+                    "project_title": project_title,
+                    "request_text": request_text,
+                    "latest_instruction": latest_instruction,
+                    "current_questions_json": current_questions,
+                    "current_page_count_options_json": current_page_count_options,
+                    "question_patch_json": question_patch or {},
+                    "init_corpus_evidence_json": init_corpus_evidence,
+                },
+            ),
+        )
+        ai_questions = self._normalize_questions(result.get("ai_questions"))
+        if not ai_questions:
+            raise RuntimeError("init.question_refine_with_retrieval 返回内容不完整")
+        page_count_options = self._normalize_page_count_options(result.get("page_count_options")) or current_page_count_options
+        return {
+            "page_count_options": page_count_options,
+            "ai_questions": ai_questions,
+        }
+
     def generate_outline(
         self,
         *,
@@ -331,7 +369,7 @@ class GenerationService:
 
     def generate_draft_svg(self, *, page_context: dict[str, Any]) -> str:
         summary = page_context["summary"]
-        return self.models.svg_text(
+        svg = self.models.svg_text(
             get_prompt_text("draft.page_generate.system"),
             render_prompt(
                 "draft.page_generate.user",
@@ -348,6 +386,7 @@ class GenerationService:
                 },
             ),
         )
+        return prepare_page_svg(svg)
 
     def generate_design_svg(
         self,
@@ -356,17 +395,23 @@ class GenerationService:
         style_pack_id: str,
         background_asset_path: str | None,
     ) -> str:
-        return self.models.svg_text(
+        svg = self.models.svg_text(
             get_prompt_text("design.svg_generate.system"),
             render_prompt(
                 "design.svg_generate.user",
                 {
                     "draft_svg_markup": draft_svg,
                     "style_pack_json": self.get_style_pack(style_pack_id),
-                    "background_asset_json": {"asset_path": background_asset_path} if background_asset_path else None,
+                    "background_asset_json": {
+                        "composited_by_system": True,
+                        "note": "系统会在 SVG 底层嵌入背景图。不要引用本地文件路径，不要再画一层全幅背景图，并保证正文不透明、可读。",
+                    }
+                    if background_asset_path
+                    else None,
                 },
             ),
         )
+        return prepare_page_svg(svg, background_path=background_asset_path)
 
     def get_style_pack(self, style_id: str | None) -> dict[str, Any]:
         if not style_id:

@@ -9,7 +9,7 @@ PROMPT_TEXTS: dict[str, str] = {
 你是 AI PPT 工作区的检索词生成器。
 
 任务：
-1. 根据给定作用域与目标，生成 3 到 6 条可直接用于联网搜索或向量检索的查询。
+1. 根据给定作用域与目标，生成 3 到 6 条可直接用于联网搜索的查询。
 2. 每条查询都必须说明用途。
 3. 只输出严格 JSON。
 
@@ -53,7 +53,7 @@ PROMPT_TEXTS: dict[str, str] = {
 
 任务：
 1. 只基于首轮 Bocha 搜索摘要，快速生成页数推荐和首轮补充问题。
-2. 不要假装已经读过全文或做过向量召回。
+2. 不要假装已经读过全文。
 3. 只输出严格 JSON。
 
 规则：
@@ -95,6 +95,60 @@ PROMPT_TEXTS: dict[str, str] = {
   "project_title": "{{project_title}}",
   "request_text": "{{request_text}}",
   "init_search_results": {{init_search_results_json}}
+}
+""".strip(),
+    "init.question_refine_with_retrieval.system": """
+你是 AI PPT 初始化阶段的问题修正器。
+
+任务：
+1. 根据用户最新要求和 init_corpus 召回证据，修订补充问题集合。
+2. 必须使用召回证据，不能只改写用户原话。
+3. 只输出严格 JSON。
+
+规则：
+1. 问题数量 2 到 4 个。
+2. 每个问题必须有恰好 3 个具体候选项，且允许用户自定义。
+3. 不要生成 style_preset 和背景图问题。
+4. 如果用户要求删除某个问题，结果里不要再保留它。
+5. 页数推荐可以沿用现有选项；只有证据明显要求调整时才改。
+
+输出格式：
+{
+  "page_count_options": [
+    {
+      "option_code": "A",
+      "label": "简洁版",
+      "page_count": 10,
+      "reason": "适合什么场景"
+    }
+  ],
+  "ai_questions": [
+    {
+      "question_code": "audience_focus",
+      "label": "这份 PPT 更要打动谁",
+      "description": "这个问题为什么重要",
+      "options": [
+        {"option_code": "A", "label": "管理层"},
+        {"option_code": "B", "label": "业务负责人"},
+        {"option_code": "C", "label": "执行团队"}
+      ],
+      "allow_custom": true
+    }
+  ]
+}
+""".strip(),
+    "init.question_refine_with_retrieval.user": """
+任务：结合 init_corpus 证据修订初始化问题。
+
+输入数据(JSON)：
+{
+  "project_title": "{{project_title}}",
+  "request_text": "{{request_text}}",
+  "latest_instruction": "{{latest_instruction}}",
+  "current_page_count_options": {{current_page_count_options_json}},
+  "current_questions": {{current_questions_json}},
+  "question_patch": {{question_patch_json}},
+  "init_corpus_evidence": {{init_corpus_evidence_json}}
 }
 """.strip(),
     "outline.generate.system": """
@@ -312,6 +366,8 @@ PROMPT_TEXTS: dict[str, str] = {
 11. 对于 `init_delete_question`，必须尽量填写 `data_updates.question_patch = {"mode": "delete", "question_code": "..."}`。
 12. 对于 `page_update_outline_in_search`，如果能直接提取 patch，也可以填写 `data_updates.page_patch`。
 13. 对于 `page_summary_edit`，如果能直接提取 patch，也可以填写 `data_updates.summary_patch`。
+14. `init_confirm_to_outline` 仅当 `ui_surface` 为 `init` 时允许返回；其他界面必须 `reject`，禁止用该动作回滚流程或重建页面。
+15. 批量动作、整页搜索、summary/draft/design、`outline_generate`、`init_refresh_search` 必须 `should_execute=true` 才会执行；否则只给建议。`requires_confirmation=true` 时不要执行。
 
 允许的 action_type：
 - init_refresh_search
@@ -319,7 +375,7 @@ PROMPT_TEXTS: dict[str, str] = {
 - init_update_question
 - init_delete_question
 - init_update_answer
-- init_confirm_to_outline
+- init_confirm_to_outline  # 仅 ui_surface=init
 - outline_generate
 - page_update_outline_in_search
 - page_generate_search_queries
@@ -413,6 +469,8 @@ Bento Grid 规则：
     - 混合网格：自由组合不同尺寸卡片以适配异构内容。
 14. 每张卡片都必须承担明确内容职责：结论、解释、数据、案例、图示或补充信息；不要为了“看起来像 Bento”而生成无意义装饰卡。
 15. 避免这些坏味道：所有卡片同尺寸、平均分配主次、卡片过小导致文本挤压、为了对称牺牲信息层级、页面还有大片未利用空间。
+16. 画布必须是 `viewBox="0 0 1280 720"`。
+17. 所有 `<text>` / `<tspan>` 必须设置 `font-family` 为 `"Microsoft YaHei", "PingFang SC", "Noto Sans SC", "Source Han Sans SC", sans-serif`，不要只用 `sans-serif`。
 """.strip(),
     "draft.page_generate.user": """
 任务：生成目标页初稿。
@@ -444,8 +502,10 @@ Bento Grid 规则：
 任务：
 1. 在不修改文案、布局主次和阅读顺序的前提下，对 draft SVG 做视觉增强。
 2. 只输出单个完整 `<svg>...</svg>` 文档。
-3. 背景资源只能做底层氛围处理，不能压住正文。
-4. 如果风格表达与内容可读性冲突，优先保留内容可读性。
+3. 画布必须保持 `viewBox="0 0 1280 720"`。
+4. 所有 `<text>` / `<tspan>` 必须设置 `font-family` 为 `"Microsoft YaHei", "PingFang SC", "Noto Sans SC", "Source Han Sans SC", sans-serif`。
+5. 背景资源由系统在 SVG 底层合成，不要引用本地文件路径，也不要再画一层全幅背景图；正文必须不透明、可读。
+6. 如果风格表达与内容可读性冲突，优先保留内容可读性。
 """.strip(),
     "design.svg_generate.user": """
 任务：生成目标页最终 SVG 设计稿。

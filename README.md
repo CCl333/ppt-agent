@@ -2,7 +2,7 @@
 
 PPT Agent 是一个面向 AI PPT 生成的工作台项目。它不是简单把一段提示词丢给模型然后吐出几页 SVG，而是把项目初始化、资料搜索、页级研究、初稿生成、设计稿生成和 PPTX 导出串成一条可观察、可干预、可回放的 agent workflow。
 
-通过联网搜索（bocha） + 向量化产出 SVG 完成整个PPT的产出，可以通过新版本 PPT 进行转换成形状进行编辑。 
+通过联网搜索（Bocha/Jina）整理页级资料，再生成 SVG 初稿与设计稿，最后导出可在新版本 PowerPoint 中转换为形状编辑的 PPTX。
 
 当前仓库包含两部分：
 
@@ -60,8 +60,8 @@ PPT Agent 是一个面向 AI PPT 生成的工作台项目。它不是简单把�
 
 - 前端：React 19、TypeScript、Vite 6、Tailwind CSS 4
 - 后端：FastAPI、SQLAlchemy、Pydantic Settings、SSE、python-pptx
-- 模型与检索：OpenAI 兼容接口、Embedding、Bocha/Jina/MCP 检索链路
-- 存储：PostgreSQL + pgvector 为推荐方案；也支持 SQLite 本地启动
+- 模型与检索：OpenAI 兼容接口、Bocha/Jina MCP 检索；页级证据按资料池排序截取，不再使用向量检索
+- 存储：默认 SQLite；也支持 PostgreSQL
 
 ## 目录结构
 
@@ -82,10 +82,9 @@ ppt/
 
 - Node.js 20+
 - Python 3.11+
-- 推荐：PostgreSQL 15+、`pgvector`
-- 可选：Redis
+- 可选：PostgreSQL 15+
 
-如果你只是本地快速跑通，可以直接用 SQLite；如果要跑完整向量检索链路，建议使用 PostgreSQL。
+如果你只是本地快速跑通，可以直接用 SQLite（默认）。
 
 ### 2. 配置环境变量
 
@@ -98,9 +97,8 @@ Copy-Item .env.example .env
 最关键的配置项有这些：
 
 - `DATABASE_URL`：数据库连接串。最简本地模式可改成 `sqlite:///./backend/data/ppt_agent.db`
-- `CONTEXT_LLM_API_KEY`：文本模型 API Key
+- `CONTEXT_LLM_API_KEY`：文本模型 API Key（首次启动灌入模型库）
 - `SVG_LLM_API_KEY`：SVG 生成模型 API Key
-- `EMBEDDING_API_KEY`：向量模型 API Key
 - `MCP_BOCHA_URL` / `MCP_BOCHA_AUTH_HEADER`：Bocha 检索服务
 - `MCP_JINA_URL` / `MCP_JINA_AUTH_HEADER`：Jina 检索服务
 
@@ -146,14 +144,12 @@ $env:VITE_API_PROXY_TARGET="http://your-backend-host:8000"
 
 - 项目当前前端工作台位于 `src/`，`static/` 是旧版 POC，只适合作为 UI 参考，不是主入口。
 - 后端任务默认通过本地后台线程异步执行，前端通过 SSE 接收事件流并刷新状态。
-- 如果你需要先理解业务边界，不要直接猜，先看 [docs/README.md](docs/README.md)。
-- 如果你只关心后端接口与链路，先看 [backend/README.md](backend/README.md)。
+- 业务边界与分阶段计划见 [docs/开发文档.md](docs/开发文档.md)。
+- 后端接口与主链路见 [backend/README.md](backend/README.md)。
 
 ## 文档索引
 
-- [docs/README.md](docs/README.md)：整体文档入口
-- [docs/final-target-agent-workflow.md](docs/final-target-agent-workflow.md)：目标工作流与约束
-- [docs/08-backend-technical-roadmap.md](docs/08-backend-technical-roadmap.md)：后端技术路线
+- [docs/开发文档.md](docs/开发文档.md)：当前开发约束与分阶段计划
 - [backend/README.md](backend/README.md)：当前后端接口与主链路说明
 
 ## 🙏 致谢

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager
 from typing import Generator
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -64,12 +63,15 @@ def get_engine() -> Engine:
         connect_args: dict[str, object] = {}
         if settings.database_url.startswith("sqlite"):
             connect_args["check_same_thread"] = False
+            connect_args["timeout"] = 10
         _ENGINE = create_engine(
             settings.database_url,
             future=True,
             pool_pre_ping=True,
             connect_args=connect_args,
         )
+        if settings.database_url.startswith("sqlite"):
+            event.listen(_ENGINE, "connect", _configure_sqlite)
     return _ENGINE
 
 
@@ -109,10 +111,11 @@ def session_scope() -> Generator[Session, None, None]:
 
 def init_db() -> None:
     engine = get_engine()
-    _ensure_pgvector(engine)
     Base.metadata.create_all(bind=engine)
     _apply_schema_upgrades(engine)
-    _relax_pgvector_dimensions(engine)
+    from app.services.model_settings import seed_models_from_env
+
+    seed_models_from_env()
 
 
 def reset_db_state() -> None:
@@ -123,14 +126,19 @@ def reset_db_state() -> None:
     _SESSION_FACTORY = None
 
 
-def _ensure_pgvector(engine: Engine) -> None:
-    if engine.dialect.name != "postgresql":
-        return
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-    except Exception:
-        os.environ["PPT_DISABLE_PGVECTOR"] = "1"
+def is_sqlite_locked(exc: BaseException) -> bool:
+    original = getattr(exc, "orig", None)
+    text = f"{original or exc}".lower()
+    return "database is locked" in text or "database table is locked" in text
+
+
+def _configure_sqlite(dbapi_connection, _) -> None:
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA busy_timeout=10000")
+    cursor.close()
 
 
 def _apply_schema_upgrades(engine: Engine) -> None:
@@ -144,26 +152,3 @@ def _apply_schema_upgrades(engine: Engine) -> None:
                 if column_name in existing:
                     continue
                 conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}"))
-
-
-def _relax_pgvector_dimensions(engine: Engine) -> None:
-    if engine.dialect.name != "postgresql" or os.getenv("PPT_DISABLE_PGVECTOR") == "1":
-        return
-
-    query = text(
-        """
-        SELECT format_type(a.atttypid, a.atttypmod) AS column_type
-        FROM pg_attribute a
-        JOIN pg_class c ON a.attrelid = c.oid
-        JOIN pg_namespace n ON c.relnamespace = n.oid
-        WHERE c.relname = 'source_chunks'
-          AND a.attname = 'embedding'
-          AND a.attnum > 0
-          AND NOT a.attisdropped
-        LIMIT 1
-        """
-    )
-    with engine.begin() as conn:
-        column_type = conn.execute(query).scalar()
-        if isinstance(column_type, str) and column_type.startswith("vector("):
-            conn.execute(text("ALTER TABLE source_chunks ALTER COLUMN embedding TYPE vector USING embedding::vector"))

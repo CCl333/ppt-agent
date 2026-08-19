@@ -1,0 +1,55 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    container_name: ppt-agent-backend
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      APP_ENV: local
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+      APP_DEBUG: "true"
+      API_PREFIX: /api/v1
+      CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      DATABASE_URL: sqlite:////data/ppt_agent.db
+      FILE_STORAGE_ROOT: /app/storage
+      UPLOAD_DIR: uploads
+      BACKGROUND_DIR: backgrounds
+      EXPORT_DIR: exports
+      TASK_WORKER_ENABLED: "true"
+      TASK_WORKER_COUNT: "2"
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      TAVILY_API_URL: ${TAVILY_API_URL:-https://api.tavily.com}
+      FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
+      FIRECRAWL_API_URL: ${FIRECRAWL_API_URL:-https://api.firecrawl.dev/v2}
+    volumes:
+      - ppt-db:/data
+      - ppt-storage:/app/storage
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    container_name: ppt-agent-frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+
+volumes:
+  ppt-db:
+  ppt-storage:

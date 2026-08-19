@@ -18,7 +18,6 @@ class Settings(BaseSettings):
         default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"]
     )
     database_url: str = "sqlite:///./backend/data/ppt_agent.db"
-    redis_url: str | None = None
     file_storage_root: Path = Path("backend/data")
     upload_dir: str = "uploads"
     background_dir: str = "backgrounds"
@@ -28,21 +27,13 @@ class Settings(BaseSettings):
     context_llm_api_key: SecretStr | None = None
     context_llm_model: str = "gpt-4o-mini"
     context_llm_path: str = "/chat/completions"
-    context_llm_stream: bool = False
     context_llm_timeout_seconds: int = 60
 
     svg_llm_base_url: str | None = None
     svg_llm_api_key: SecretStr | None = None
     svg_llm_model: str = "gpt-4o-mini"
     svg_llm_path: str = "/chat/completions"
-    svg_llm_stream: bool = False
     svg_llm_timeout_seconds: int = 60
-
-    embedding_base_url: str | None = None
-    embedding_api_key: SecretStr | None = None
-    embedding_model: str = "text-embedding-3-small"
-    embedding_path: str = "/embeddings"
-    embedding_timeout_seconds: int = 60
 
     mcp_bocha_url: str | None = None
     mcp_bocha_auth_header: str | None = None
@@ -51,12 +42,18 @@ class Settings(BaseSettings):
     mcp_jina_auth_header: str | None = None
     mcp_firecrawl_url: str | None = None
     mcp_markitdown_url: str | None = None
+    tavily_api_key: str | None = None
+    tavily_api_url: str | None = None
+    firecrawl_api_key: str | None = None
+    firecrawl_api_url: str | None = None
 
     max_research_concurrency: int = 4
-    max_embedding_concurrency: int = 4
-    max_render_concurrency: int = 2
     event_stream_replay_limit: int = 100
     run_jobs_inline: bool = False
+    task_worker_enabled: bool = True
+    task_worker_count: int = 2
+    task_lease_seconds: int = 180
+    task_poll_interval_ms: int = 400
 
     model_config = SettingsConfigDict(
         env_file=".env",

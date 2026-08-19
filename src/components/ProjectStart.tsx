@@ -21,6 +21,7 @@ import {
   getRequirementForm,
   listMessages,
   retryInitSearchResult,
+  retryBootstrap,
   submitRequirementAnswers,
   uploadBackground,
   type InitSearchResult,
@@ -171,6 +172,7 @@ export default function ProjectStart({
   const [isConfirming, setIsConfirming] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [retryingSourceIds, setRetryingSourceIds] = useState<Record<string, boolean>>({});
+  const [isRetryingBootstrap, setIsRetryingBootstrap] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const questions = useMemo(() => form?.ai_questions ?? [], [form]);
@@ -422,6 +424,32 @@ export default function ProjectStart({
         return next;
       });
     }
+  };
+
+  const handleRetryBootstrap = async () => {
+    if (isRetryingBootstrap || isBootstrapRunning) {
+      return;
+    }
+    setIsRetryingBootstrap(true);
+    try {
+      const nextProject = await retryBootstrap(project.project_id);
+      onProjectUpdated(nextProject);
+      const formResponse = await getRequirementForm(project.project_id);
+      setForm(formResponse.requirement_form);
+      setError(null);
+    } catch (caughtError) {
+      setError(getErrorMessage(caughtError, '重试初始化失败'));
+    } finally {
+      setIsRetryingBootstrap(false);
+    }
+  };
+
+  const handleRecommendation = (recommendation: {code: string; label: string}) => {
+    if (recommendation.code === 'refresh_init_search') {
+      void handleRetryBootstrap();
+      return;
+    }
+    void sendMessage(recommendation.label);
   };
 
   const sendMessage = async (content: string, options?: { clearInput?: boolean }) => {
@@ -761,10 +789,13 @@ export default function ProjectStart({
                 <div key={item.key} className="flex justify-start">
                   <AgentActivityCard
                     run={item.run}
-                    onRecommendationClick={(recommendation) => {
-                      void sendMessage(recommendation.label);
+                    onRecommendationClick={handleRecommendation}
+                    recommendationsDisabled={isSendingMessage || isRetryingBootstrap}
+                    onFailedRetry={() => {
+                      void handleRetryBootstrap();
                     }}
-                    recommendationsDisabled={isSendingMessage}
+                    failedRetrying={isRetryingBootstrap}
+                    failedRetryLabel="重试初始化搜索"
                   />
                 </div>
               ) : item.message.role === 'user' ? (
@@ -778,10 +809,13 @@ export default function ProjectStart({
                   {agentRunFromMessage(item.message) ? (
                     <AgentActivityCard
                       run={{...agentRunFromMessage(item.message)!, content_md: item.message.content_md}}
-                      onRecommendationClick={(recommendation) => {
-                        void sendMessage(recommendation.label);
+                      onRecommendationClick={handleRecommendation}
+                      recommendationsDisabled={isSendingMessage || isRetryingBootstrap}
+                      onFailedRetry={() => {
+                        void handleRetryBootstrap();
                       }}
-                      recommendationsDisabled={isSendingMessage}
+                      failedRetrying={isRetryingBootstrap}
+                      failedRetryLabel="重试初始化搜索"
                     />
                   ) : (
                     <div className="w-full max-w-[95%] space-y-3 rounded-2xl rounded-tl-sm border border-slate-200 bg-white px-5 py-4 shadow-sm">
@@ -882,8 +916,12 @@ export default function ProjectStart({
                     type="button"
                     key={item.code}
                     title={item.reason}
-                    disabled={isSendingMessage}
+                    disabled={isSendingMessage || isRetryingBootstrap || isBootstrapRunning}
                     onClick={() => {
+                      if (item.code === 'refresh_init_search') {
+                        void handleRetryBootstrap();
+                        return;
+                      }
                       void sendMessage(item.label);
                     }}
                     className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-600 transition-colors hover:border-blue-300 hover:bg-blue-50 hover:text-blue-700 disabled:cursor-not-allowed disabled:opacity-50"

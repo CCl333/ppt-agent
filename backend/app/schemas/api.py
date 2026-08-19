@@ -93,3 +93,52 @@ class BatchActionRequest(BaseModel):
 
 class ExportCreateRequest(BaseModel):
     export_format: str = "pptx"
+
+
+class CancelTasksRequest(BaseModel):
+    page_id: str | None = None
+
+
+class ModelProviderCreateRequest(BaseModel):
+    name: str = Field(min_length=1)
+    base_url: str = Field(min_length=1)
+    api_key: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    api_path: str = "/chat/completions"
+    timeout_seconds: int = Field(default=120, ge=5, le=600)
+
+
+class ModelProviderPatchRequest(BaseModel):
+    name: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+    api_path: str | None = None
+    timeout_seconds: int | None = Field(default=None, ge=5, le=600)
+
+
+class ModelBindingsPutRequest(BaseModel):
+    context: str | None = None
+    svg: str | None = None
+    search: str | None = None
+
+
+class SearchSettingsPutRequest(BaseModel):
+    mode: str | None = None
+    bocha_auth_header: str | None = None
+
+
+class ReaderSettingsPutRequest(BaseModel):
+    mode: str | None = None
+    tavily_api_key: str | None = None
+    tavily_api_url: str | None = None
+    firecrawl_api_key: str | None = None
+    firecrawl_api_url: str | None = None
+
+
+class ModelCatalogRequest(BaseModel):
+    base_url: str | None = None
+    api_key: str | None = None
+    provider_id: str | None = None
+    api_path: str = "/chat/completions"
+    timeout_seconds: int = Field(default=30, ge=5, le=120)

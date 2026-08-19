@@ -1,22 +1,20 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
+import time
 import zipfile
-from xml.etree import ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, UploadFile, status
-from pptx.opc.package import Part
-from pptx.util import Emu
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.db import session_scope
+from app.core.db import is_sqlite_locked, session_scope
 from app.models.base import new_id
 from app.models.entities import (
     DesignVersion,
@@ -30,10 +28,22 @@ from app.models.entities import (
     RequirementForm,
     ResearchSession,
 )
-from app.services.background import dispatcher
 from app.services.events import append_event
+from app.services.tasks import (
+    cancel_tasks as request_task_cancel,
+    enqueue_batch_action,
+    enqueue_page_action,
+    enqueue_project_task,
+    wake_scheduler,
+)
 from app.services.generation import GenerationService
 from app.services.research import ResearchService
+from app.services.flows.batch_flow import BatchFlowMixin
+from app.services.flows.init_flow import InitFlowMixin
+from app.services.flows.outline_flow import OutlineFlowMixin
+from app.services.flows.page_flow import PageFlowMixin
+from app.services.export import build_pptx
+from app.services.flows.router_flow import RouterFlowMixin
 
 PAGE_STATUS_VALUES = {"empty", "ready", "running", "confirmed", "stale", "failed"}
 PROJECT_STAGE_ORDER = {
@@ -43,6 +53,19 @@ PROJECT_STAGE_ORDER = {
     "draft": 3,
     "design": 4,
     "export": 5,
+}
+_GATED_EXECUTE_ACTIONS = {
+    "init_refresh_search",
+    "outline_generate",
+    "page_search_run",
+    "page_search_refresh",
+    "page_summary_generate",
+    "page_draft_generate",
+    "page_design_generate",
+    "project_batch_search",
+    "project_batch_summary",
+    "project_batch_draft",
+    "project_batch_design",
 }
 WORKFLOW_CONSTRAINTS = [
     {
@@ -77,56 +100,11 @@ WORKFLOW_CONSTRAINTS = [
     },
 ]
 
-SVG_IMAGE_CONTENT_TYPE = "image/svg+xml"
-
-
-class SvgImagePart(Part):
-    def __init__(
-        self,
-        *,
-        partname,
-        package,
-        blob: bytes,
-        filename: str,
-        width_px: float,
-        height_px: float,
-    ) -> None:
-        super().__init__(partname, SVG_IMAGE_CONTENT_TYPE, package, blob)
-        self._filename = filename
-        self._width_px = width_px
-        self._height_px = height_px
-        self._sha1 = hashlib.sha1(blob).hexdigest()
-
-    @property
-    def desc(self) -> str:
-        return self._filename
-
-    @property
-    def ext(self) -> str:
-        return "svg"
-
-    @property
-    def sha1(self) -> str:
-        return self._sha1
-
-    def scale(self, scaled_cx: int | None, scaled_cy: int | None) -> tuple[int, int]:
-        native_cx, native_cy = self._native_size
-
-        if scaled_cx and scaled_cy:
-            return scaled_cx, scaled_cy
-        if scaled_cx and not scaled_cy:
-            return scaled_cx, int(round(native_cy * (scaled_cx / native_cx)))
-        if scaled_cy and not scaled_cx:
-            return int(round(native_cx * (scaled_cy / native_cy))), scaled_cy
-        return native_cx, native_cy
-
-    @property
-    def _native_size(self) -> tuple[int, int]:
-        emu_per_inch = 914400
-        # SVG 像素按 CSS 规则处理，1px = 1/96in。
-        width = int(emu_per_inch * self._width_px / 96)
-        height = int(emu_per_inch * self._height_px / 96)
-        return Emu(width), Emu(height)
+BACKGROUND_MAX_BYTES = 8 * 1024 * 1024
+_STORAGE_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -324,7 +302,7 @@ class AgentRunRecorder:
         self._commit()
 
 
-class PptAgentService:
+class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowMixin, RouterFlowMixin):
     def __init__(self, session: Session):
         self.session = session
         self.settings = get_settings()
@@ -334,6 +312,36 @@ class PptAgentService:
     def list_projects(self, limit: int = 20) -> list[dict[str, Any]]:
         stmt = select(Project).order_by(Project.updated_at.desc()).limit(limit)
         return [self.serialize_project(item) for item in self.session.scalars(stmt)]
+
+    def delete_project(self, project_id: str) -> dict[str, Any]:
+        project = self._require_project(project_id)
+        self._purge_project_files(project)
+        try:
+            request_task_cancel(self.session, project_id=project.id)
+            self.session.flush()
+        except OperationalError as exc:
+            if not is_sqlite_locked(exc):
+                raise
+            self.session.rollback()
+        delay = 0.2
+        last_error: OperationalError | None = None
+        for _ in range(6):
+            try:
+                self.session.expunge_all()
+                self.session.execute(delete(Project).where(Project.id == project_id))
+                self.session.commit()
+                return {"status": "deleted", "project_id": project_id}
+            except OperationalError as exc:
+                last_error = exc
+                self.session.rollback()
+                if not is_sqlite_locked(exc):
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 1.5, 1.2)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="项目正在处理中，暂时无法删除，请稍后再试。",
+        ) from last_error
 
     def create_project(self, title: str | None, request_text: str) -> dict[str, Any]:
         project = Project(
@@ -370,8 +378,22 @@ class PptAgentService:
             scope_type="project",
             payload={"title": project.title},
         )
+        enqueue_project_task(self.session, project_id=project.id, task_type="bootstrap")
         self.session.commit()
-        dispatcher.dispatch(run_bootstrap_job, project.id)
+        wake_scheduler()
+        return self.serialize_project(project)
+
+    def retry_bootstrap(self, project_id: str) -> dict[str, Any]:
+        project = self._require_project(project_id)
+        if project.current_stage != "init":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="当前不在初始化阶段，不能重试初始化搜索")
+        form = project.requirement_form
+        if form is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="需求单不存在")
+        form.status = "running"
+        enqueue_project_task(self.session, project_id=project.id, task_type="bootstrap")
+        self.session.commit()
+        wake_scheduler()
         return self.serialize_project(project)
 
     def get_project(self, project_id: str) -> dict[str, Any]:
@@ -409,8 +431,14 @@ class PptAgentService:
                 "attachments": attachments,
             },
         )
+        enqueue_project_task(
+            self.session,
+            project_id=project.id,
+            task_type="message",
+            task_context={"message_id": message.id},
+        )
         self.session.commit()
-        dispatcher.dispatch(run_message_job, message.id)
+        wake_scheduler()
         return self.serialize_message(message)
 
     def get_requirement_form(self, project_id: str) -> dict[str, Any]:
@@ -578,10 +606,25 @@ class PptAgentService:
 
     def confirm_requirements(self, project_id: str, note_md: str | None = None) -> dict[str, Any]:
         project = self._require_project(project_id)
+        if project.current_stage != "init":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="项目已进入后续阶段，不能重新确认需求",
+            )
         requirement_form = self._require_requirement_form(project)
         self._validate_requirement_form(project, requirement_form)
         if note_md:
             requirement_form.latest_instruction = note_md
+        cas = self.session.execute(
+            update(Project)
+            .where(Project.id == project.id, Project.current_stage == "init")
+            .values(current_stage="outline")
+        )
+        if cas.rowcount != 1:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="项目已进入后续阶段，不能重新确认需求",
+            )
         project.current_stage = "outline"
         append_event(
             self.session,
@@ -591,16 +634,29 @@ class PptAgentService:
             scope_type="project",
             payload={"project_id": project.id},
         )
+        enqueue_project_task(self.session, project_id=project.id, task_type="outline")
         self.session.commit()
-        dispatcher.dispatch(run_outline_job, project.id)
+        wake_scheduler()
         return self.serialize_project(project)
 
     def upload_background(self, project_id: str, file: UploadFile) -> dict[str, Any]:
         project = self._require_project(project_id)
-        suffix = Path(file.filename or "background.bin").suffix or ".bin"
-        target = self.settings.background_path / f"{project_id}{suffix}"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(file.file.read())
+        payload = _read_upload_limited(file, BACKGROUND_MAX_BYTES)
+        suffix = _detect_background_suffix(payload)
+        if suffix is None:
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="仅支持 png/jpeg/webp/gif 背景图",
+            )
+        asset_id = _safe_storage_id(project.id)
+        target_dir = self.settings.background_path
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if project.background_asset_path:
+            Path(project.background_asset_path).unlink(missing_ok=True)
+        for stale in target_dir.glob(f"{asset_id}.*"):
+            stale.unlink(missing_ok=True)
+        target = target_dir / f"{asset_id}{suffix}"
+        target.write_bytes(payload)
         project.background_asset_path = str(target)
         requirement_form = self._require_requirement_form(project)
         answers = dict(requirement_form.answers_json or {})
@@ -801,14 +857,39 @@ class PptAgentService:
     ) -> dict[str, Any]:
         self._require_page(project_id, page_id)
         agent_run_id = new_id()
-        dispatcher.dispatch(run_page_action_job, project_id, page_id, action_type, agent_run_id, replace_existing)
-        return {"status": "queued", "agent_run_id": agent_run_id}
+        task = enqueue_page_action(
+            self.session,
+            project_id=project_id,
+            page_id=page_id,
+            action_type=action_type,
+            agent_run_id=agent_run_id,
+            replace_existing=replace_existing,
+            priority=100,
+        )
+        self.session.commit()
+        wake_scheduler()
+        return {"status": "queued", "agent_run_id": agent_run_id, "task_id": task.task_id}
 
     def queue_batch_action(self, project_id: str, action_type: str) -> dict[str, Any]:
         self._require_project(project_id)
         agent_run_id = new_id()
-        dispatcher.dispatch(run_batch_action_job, project_id, action_type, agent_run_id)
-        return {"status": "queued", "agent_run_id": agent_run_id}
+        tasks = enqueue_batch_action(
+            self.session,
+            project_id=project_id,
+            action_type=action_type,
+            agent_run_id=agent_run_id,
+        )
+        self.session.commit()
+        wake_scheduler()
+        return {"status": "queued", "agent_run_id": agent_run_id, "task_ids": [item.task_id for item in tasks]}
+
+    def cancel_tasks(self, project_id: str, page_id: str | None = None) -> dict[str, Any]:
+        self._require_project(project_id)
+        if page_id:
+            self._require_page(project_id, page_id)
+        canceled = request_task_cancel(self.session, project_id=project_id, page_id=page_id)
+        self.session.commit()
+        return {"status": "canceled", "canceled": canceled}
 
     def get_page_draft(self, project_id: str, page_id: str) -> dict[str, Any]:
         page = self._require_page(project_id, page_id)
@@ -1044,6 +1125,23 @@ class PptAgentService:
         if not project:
             raise HTTPException(status_code=404, detail="项目不存在")
         return project
+
+    def _purge_project_files(self, project: Project) -> None:
+        asset_id = project.id.lower()
+        candidates: list[Path] = []
+        if project.background_asset_path:
+            candidates.append(Path(project.background_asset_path))
+        for directory in (self.settings.background_path, self.settings.export_path, self.settings.upload_path):
+            if not directory.exists():
+                continue
+            candidates.extend(directory.glob(f"{asset_id}.*"))
+        seen: set[Path] = set()
+        for path in candidates:
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            path.unlink(missing_ok=True)
 
     def _require_requirement_form(self, project: Project) -> RequirementForm:
         if not project.requirement_form:
@@ -1291,37 +1389,9 @@ class PptAgentService:
 
     def _build_export_pptx(self, project: Project) -> Path:
         exportables = self._collect_exportable_designs(project.id)
-        from pptx import Presentation
-
-        presentation = Presentation()
-        slide_width_emu, slide_height_emu = self._presentation_size_from_svg(exportables[0][1].design_svg_markup)
-        presentation.slide_width = slide_width_emu
-        presentation.slide_height = slide_height_emu
-        blank_layout = presentation.slide_layouts[6]
-        svg_part_cache: dict[str, SvgImagePart] = {}
-
-        for page, design in exportables:
-            slide = presentation.slides.add_slide(blank_layout)
-            left, top, width, height = self._fit_picture_to_slide(
-                slide_width_emu=slide_width_emu,
-                slide_height_emu=slide_height_emu,
-                svg_markup=design.design_svg_markup,
-            )
-            self._add_svg_picture(
-                slide=slide,
-                svg_markup=design.design_svg_markup,
-                filename=f"{page.page_code}.svg",
-                left=left,
-                top=top,
-                width=width,
-                height=height,
-                cache=svg_part_cache,
-            )
-
+        slides = [(page.page_code, design.design_svg_markup) for page, design in exportables]
         export_path = self.settings.export_path / f"{project.id}.pptx"
-        export_path.parent.mkdir(parents=True, exist_ok=True)
-        presentation.save(str(export_path))
-        return export_path
+        return build_pptx(slides, export_path)
 
     def _collect_exportable_designs(self, project_id: str) -> list[tuple[ProjectPage, DesignVersion]]:
         pages = list(
@@ -1352,112 +1422,6 @@ class PptAgentService:
     def _page_export_title(self, page: ProjectPage) -> str:
         brief = self._get_current_brief(page)
         return brief.title if brief and brief.title.strip() else page.page_code
-
-    def _add_svg_picture(
-        self,
-        *,
-        slide: Any,
-        svg_markup: str,
-        filename: str,
-        left: int,
-        top: int,
-        width: int,
-        height: int,
-        cache: dict[str, SvgImagePart],
-    ) -> None:
-        from pptx.opc.constants import RELATIONSHIP_TYPE as RT
-
-        svg_part = self._get_or_add_svg_part(
-            package=slide.part.package,
-            svg_markup=svg_markup,
-            filename=filename,
-            cache=cache,
-        )
-        relationship_id = slide.part.relate_to(svg_part, RT.IMAGE)
-        shape_id = slide.shapes._next_shape_id
-        slide.shapes._grpSp.add_pic(shape_id, f"Picture {shape_id - 1}", filename, relationship_id, left, top, width, height)
-        slide.shapes._recalculate_extents()
-
-    def _get_or_add_svg_part(
-        self,
-        *,
-        package: Any,
-        svg_markup: str,
-        filename: str,
-        cache: dict[str, SvgImagePart],
-    ) -> SvgImagePart:
-        svg_blob = svg_markup.encode("utf-8")
-        content_hash = hashlib.sha1(svg_blob).hexdigest()
-        existing = cache.get(content_hash)
-        if existing:
-            return existing
-
-        width_px, height_px = self._extract_svg_canvas_size(svg_markup)
-        svg_part = SvgImagePart(
-            partname=package.next_image_partname("svg"),
-            package=package,
-            blob=svg_blob,
-            filename=filename,
-            width_px=width_px,
-            height_px=height_px,
-        )
-        cache[content_hash] = svg_part
-        return svg_part
-
-    def _presentation_size_from_svg(self, svg_markup: str) -> tuple[int, int]:
-        width_px, height_px = self._extract_svg_canvas_size(svg_markup)
-        aspect_ratio = width_px / height_px if width_px and height_px else 16 / 9
-        slide_width_inch = 13.333333
-        slide_height_inch = slide_width_inch / aspect_ratio if aspect_ratio > 0 else 7.5
-        return Emu(int(slide_width_inch * 914400)), Emu(int(slide_height_inch * 914400))
-
-    def _fit_picture_to_slide(self, *, slide_width_emu: int, slide_height_emu: int, svg_markup: str) -> tuple[int, int, int, int]:
-        width_px, height_px = self._extract_svg_canvas_size(svg_markup)
-        if not width_px or not height_px:
-            return 0, 0, slide_width_emu, slide_height_emu
-        width_scale = slide_width_emu / width_px
-        height_scale = slide_height_emu / height_px
-        scale = min(width_scale, height_scale)
-        width = int(width_px * scale)
-        height = int(height_px * scale)
-        left = int((slide_width_emu - width) / 2)
-        top = int((slide_height_emu - height) / 2)
-        return left, top, width, height
-
-    def _extract_svg_canvas_size(self, svg_markup: str) -> tuple[float, float]:
-        try:
-            root = ET.fromstring(svg_markup)
-        except ET.ParseError:
-            return 1600.0, 900.0
-
-        view_box = root.attrib.get("viewBox") or root.attrib.get("viewbox")
-        if view_box:
-            parts = [part for part in re.split(r"[,\s]+", view_box.strip()) if part]
-            if len(parts) == 4:
-                try:
-                    width = float(parts[2])
-                    height = float(parts[3])
-                    if width > 0 and height > 0:
-                        return width, height
-                except ValueError:
-                    pass
-
-        width = self._parse_svg_dimension(root.attrib.get("width"))
-        height = self._parse_svg_dimension(root.attrib.get("height"))
-        if width > 0 and height > 0:
-            return width, height
-        return 1600.0, 900.0
-
-    def _parse_svg_dimension(self, raw_value: str | None) -> float:
-        if not raw_value:
-            return 0.0
-        match = re.search(r"[-+]?\d*\.?\d+", raw_value)
-        if not match:
-            return 0.0
-        try:
-            return float(match.group(0))
-        except ValueError:
-            return 0.0
 
     def _slugify_filename(self, raw_value: str) -> str:
         cleaned = re.sub(r"[^\w\u4e00-\u9fff-]+", "-", raw_value.strip(), flags=re.UNICODE)
@@ -1537,12 +1501,12 @@ class PptAgentService:
             "page_search_run": [
                 {"step_code": "page_search_bocha", "step_name": "执行 Bocha 搜索", "reason": "先获取搜索摘要结果，再决定后续抓取。"},
                 {"step_code": "page_search_read", "step_name": "抓取全文并写入资料池", "reason": "把搜索结果扩展成可引用正文。"},
-                {"step_code": "page_search_vectorize", "step_name": "向量化资料池", "reason": "把正文切块并写入向量，供后续摘要和召回使用。"},
+                {"step_code": "page_search_chunk", "step_name": "切块入库资料池", "reason": "把正文切块，供后续确定性选证据使用。"},
             ],
             "page_search_refresh": [
                 {"step_code": "page_search_bocha", "step_name": "执行 Bocha 搜索", "reason": "先获取搜索摘要结果，再决定后续抓取。"},
                 {"step_code": "page_search_read", "step_name": "抓取全文并写入资料池", "reason": "把搜索结果扩展成可引用正文。"},
-                {"step_code": "page_search_vectorize", "step_name": "向量化资料池", "reason": "把正文切块并写入向量，供后续摘要和召回使用。"},
+                {"step_code": "page_search_chunk", "step_name": "切块入库资料池", "reason": "把正文切块，供后续确定性选证据使用。"},
             ],
             "page_summary_generate": [
                 {"step_code": "page_summary_generate", "step_name": "生成页面 summary", "reason": "只从当前页资料池内召回并生成摘要。"},
@@ -1617,1285 +1581,6 @@ class PptAgentService:
         )
         run.complete("failed")
 
-    def _mark_page_stage_failed(self, page: ProjectPage, action_type: str) -> None:
-        if action_type in {"page_search_run", "page_search_refresh"}:
-            page.search_status = "failed"
-        elif action_type == "page_summary_generate":
-            page.summary_status = "failed"
-        elif action_type == "page_draft_generate":
-            page.draft_status = "failed"
-        elif action_type == "page_design_generate":
-            page.design_status = "failed"
-
-    def run_bootstrap_flow(self, project_id: str) -> None:
-        project = self._require_project(project_id)
-        requirement_form = self._require_requirement_form(project)
-        run = AgentRunRecorder(
-            service=self,
-            project=project,
-            stage="init",
-            scope_type="project",
-            target_page_id=None,
-            title="初始化资料准备",
-            origin="system",
-        )
-        run.start()
-        run.set_router_decision(
-            self._build_system_decision(
-                scope_type="project",
-                target_stage="init",
-                target_page_id=None,
-                action_type="init_refresh_search",
-                reason="项目创建后自动执行初始化搜索、建库和问题生成。",
-                execution_plan=[
-                    {"step_code": "I2", "step_name": "生成初始化搜索词", "reason": "把原始需求翻译成项目级查询。"},
-                    {"step_code": "I3", "step_name": "执行 Bocha 搜索", "reason": "获取首轮搜索摘要。"},
-                    {"step_code": "I4", "step_name": "生成页数推荐和问题", "reason": "基于搜索摘要快速产出固定项与问题。"},
-                    {"step_code": "I5", "step_name": "抓取全文并写入 init_corpus", "reason": "把摘要结果扩展成可引用正文。"},
-                    {"step_code": "I6", "step_name": "向量化 init_corpus", "reason": "把正文切块并建立后续召回能力。"},
-                ],
-            )
-        )
-        current_step_code = "I2"
-        current_step_name = "生成初始化搜索词"
-        try:
-            run.step_started("I2", "生成初始化搜索词", "把原始需求翻译成项目级查询。")
-            query_plan = self.research.build_query_plan(
-                scope_type="project",
-                session_role="init_discovery",
-                request_text=project.request_text,
-                project_stage="init",
-                project_title=project.title,
-                fixed_fields=self._build_fixed_field_values(project, requirement_form),
-                answers=requirement_form.answers_json or {},
-                latest_instruction=requirement_form.latest_instruction or "",
-            )
-            requirement_form.init_search_queries_json = query_plan
-            run.data_updated(
-                {
-                    "entity": "requirement_form",
-                    "update_kind": "init_queries",
-                    "query_count": len(query_plan),
-                }
-            )
-            run.step_completed("I2", "生成初始化搜索词", {"query_count": len(query_plan)})
-
-            current_step_code = "I3"
-            current_step_name = "执行 Bocha 搜索"
-            run.step_started("I3", "执行 Bocha 搜索", "获取首轮搜索摘要。")
-
-            def on_init_query_completed(payload: dict[str, Any]) -> None:
-                requirement_form.init_search_results_json = payload["items"]
-                run.data_updated(
-                    {
-                        "entity": "requirement_form",
-                        "update_kind": "init_search_results",
-                        "query_index": payload["query_index"],
-                        "query_total": payload["query_total"],
-                        "result_count": payload["result_count"],
-                    }
-                )
-                run.step_progress(
-                    "I3",
-                    "执行 Bocha 搜索",
-                    progress={
-                        "current": payload["query_index"],
-                        "total": payload["query_total"],
-                        "label": f"已完成 {payload['query_index']}/{payload['query_total']} 条查询",
-                    },
-                    result={"result_count": payload["result_count"]},
-                )
-
-            search_results = self.research.search_query_summaries(
-                query_plan,
-                limit_per_query=4,
-                on_query_completed=on_init_query_completed,
-            )
-            requirement_form.init_search_results_json = self.research.build_search_result_cards(search_results)
-            run.step_completed("I3", "执行 Bocha 搜索", {"result_count": len(search_results)})
-
-            current_step_code = "I4"
-            current_step_name = "生成页数推荐和问题"
-            run.step_started("I4", "生成页数推荐和问题", "基于搜索摘要快速产出固定项与问题。")
-            package = self.generator.generate_init_fast_questions(
-                project_title=project.title,
-                request_text=project.request_text,
-                init_search_results=search_results,
-            )
-            requirement_form.page_count_options_json = package["page_count_options"]
-            requirement_form.ai_questions_json = package["ai_questions"]
-            requirement_form.status = "ready"
-            requirement_form.suggested_actions_json = [
-                {
-                    "code": "fill_required_fields",
-                    "label": "补全固定项和问题答案",
-                    "reason": "先完成页数、风格和问题答案，再进入大纲。",
-                },
-                {
-                    "code": "refresh_init_search",
-                    "label": "补充约束后重跑项目级搜索",
-                    "reason": "如果首轮资料跑偏，可以要求重新搜索。",
-                },
-            ]
-            run.data_updated(
-                {
-                    "entity": "requirement_form",
-                    "update_kind": "init_questions",
-                    "question_count": len(requirement_form.ai_questions_json),
-                }
-            )
-            run.step_completed("I4", "生成页数推荐和问题", {"question_count": len(requirement_form.ai_questions_json)})
-
-            current_step_code = "I5"
-            current_step_name = "抓取全文并写入 init_corpus"
-            run.step_started("I5", "抓取全文并写入 init_corpus", "把摘要结果扩展成可引用正文。")
-            init_collection = self.research.get_or_create_init_collection(project)
-
-            def on_init_read_progress(payload: dict[str, Any]) -> None:
-                run.step_progress(
-                    "I5",
-                    "抓取全文并写入 init_corpus",
-                    progress={
-                        "current": payload["completed"],
-                        "total": payload["total"],
-                        "label": f"已处理 {payload['completed']}/{payload['total']} 条来源",
-                    },
-                    result={
-                        "ingested_count": payload["ingested_count"],
-                        "failed_count": payload["failed_count"],
-                    },
-                )
-
-            candidate_sources, pending_chunk_records, read_summary = self.research.hydrate_search_results(
-                collection=init_collection,
-                search_results=search_results,
-                replace=True,
-                on_read_progress=on_init_read_progress,
-            )
-            candidate_sources = self.research.refresh_search_result_cards(candidate_sources)
-            requirement_form.init_search_results_json = candidate_sources
-            run.data_updated(
-                {
-                    "entity": "requirement_form",
-                    "update_kind": "init_read",
-                    "result_count": len(candidate_sources),
-                    "read_ready": sum(1 for item in candidate_sources if item.get("read_status") in {"ready", "reused"}),
-                    "read_failed": sum(1 for item in candidate_sources if item.get("read_status") == "failed"),
-                }
-            )
-            run.step_completed(
-                "I5",
-                "抓取全文并写入 init_corpus",
-                {
-                    "result_count": len(candidate_sources),
-                    "read_ready": sum(1 for item in candidate_sources if item.get("read_status") in {"ready", "reused"}),
-                    "read_failed": sum(1 for item in candidate_sources if item.get("read_status") == "failed"),
-                    **read_summary,
-                },
-            )
-
-            current_step_code = "I6"
-            current_step_name = "向量化 init_corpus"
-            run.step_started("I6", "向量化 init_corpus", "把正文切块并建立后续召回能力。")
-
-            def on_init_embedding_progress(payload: dict[str, Any]) -> None:
-                run.step_progress(
-                    "I6",
-                    "向量化 init_corpus",
-                    progress={
-                        "current": payload["completed_chunks"],
-                        "total": payload["total_chunks"],
-                        "label": f"已写入 {payload['completed_chunks']}/{payload['total_chunks']} 个 chunk",
-                    },
-                    result={"document_count": payload["document_count"]},
-                )
-
-            embedding_stats = self.research.store_chunk_embeddings(
-                pending_chunk_records,
-                on_embedding_progress=on_init_embedding_progress,
-            )
-            candidate_sources = self.research.refresh_search_result_cards(candidate_sources)
-            digest = self.research.build_collection_digest(init_collection.id)
-            requirement_form.init_search_results_json = candidate_sources
-            requirement_form.init_corpus_digest_json = digest
-            run.data_updated(
-                {
-                    "entity": "requirement_form",
-                    "update_kind": "init_vectorized",
-                    "document_count": digest.get("document_count", 0),
-                    "chunk_count": digest.get("chunk_count", 0),
-                }
-            )
-            run.step_completed("I6", "向量化 init_corpus", {**digest, **embedding_stats})
-            run.set_recommendations(requirement_form.suggested_actions_json)
-            self._persist_agent_message(
-                run=run,
-                content_md="初始化资料已准备完成。现在可以填写页数、风格和补充问题答案；如果资料方向不对，也可以直接要求重跑项目级搜索。",
-                result_snapshot={"requirement_form_status": requirement_form.status},
-            )
-            run.complete()
-        except Exception as exc:
-            requirement_form.status = "failed"
-            self._finalize_run_failure(
-                run=run,
-                step_code=current_step_code,
-                step_name=current_step_name,
-                exc=exc,
-                content_md="初始化资料准备失败。错误已经保留在当前动作卡片中，请先处理该错误再继续。",
-                result_snapshot={"requirement_form_status": requirement_form.status},
-            )
-
-    def run_outline_flow(self, project_id: str) -> None:
-        project = self._require_project(project_id)
-        requirement_form = self._require_requirement_form(project)
-        self._validate_requirement_form(project, requirement_form)
-        run = AgentRunRecorder(
-            service=self,
-            project=project,
-            stage="outline",
-            scope_type="project",
-            target_page_id=None,
-            title="生成大纲并切换到搜索工作台",
-            origin="system",
-        )
-        run.start()
-        run.set_router_decision(
-            self._build_system_decision(
-                scope_type="project",
-                target_stage="outline",
-                target_page_id=None,
-                action_type="outline_generate",
-                reason="固定项齐备后生成大纲，并直接进入搜索工作台。",
-                execution_plan=[
-                    {"step_code": "O2", "step_name": "从 init_corpus 检索证据", "reason": "大纲只能使用项目级资料池。"},
-                    {"step_code": "O3", "step_name": "生成大纲", "reason": "根据需求、固定项和证据生成章节与页面。"},
-                    {"step_code": "O4", "step_name": "落库页面实体", "reason": "创建页面和首个版本。"},
-                    {"step_code": "O5", "step_name": "切换到搜索页", "reason": "完成后直接进入搜索工作台，不自动搜索。"},
-                ],
-            )
-        )
-        fixed_fields = self._build_fixed_field_values(project, requirement_form)
-        page_count_target = self._coerce_page_count(fixed_fields.get("page_count_target"), project.page_count_target) or 10
-        project.page_count_target = page_count_target
-        project.style_preset = str(fixed_fields.get("style_preset") or project.style_preset or "")
-        current_step_code = "O2"
-        current_step_name = "从 init_corpus 检索证据"
-        try:
-            run.step_started("O2", "从 init_corpus 检索证据", "大纲只能使用项目级资料池。")
-            init_collection = self.research.get_or_create_init_collection(project)
-            evidence_query_plan = self.research.build_query_plan(
-                scope_type="project",
-                session_role="outline_generate",
-                request_text=project.request_text,
-                project_stage="outline",
-                project_title=project.title,
-                fixed_fields=fixed_fields,
-                answers=requirement_form.answers_json or {},
-                latest_instruction=requirement_form.latest_instruction or "",
-            )
-            evidence_session = self.research.create_session(
-                project_id=project.id,
-                page_id=None,
-                scope_type="project",
-                session_role="outline_generate",
-                research_goal="为大纲生成筛选项目级证据。",
-                query_plan=evidence_query_plan,
-                context_snapshot={"request_text": project.request_text, "fixed_fields": fixed_fields},
-            )
-            evidence = self.research.retrieve_for_collection(
-                project=project,
-                collection=init_collection,
-                research_session=evidence_session,
-                query_plan=evidence_query_plan,
-                limit=200,
-            )
-            evidence_session.status = "completed" if evidence else "failed"
-            run.step_completed("O2", "从 init_corpus 检索证据", {"citation_count": len(evidence)})
-
-            current_step_code = "O3"
-            current_step_name = "生成大纲"
-            run.step_started("O3", "生成大纲", "根据需求、固定项和证据生成章节与页面。")
-            outline_payload = self.generator.generate_outline(
-                project_title=project.title,
-                request_text=project.request_text,
-                page_count_target=page_count_target,
-                style_preset=project.style_preset or "",
-                background_asset_path=project.background_asset_path,
-                answers=requirement_form.answers_json or {},
-                init_corpus_evidence=evidence,
-            )
-            run.step_completed("O3", "生成大纲", {"part_count": len(outline_payload["ppt_outline"].get("parts", []))})
-
-            current_step_code = "O4"
-            current_step_name = "落库页面实体"
-            run.step_started("O4", "落库页面实体", "创建页面和首个版本。")
-            self._rebuild_pages_from_outline(project, outline_payload)
-            outline = OutlineVersion(
-                project_id=project.id,
-                version_no=(self.session.scalar(select(func.count(OutlineVersion.id)).where(OutlineVersion.project_id == project.id)) or 0) + 1,
-                status="ready",
-                outline_json=outline_payload,
-            )
-            self.session.add(outline)
-            project.current_stage = "search"
-            run.data_updated(
-                {
-                    "entity": "project",
-                    "update_kind": "outline",
-                    "page_count": len(self.list_pages(project.id)),
-                }
-            )
-            run.step_completed("O4", "落库页面实体", {"page_count": len(self.list_pages(project.id))})
-
-            current_step_code = "O5"
-            current_step_name = "切换到搜索页"
-            run.step_started("O5", "切换到搜索页", "完成后直接进入搜索工作台，不自动搜索。")
-            run.status_changed({"current_stage": "search"})
-            run.step_completed("O5", "切换到搜索页", {"current_stage": "search"})
-            run.set_recommendations(
-                [
-                    {
-                        "code": "page_generate_search_queries",
-                        "label": "先为当前页生成搜索词",
-                        "reason": "进入搜索页后默认不自动搜索，先看当前页职责是否正确。",
-                    },
-                    {
-                        "code": "project_batch_search",
-                        "label": "需要时再批量搜索",
-                        "reason": "只有用户明确要求批量执行时才跑全项目。",
-                    },
-                ]
-            )
-            self._persist_agent_message(
-                run=run,
-                content_md="大纲生成完成，系统已进入搜索工作台。当前没有自动搜索任何页面，你可以先修改当前页标题和要点，再决定是否生成搜索词或执行搜索。",
-                result_snapshot={"current_stage": "search"},
-            )
-            run.complete()
-        except Exception as exc:
-            self._finalize_run_failure(
-                run=run,
-                step_code=current_step_code,
-                step_name=current_step_name,
-                exc=exc,
-                content_md="大纲生成失败。错误已经保留在当前动作卡片中。",
-                result_snapshot={"current_stage": project.current_stage},
-            )
-
-    def _rebuild_pages_from_outline(self, project: Project, outline_payload: dict[str, Any]) -> None:
-        for page in self.session.scalars(select(ProjectPage).where(ProjectPage.project_id == project.id)):
-            self.session.delete(page)
-        self.session.flush()
-
-        page_defs: list[tuple[str, str | None, str, list[str]]] = []
-        ppt_outline = outline_payload["ppt_outline"]
-        page_defs.append(("cover", None, ppt_outline["cover"]["title"], ppt_outline["cover"].get("content", [])))
-        page_defs.append(("toc", None, ppt_outline["table_of_contents"]["title"], ppt_outline["table_of_contents"].get("content", [])))
-        for section in ppt_outline.get("parts", []):
-            for page in section.get("pages", []):
-                page_defs.append(("content", section["part_title"], page["title"], page.get("content", [])))
-        page_defs.append(("end", None, ppt_outline["end_page"]["title"], ppt_outline["end_page"].get("content", [])))
-
-        for sort_order, (role, part_title, title, content) in enumerate(page_defs, start=1):
-            page = ProjectPage(
-                project_id=project.id,
-                page_code=f"page-{sort_order:02d}",
-                page_role=role,
-                part_title=part_title,
-                sort_order=sort_order,
-                outline_status="ready",
-                search_status="confirmed" if role != "content" else "empty",
-                summary_status="confirmed" if role != "content" else "empty",
-                draft_status="empty",
-                design_status="empty",
-                page_summary_md="；".join(content[:2]) or title if role != "content" else "",
-                page_summary_citations_json=[],
-                page_search_queries_json=[],
-                page_search_results_json=[],
-                page_corpus_digest_json={},
-                artifact_staleness_json={},
-            )
-            self.session.add(page)
-            self.session.flush()
-            self._new_page_brief_version(
-                page=page,
-                title=title,
-                content_outline=content,
-                section_title=part_title,
-            )
-            self._update_artifact_staleness(page)
-
-    def _run_page_query_generation(
-        self,
-        *,
-        project: Project,
-        page: ProjectPage,
-        latest_instruction: str,
-    ) -> list[dict[str, str]]:
-        if page.page_role != "content":
-            raise RuntimeError("固定页不需要生成搜索词")
-        brief = self._get_current_brief(page)
-        if not brief:
-            raise RuntimeError("页面结构不存在")
-        queries = self.generator.generate_page_search_queries(
-            project_title=project.title,
-            project_request=project.request_text,
-            page_id=page.id,
-            page_title=brief.title,
-            page_bullets=brief.content_outline_json,
-            page_section_title=page.part_title,
-            outline_full_snapshot=self._build_outline_snapshot(project.id),
-            latest_instruction=latest_instruction,
-        )
-        page.page_search_queries_json = queries
-        return queries
-
-    def _run_page_search(
-        self,
-        *,
-        project: Project,
-        page: ProjectPage,
-        latest_instruction: str,
-        replace_existing: bool,
-        run: AgentRunRecorder | None = None,
-    ) -> dict[str, Any]:
-        if page.page_role != "content":
-            raise RuntimeError("固定页不需要页级搜索")
-        queries = page.page_search_queries_json
-        if not queries:
-            if run is not None:
-                run.step_started("page_search_prepare_queries", "补齐页面搜索词", "当前页还没有搜索词，先自动补齐。")
-            queries = self._run_page_query_generation(
-                project=project,
-                page=page,
-                latest_instruction=latest_instruction,
-            )
-            if run is not None:
-                run.data_updated(
-                    {
-                        "entity": "page",
-                        "page_id": page.id,
-                        "update_kind": "search_queries",
-                        "query_count": len(queries),
-                    }
-                )
-                run.step_completed("page_search_prepare_queries", "补齐页面搜索词", {"query_count": len(queries)})
-        page.search_status = "running"
-        if run is not None:
-            run.data_updated(
-                {
-                    "entity": "page",
-                    "page_id": page.id,
-                    "update_kind": "search_started",
-                    "query_count": len(queries),
-                }
-            )
-            run.step_started("page_search_bocha", "执行 Bocha 搜索", "先获取搜索摘要结果，再决定后续抓取。")
-
-        def on_query_completed(payload: dict[str, Any]) -> None:
-            page.page_search_results_json = payload["items"]
-            if run is not None:
-                run.data_updated(
-                    {
-                        "entity": "page",
-                        "page_id": page.id,
-                        "update_kind": "search_results",
-                        "query_index": payload["query_index"],
-                        "query_total": payload["query_total"],
-                        "result_count": payload["result_count"],
-                    }
-                )
-                run.step_progress(
-                    "page_search_bocha",
-                    "执行 Bocha 搜索",
-                    progress={
-                        "current": payload["query_index"],
-                        "total": payload["query_total"],
-                        "label": f"已完成 {payload['query_index']}/{payload['query_total']} 条查询",
-                    },
-                    result={"result_count": payload["result_count"]},
-                )
-
-        search_results = self.research.search_query_summaries(
-            queries,
-            limit_per_query=4,
-            on_query_completed=on_query_completed if run is not None else None,
-        )
-        if run is not None:
-            run.step_completed("page_search_bocha", "执行 Bocha 搜索", {"result_count": len(search_results)})
-        collection = self.research.get_or_create_page_collection(project, page)
-        if run is not None:
-            run.step_started("page_search_read", "抓取全文并写入资料池", "把搜索结果扩展成可引用正文。")
-
-        def on_read_progress(payload: dict[str, Any]) -> None:
-            if run is None:
-                return
-            run.step_progress(
-                "page_search_read",
-                "抓取全文并写入资料池",
-                progress={
-                    "current": payload["completed"],
-                    "total": payload["total"],
-                    "label": f"已处理 {payload['completed']}/{payload['total']} 条来源",
-                },
-                result={
-                    "ingested_count": payload["ingested_count"],
-                    "failed_count": payload["failed_count"],
-                },
-            )
-
-        candidate_sources, pending_chunk_records, read_summary = self.research.hydrate_search_results(
-            collection=collection,
-            search_results=search_results,
-            replace=replace_existing,
-            on_read_progress=on_read_progress if run is not None else None,
-        )
-        candidate_sources = self.research.refresh_search_result_cards(candidate_sources)
-        page.page_search_results_json = candidate_sources
-        read_ready = sum(1 for item in candidate_sources if item.get("read_status") in {"ready", "reused"})
-        read_failed = sum(1 for item in candidate_sources if item.get("read_status") == "failed")
-        if run is not None:
-            run.data_updated(
-                {
-                    "entity": "page",
-                    "page_id": page.id,
-                    "update_kind": "search_read",
-                    "result_count": len(candidate_sources),
-                    "read_ready": read_ready,
-                    "read_failed": read_failed,
-                }
-            )
-            run.step_completed(
-                "page_search_read",
-                "抓取全文并写入资料池",
-                {
-                    "result_count": len(candidate_sources),
-                    "read_ready": read_ready,
-                    "read_failed": read_failed,
-                },
-            )
-
-        if run is not None:
-            run.step_started("page_search_vectorize", "向量化资料池", "把正文切块并写入向量，供后续摘要和召回使用。")
-
-        def on_embedding_progress(payload: dict[str, Any]) -> None:
-            if run is None:
-                return
-            run.step_progress(
-                "page_search_vectorize",
-                "向量化资料池",
-                progress={
-                    "current": payload["completed_chunks"],
-                    "total": payload["total_chunks"],
-                    "label": f"已写入 {payload['completed_chunks']}/{payload['total_chunks']} 个 chunk",
-                },
-                result={"document_count": payload["document_count"]},
-            )
-
-        embedding_stats = self.research.store_chunk_embeddings(
-            pending_chunk_records,
-            on_embedding_progress=on_embedding_progress if run is not None else None,
-        )
-        candidate_sources = self.research.refresh_search_result_cards(candidate_sources)
-        digest = self.research.build_collection_digest(collection.id)
-        session = self.research.create_session(
-            project_id=project.id,
-            page_id=page.id,
-            scope_type="page",
-            session_role="page_search",
-            research_goal=f"为页面《{self._get_current_brief(page).title if self._get_current_brief(page) else page.page_code}》建立独立资料池。",
-            query_plan=queries,
-            context_snapshot={"latest_instruction": latest_instruction},
-        )
-        session.candidate_sources_json = candidate_sources
-        session.status = "completed" if digest.get("document_count") else "failed"
-        page.current_research_session_id = session.id
-        page.page_search_results_json = candidate_sources
-        page.page_corpus_digest_json = digest
-        page.search_status = "ready" if digest.get("document_count") else "failed"
-        page.summary_status = "stale" if page.page_summary_md else "empty"
-        page.draft_status = "stale" if page.current_draft_version_id else "empty"
-        page.design_status = "stale" if page.current_design_version_id else "empty"
-        self._update_artifact_staleness(page)
-        if run is not None:
-            run.data_updated(
-                {
-                    "entity": "page",
-                    "page_id": page.id,
-                    "update_kind": "search_vectorized",
-                    "document_count": digest.get("document_count", 0),
-                    "chunk_count": digest.get("chunk_count", 0),
-                }
-            )
-            run.step_completed(
-                "page_search_vectorize",
-                "向量化资料池",
-                {
-                    "document_count": digest.get("document_count", 0),
-                    "chunk_count": digest.get("chunk_count", 0),
-                    **embedding_stats,
-                },
-            )
-        return {"query_count": len(queries), "result_count": len(candidate_sources), **digest}
-
-    def _run_page_summary(
-        self,
-        *,
-        project: Project,
-        page: ProjectPage,
-        latest_instruction: str,
-    ) -> dict[str, Any]:
-        if page.page_role != "content":
-            raise RuntimeError("固定页不需要页级 summary 生成")
-        brief = self._get_current_brief(page)
-        if not brief:
-            raise RuntimeError("页面结构不存在")
-        if not page.page_corpus_digest_json.get("document_count"):
-            raise RuntimeError("当前页资料池为空，不能生成 summary")
-        page.summary_status = "running"
-        query_plan = page.page_search_queries_json or [
-            {
-                "query_text": f"{brief.title} {' '.join(brief.content_outline_json)}".strip(),
-                "query_purpose": "当前页核心事实和证据",
-            }
-        ]
-        collection = self.research.get_or_create_page_collection(project, page)
-        session = self.research.create_session(
-            project_id=project.id,
-            page_id=page.id,
-            scope_type="page",
-            session_role="page_summary",
-            research_goal=f"从当前页资料池生成页面《{brief.title}》的详实摘要。",
-            query_plan=query_plan,
-            context_snapshot={"latest_instruction": latest_instruction},
-        )
-        selected = self.research.retrieve_for_collection(
-            project=project,
-            collection=collection,
-            research_session=session,
-            query_plan=query_plan,
-            limit=20,
-        )
-        summary_package = self.generator.summarize_selected_sources(
-            scope_type="page",
-            research_goal=session.research_goal or "",
-            selected_sources=selected,
-        )
-        session.summary_md = summary_package["summary_md"]
-        session.status = "completed" if selected else "failed"
-        page.current_research_session_id = session.id
-        page.page_summary_md = summary_package["summary_md"]
-        page.page_summary_citations_json = selected
-        page.summary_status = "ready" if page.page_summary_md else "failed"
-        page.draft_status = "stale" if page.current_draft_version_id else "empty"
-        page.design_status = "stale" if page.current_design_version_id else "empty"
-        self._update_artifact_staleness(page)
-        return {"citation_count": len(selected), "summary_length": len(page.page_summary_md)}
-
-    def _run_page_draft(
-        self,
-        *,
-        project: Project,
-        page: ProjectPage,
-        latest_instruction: str,
-    ) -> dict[str, Any]:
-        brief = self._get_current_brief(page)
-        if not brief:
-            raise RuntimeError("页面结构不存在")
-        summary_md = page.page_summary_md.strip()
-        summary_source = "page_summary"
-        if not summary_md and page.page_role != "content":
-            summary_md = self._build_fixed_page_summary(brief.title, brief.content_outline_json)
-            summary_source = "outline_brief"
-        if not summary_md:
-            raise RuntimeError("当前页 summary 为空，不能生成初稿")
-        self._set_project_stage_at_least(project, "draft")
-        page_context = {
-            "page": {
-                "page_id": page.id,
-                "page_code": page.page_code,
-                "page_brief_version_id": brief.id,
-                "title": brief.title,
-                "content_outline": brief.content_outline_json,
-                "content_summary": brief.content_summary,
-            },
-            "summary": {
-                "summary_md": summary_md,
-                "selected_sources": page.page_summary_citations_json,
-            },
-            "latest_instruction": latest_instruction,
-        }
-        svg = self.generator.generate_draft_svg(page_context=page_context)
-        version_no = (self.session.scalar(select(func.count(DraftVersion.id)).where(DraftVersion.page_id == page.id)) or 0) + 1
-        draft = DraftVersion(
-            project_id=project.id,
-            page_id=page.id,
-            version_no=version_no,
-            status="ready",
-            page_brief_version_id=brief.id,
-            research_session_id=page.current_research_session_id,
-            draft_svg_markup=svg,
-        )
-        self.session.add(draft)
-        self.session.flush()
-        page.current_draft_version_id = draft.id
-        page.draft_status = "ready"
-        page.design_status = "stale" if page.current_design_version_id else "empty"
-        self._update_artifact_staleness(page)
-        return {"draft_version_id": draft.id, "summary_source": summary_source}
-
-    def _run_page_design(
-        self,
-        *,
-        project: Project,
-        page: ProjectPage,
-    ) -> dict[str, Any]:
-        draft = self._get_current_draft(page)
-        if not draft:
-            raise RuntimeError("当前页初稿为空，不能生成设计稿")
-        if not project.style_preset:
-            raise RuntimeError("style_preset 未设置，不能生成设计稿")
-        self._set_project_stage_at_least(project, "design")
-        svg = self.generator.generate_design_svg(
-            draft_svg=draft.draft_svg_markup,
-            style_pack_id=project.style_preset,
-            background_asset_path=project.background_asset_path,
-        )
-        version_no = (self.session.scalar(select(func.count(DesignVersion.id)).where(DesignVersion.page_id == page.id)) or 0) + 1
-        design = DesignVersion(
-            project_id=project.id,
-            page_id=page.id,
-            version_no=version_no,
-            status="ready",
-            draft_version_id=draft.id,
-            style_pack_id=project.style_preset,
-            background_asset_path=project.background_asset_path,
-            design_svg_markup=svg,
-        )
-        self.session.add(design)
-        self.session.flush()
-        page.current_design_version_id = design.id
-        page.design_status = "ready"
-        self._update_artifact_staleness(page)
-        return {"design_version_id": design.id}
-
-    def run_page_action_flow(
-        self,
-        project_id: str,
-        page_id: str,
-        action_type: str,
-        agent_run_id: str,
-        replace_existing: bool,
-    ) -> None:
-        project = self._require_project(project_id)
-        page = self._require_page(project_id, page_id)
-        latest_instruction = ""
-        run = AgentRunRecorder(
-            service=self,
-            project=project,
-            stage=project.current_stage if project.current_stage != "outline" else "search",
-            scope_type="page",
-            target_page_id=page.id,
-            title=f"执行页面动作：{action_type}",
-            origin="button",
-            message_id=None,
-            agent_run_id=agent_run_id,
-        )
-        run.start()
-        run.set_router_decision(
-            self._build_system_decision(
-                scope_type="page",
-                target_stage=run.stage,
-                target_page_id=page.id,
-                action_type=action_type,
-                reason="用户通过按钮直接触发页面动作。",
-                execution_plan=self._page_action_execution_plan(action_type),
-            )
-        )
-        result_snapshot: dict[str, Any] = {"page_id": page.id}
-        step_name = action_type
-        try:
-            if action_type == "page_generate_search_queries":
-                step_name = "生成页面搜索词"
-                run.step_started(action_type, step_name, "把当前页结构化需求翻译成搜索词集合。")
-                result_snapshot = {"queries": self._run_page_query_generation(project=project, page=page, latest_instruction=latest_instruction)}
-                run.data_updated(
-                    {
-                        "entity": "page",
-                        "page_id": page.id,
-                        "update_kind": "search_queries",
-                        "query_count": len(page.page_search_queries_json),
-                    }
-                )
-                run.step_completed(action_type, step_name, {"query_count": len(page.page_search_queries_json)})
-                message = f"已为当前页生成 {len(page.page_search_queries_json)} 条搜索词。下一步可以直接执行正式搜索。"
-            elif action_type in {"page_search_run", "page_search_refresh"}:
-                step_name = "执行页面搜索"
-                result_snapshot = self._run_page_search(
-                    project=project,
-                    page=page,
-                    latest_instruction=latest_instruction,
-                    replace_existing=replace_existing or action_type == "page_search_refresh",
-                    run=run,
-                )
-                message = "当前页资料池已更新。系统没有自动生成 summary，你可以继续手动生成 summary。"
-            elif action_type == "page_summary_generate":
-                step_name = "生成页面 summary"
-                run.step_started(action_type, step_name, "只从当前页资料池内召回并生成摘要。")
-                result_snapshot = self._run_page_summary(project=project, page=page, latest_instruction=latest_instruction)
-                run.data_updated(
-                    {
-                        "entity": "page",
-                        "page_id": page.id,
-                        "update_kind": "summary",
-                        "summary_length": result_snapshot.get("summary_length", 0),
-                    }
-                )
-                run.step_completed(action_type, step_name, result_snapshot)
-                message = "当前页 summary 已生成。系统没有自动继续出初稿。"
-            elif action_type == "page_draft_generate":
-                step_name = "生成页面初稿"
-                run.step_started(action_type, step_name, "基于当前页 summary 生成 draft。")
-                result_snapshot = self._run_page_draft(project=project, page=page, latest_instruction=latest_instruction)
-                run.data_updated(
-                    {
-                        "entity": "page",
-                        "page_id": page.id,
-                        "update_kind": "draft",
-                        "draft_version_id": result_snapshot.get("draft_version_id"),
-                    }
-                )
-                run.step_completed(action_type, step_name, result_snapshot)
-                message = "当前页初稿已生成。"
-            elif action_type == "page_design_generate":
-                step_name = "生成页面设计稿"
-                run.step_started(action_type, step_name, "基于当前页 draft 和 style_preset 生成 design。")
-                result_snapshot = self._run_page_design(project=project, page=page)
-                run.data_updated(
-                    {
-                        "entity": "page",
-                        "page_id": page.id,
-                        "update_kind": "design",
-                        "design_version_id": result_snapshot.get("design_version_id"),
-                    }
-                )
-                run.step_completed(action_type, step_name, result_snapshot)
-                message = "当前页设计稿已生成。"
-            else:
-                raise RuntimeError(f"不支持的页面动作: {action_type}")
-        except Exception as exc:
-            self._mark_page_stage_failed(page, action_type)
-            self._update_artifact_staleness(page)
-            self.session.commit()
-            self._finalize_run_failure(
-                run=run,
-                step_code=action_type,
-                step_name=step_name,
-                exc=exc,
-                content_md=f"{step_name}失败。错误已经保留在当前动作卡片中。",
-                result_snapshot={"page_id": page.id},
-            )
-            return
-
-        run.set_recommendations(self._default_recommendations_for_action(action_type))
-        self._persist_agent_message(run=run, content_md=message, result_snapshot=result_snapshot)
-        run.complete()
-
-    def run_batch_action_flow(self, project_id: str, action_type: str, agent_run_id: str) -> None:
-        project = self._require_project(project_id)
-        run = AgentRunRecorder(
-            service=self,
-            project=project,
-            stage=project.current_stage if project.current_stage != "outline" else "search",
-            scope_type="project",
-            target_page_id=None,
-            title=f"批量执行：{action_type}",
-            origin="button",
-            agent_run_id=agent_run_id,
-        )
-        run.start()
-        run.set_router_decision(
-            self._build_system_decision(
-                scope_type="project",
-                target_stage=run.stage,
-                target_page_id=None,
-                action_type=action_type,
-                reason="用户通过按钮明确触发批量动作。",
-                execution_plan=[{"step_code": action_type, "step_name": action_type, "reason": "按批量规则逐页执行。"}],
-            )
-        )
-        pages = list(self.session.scalars(select(ProjectPage).where(ProjectPage.project_id == project.id).order_by(ProjectPage.sort_order.asc())))
-        processed = 0
-        skipped = 0
-        try:
-            run.step_started(action_type, action_type, "按批量规则逐页执行。")
-            for index, page in enumerate(pages, start=1):
-                if action_type == "project_batch_search":
-                    if page.page_role != "content":
-                        skipped += 1
-                    else:
-                        self._run_page_search(project=project, page=page, latest_instruction="", replace_existing=True)
-                        processed += 1
-                elif action_type == "project_batch_summary":
-                    if page.page_role != "content" or not page.page_corpus_digest_json.get("document_count"):
-                        skipped += 1
-                    else:
-                        self._run_page_summary(project=project, page=page, latest_instruction="")
-                        processed += 1
-                elif action_type == "project_batch_draft":
-                    if page.page_role == "content" and not page.page_summary_md:
-                        skipped += 1
-                    else:
-                        self._run_page_draft(project=project, page=page, latest_instruction="")
-                        processed += 1
-                elif action_type == "project_batch_design":
-                    if not page.current_draft_version_id:
-                        skipped += 1
-                    else:
-                        self._run_page_design(project=project, page=page)
-                        processed += 1
-                else:
-                    raise RuntimeError(f"不支持的批量动作: {action_type}")
-                run.step_progress(
-                    action_type,
-                    action_type,
-                    progress={
-                        "current": index,
-                        "total": len(pages),
-                        "label": f"已扫描 {index}/{len(pages)} 页",
-                    },
-                    result={"processed": processed, "skipped": skipped},
-                )
-            run.step_completed(action_type, action_type, {"processed": processed, "skipped": skipped})
-            run.set_recommendations(self._default_recommendations_for_action(action_type))
-            self._persist_agent_message(
-                run=run,
-                content_md=f"批量动作 `{action_type}` 已执行完成。处理 {processed} 页，跳过 {skipped} 页。",
-                result_snapshot={"processed": processed, "skipped": skipped},
-            )
-            run.complete()
-        except Exception as exc:
-            self._finalize_run_failure(
-                run=run,
-                step_code=action_type,
-                step_name=action_type,
-                exc=exc,
-                content_md=f"批量动作 `{action_type}` 执行失败。错误已经保留在当前动作卡片中。",
-                result_snapshot={"processed": processed, "skipped": skipped},
-            )
-
-    def run_message_flow(self, message_id: str) -> None:
-        message = self.session.get(ProjectMessage, message_id)
-        if not message:
-            return
-        project = self._require_project(message.project_id)
-        page = self._require_page(project.id, message.target_page_id) if message.target_page_id else None
-        ui_surface = str(message.structured_payload_json.get("ui_surface") or project.current_stage)
-        run = AgentRunRecorder(
-            service=self,
-            project=project,
-            stage=ui_surface if ui_surface in PROJECT_STAGE_ORDER else project.current_stage,
-            scope_type=message.scope_type,
-            target_page_id=message.target_page_id,
-            title="处理聊天动作",
-            origin="message",
-            message_id=message.id,
-        )
-        run.start()
-        try:
-            requirement_form = self._require_requirement_form(project)
-            router_payload = {
-                "project_id": project.id,
-                "project_stage": project.current_stage,
-                "ui_surface": ui_surface,
-                "latest_user_message": message.content_md,
-                "recent_messages": self._recent_messages(project.id),
-                "project_request": project.request_text,
-                "workflow_constraints": project.workflow_constraints_json.get("items", []),
-                "fixed_fields": self._build_fixed_field_values(project, requirement_form),
-                "project_level_status_summary": self._build_project_level_status_summary(project),
-                "outline_state_snapshot": self._build_outline_snapshot(project.id),
-                "page_context": self._build_page_context_for_router(page),
-                "default_scope_type": message.scope_type,
-            }
-            decision = self.generator.route_workspace_intent(router_payload=router_payload)
-            run.set_router_decision(decision)
-            run.set_recommendations(decision.get("next_recommendations", []))
-
-            if decision["needs_clarification"] or decision["action_type"] == "reject":
-                self._persist_agent_message(
-                    run=run,
-                    content_md=self._build_rejection_message(decision),
-                    result_snapshot={"missing_data": decision.get("missing_data", [])},
-                )
-                run.complete("rejected")
-                return
-
-            action_type = decision["action_type"]
-            if action_type == "init_refresh_search":
-                self.run_bootstrap_flow(project.id)
-                run.complete()
-                return
-
-            if action_type == "init_confirm_to_outline":
-                try:
-                    self.confirm_requirements(project.id, note_md=message.content_md)
-                    self._persist_agent_message(
-                        run=run,
-                        content_md="初始化信息已满足要求，系统开始生成大纲。大纲完成后会直接进入搜索工作台。",
-                        result_snapshot={"current_stage": "outline"},
-                    )
-                    run.complete()
-                except Exception as exc:
-                    self._finalize_run_failure(
-                        run=run,
-                        step_code=action_type,
-                        step_name="确认初始化并生成大纲",
-                        exc=exc,
-                        content_md="确认初始化失败。错误已经保留在当前动作卡片中。",
-                        result_snapshot={"current_stage": project.current_stage},
-                    )
-                return
-
-            if action_type in {"project_batch_search", "project_batch_summary", "project_batch_draft", "project_batch_design"}:
-                self.run_batch_action_flow(project.id, action_type, run.agent_run_id)
-                run.complete()
-                return
-
-            if action_type in {"init_add_question", "init_update_question", "init_delete_question", "init_update_answer"}:
-                result_snapshot: dict[str, Any]
-                try:
-                    if action_type == "init_update_answer":
-                        run.step_started(action_type, "更新初始化答案", "根据聊天消息更新结构化答案，不自动重搜。")
-                        answer_patch = decision["data_updates"].get("answer_patch")
-                        if not isinstance(answer_patch, dict):
-                            raise RuntimeError("router 没有返回可执行的 answer_patch")
-                        result_snapshot = self._apply_init_answer_patch(project, requirement_form, answer_patch)
-                        run.data_updated(
-                            {
-                                "entity": "requirement_form",
-                                "update_kind": "init_answers",
-                            }
-                        )
-                        run.step_completed(action_type, "更新初始化答案", result_snapshot)
-                        content_md = "初始化答案已更新。系统没有自动重跑搜索，你可以继续修改，或明确要求重跑项目级搜索。"
-                    else:
-                        run.step_started("init_retrieval", "检索 init_corpus 证据", "问题增改前先从 init_corpus 做检索。")
-                        init_collection = self.research.get_or_create_init_collection(project)
-                        retrieval_query_plan = self.research.build_query_plan(
-                            scope_type="project",
-                            session_role="init_question_refine",
-                            request_text=project.request_text,
-                            project_stage="init",
-                            project_title=project.title,
-                            fixed_fields=self._build_fixed_field_values(project, requirement_form),
-                            answers=requirement_form.answers_json or {},
-                            latest_instruction=message.content_md,
-                        )
-                        refine_session = self.research.create_session(
-                            project_id=project.id,
-                            page_id=None,
-                            scope_type="project",
-                            session_role="init_question_refine",
-                            research_goal="为初始化问题增删改提供项目级证据。",
-                            query_plan=retrieval_query_plan,
-                            context_snapshot={"latest_instruction": message.content_md},
-                        )
-                        evidence = self.research.retrieve_for_collection(
-                            project=project,
-                            collection=init_collection,
-                            research_session=refine_session,
-                            query_plan=retrieval_query_plan,
-                            limit=200,
-                        )
-                        refine_session.status = "completed" if evidence else "failed"
-                        run.step_completed("init_retrieval", "检索 init_corpus 证据", {"citation_count": len(evidence)})
-                        question_patch = decision["data_updates"].get("question_patch")
-                        if not isinstance(question_patch, dict):
-                            raise RuntimeError("router 没有返回可执行的 question_patch")
-                        result_snapshot = self._apply_init_question_patch(requirement_form, question_patch)
-                        run.data_updated(
-                            {
-                                "entity": "requirement_form",
-                                "update_kind": "init_questions",
-                            }
-                        )
-                        run.step_completed(action_type, "更新初始化问题", result_snapshot)
-                        content_md = "初始化问题集合已更新。当前不会自动重跑搜索；如果你要基于新问题重新看资料，请明确要求重跑项目级搜索。"
-                    self._persist_agent_message(run=run, content_md=content_md, result_snapshot=result_snapshot)
-                    run.complete()
-                except Exception as exc:
-                    self._finalize_run_failure(
-                        run=run,
-                        step_code=action_type,
-                        step_name="更新初始化需求",
-                        exc=exc,
-                        content_md="初始化需求更新失败。错误已经保留在当前动作卡片中。",
-                    )
-                return
-
-            if page is None:
-                self._persist_agent_message(
-                    run=run,
-                    content_md="当前动作需要明确页面上下文，但这条消息没有绑定目标页。",
-                    result_snapshot={"missing_data": ["target_page_id"]},
-                )
-                run.complete("rejected")
-                return
-
-            result_snapshot: dict[str, Any] = {"page_id": page.id}
-            content_md = ""
-            step_name = action_type
-            try:
-                if action_type == "page_update_outline_in_search":
-                    step_name = "更新页面结构"
-                    run.step_started(action_type, step_name, "修改标题、要点和章节归属，并只标记下游 stale。")
-                    page_patch = self.generator.generate_page_outline_patch(
-                        latest_user_message=message.content_md,
-                        page_id=page.id,
-                        page_title=self._get_current_brief(page).title if self._get_current_brief(page) else "",
-                        page_bullets=self._get_current_brief(page).content_outline_json if self._get_current_brief(page) else [],
-                        page_section_title=page.part_title,
-                        outline_full_snapshot=self._build_outline_snapshot(project.id),
-                    )
-                    decision["data_updates"]["page_patch"] = page_patch
-                    self.patch_page_outline(project.id, page.id, page_patch)
-                    run.data_updated(
-                        {
-                            "entity": "page",
-                            "page_id": page.id,
-                            "update_kind": "outline",
-                        }
-                    )
-                    run.step_completed(action_type, step_name, page_patch)
-                    result_snapshot = page_patch
-                    content_md = f"当前页结构已更新：{page_patch.get('change_summary') or '标题和要点已写回数据库'}。系统没有自动重搜，相关下游产物已标记为 stale。"
-                elif action_type == "page_generate_search_queries":
-                    step_name = "生成页面搜索词"
-                    run.step_started(action_type, step_name, "只重算当前页搜索词集合。")
-                    result_snapshot = {"queries": self._run_page_query_generation(project=project, page=page, latest_instruction=message.content_md)}
-                    run.data_updated(
-                        {
-                            "entity": "page",
-                            "page_id": page.id,
-                            "update_kind": "search_queries",
-                            "query_count": len(page.page_search_queries_json),
-                        }
-                    )
-                    run.step_completed(action_type, step_name, {"query_count": len(page.page_search_queries_json)})
-                    content_md = f"已为当前页生成 {len(page.page_search_queries_json)} 条搜索词。"
-                elif action_type in {"page_search_run", "page_search_refresh"}:
-                    step_name = "执行页面搜索"
-                    result_snapshot = self._run_page_search(
-                        project=project,
-                        page=page,
-                        latest_instruction=message.content_md,
-                        replace_existing=action_type == "page_search_refresh",
-                        run=run,
-                    )
-                    content_md = "当前页资料池已更新。系统没有自动继续生成 summary。"
-                elif action_type == "page_summary_generate":
-                    step_name = "生成页面 summary"
-                    run.step_started(action_type, step_name, "只从当前页资料池生成摘要。")
-                    result_snapshot = self._run_page_summary(project=project, page=page, latest_instruction=message.content_md)
-                    run.data_updated(
-                        {
-                            "entity": "page",
-                            "page_id": page.id,
-                            "update_kind": "summary",
-                            "summary_length": result_snapshot.get("summary_length", 0),
-                        }
-                    )
-                    run.step_completed(action_type, step_name, result_snapshot)
-                    content_md = "当前页 summary 已生成。"
-                elif action_type == "page_summary_edit":
-                    step_name = "编辑页面 summary"
-                    run.step_started(action_type, step_name, "根据用户要求改写当前页 summary，并标记 draft/design stale。")
-                    patch = self.generator.generate_summary_patch(
-                        latest_user_message=message.content_md,
-                        page_title=self._get_current_brief(page).title if self._get_current_brief(page) else "",
-                        page_bullets=self._get_current_brief(page).content_outline_json if self._get_current_brief(page) else [],
-                        current_summary_md=page.page_summary_md,
-                    )
-                    decision["data_updates"]["summary_patch"] = patch
-                    self.patch_page_summary(project.id, page.id, patch["summary_md"])
-                    run.data_updated(
-                        {
-                            "entity": "page",
-                            "page_id": page.id,
-                            "update_kind": "summary",
-                            "summary_length": len(patch["summary_md"]),
-                        }
-                    )
-                    run.step_completed(action_type, step_name, {"summary_length": len(patch["summary_md"])})
-                    result_snapshot = patch
-                    content_md = "当前页 summary 已按你的要求改写，draft/design 已标记为 stale。"
-                elif action_type == "page_draft_generate":
-                    step_name = "生成页面初稿"
-                    run.step_started(action_type, step_name, "基于当前页 summary 生成 draft。")
-                    result_snapshot = self._run_page_draft(project=project, page=page, latest_instruction=message.content_md)
-                    run.data_updated(
-                        {
-                            "entity": "page",
-                            "page_id": page.id,
-                            "update_kind": "draft",
-                            "draft_version_id": result_snapshot.get("draft_version_id"),
-                        }
-                    )
-                    run.step_completed(action_type, step_name, result_snapshot)
-                    content_md = "当前页初稿已生成。"
-                elif action_type == "page_design_generate":
-                    step_name = "生成页面设计稿"
-                    run.step_started(action_type, step_name, "基于当前页 draft 生成 design。")
-                    result_snapshot = self._run_page_design(project=project, page=page)
-                    run.data_updated(
-                        {
-                            "entity": "page",
-                            "page_id": page.id,
-                            "update_kind": "design",
-                            "design_version_id": result_snapshot.get("design_version_id"),
-                        }
-                    )
-                    run.step_completed(action_type, step_name, result_snapshot)
-                    content_md = "当前页设计稿已生成。"
-                else:
-                    self._persist_agent_message(
-                        run=run,
-                        content_md="这条消息已经被识别到动作类型，但当前后端还没有对应执行器。",
-                        result_snapshot={"action_type": action_type},
-                    )
-                    run.complete("rejected")
-                    return
-            except Exception as exc:
-                self._mark_page_stage_failed(page, action_type)
-                self._update_artifact_staleness(page)
-                self.session.commit()
-                self._finalize_run_failure(
-                    run=run,
-                    step_code=action_type,
-                    step_name=step_name,
-                    exc=exc,
-                    content_md=f"{step_name}失败。错误已经保留在当前动作卡片中。",
-                    result_snapshot={"page_id": page.id},
-                )
-                return
-
-            self._persist_agent_message(run=run, content_md=content_md, result_snapshot=result_snapshot)
-            run.complete()
-        except Exception as exc:
-            self._finalize_run_failure(
-                run=run,
-                step_code="route_workspace_intent",
-                step_name="判断用户意图",
-                exc=exc,
-                content_md="处理聊天动作失败。错误已经保留在当前动作卡片中。",
-                result_snapshot={
-                    "message_id": message.id,
-                    "page_id": page.id if page else None,
-                    "ui_surface": ui_surface,
-                },
-            )
-
     def _default_recommendations_for_action(self, action_type: str) -> list[dict[str, Any]]:
         mapping = {
             "page_generate_search_queries": [
@@ -2964,6 +1649,41 @@ class PptAgentService:
         filtered.append(question)
         requirement_form.ai_questions_json = filtered
         return {"mode": "upsert", "question_code": question_code}
+
+
+
+def _read_upload_limited(file: UploadFile, max_bytes: int) -> bytes:
+    chunk_size = 1024 * 1024
+    buffer = bytearray()
+    while True:
+        chunk = file.file.read(chunk_size)
+        if not chunk:
+            break
+        buffer.extend(chunk)
+        if len(buffer) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"背景图超过大小限制（最大 {max_bytes // (1024 * 1024)}MB）",
+            )
+    return bytes(buffer)
+
+
+def _detect_background_suffix(payload: bytes) -> str | None:
+    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if payload.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if payload.startswith(b"GIF87a") or payload.startswith(b"GIF89a"):
+        return ".gif"
+    if len(payload) >= 12 and payload[:4] == b"RIFF" and payload[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def _safe_storage_id(value: str) -> str:
+    if not _STORAGE_ID_RE.fullmatch(value):
+        raise HTTPException(status_code=400, detail="无效的项目 ID")
+    return value.lower()
 
 
 def run_bootstrap_job(project_id: str) -> None:

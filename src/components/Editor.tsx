@@ -5,12 +5,12 @@ import {
   Download,
   FileText,
   LoaderCircle,
-  Paperclip,
   Play,
   RefreshCw,
   Search,
   Send,
   Sparkles,
+  Square,
   StickyNote,
   Wand2,
 } from 'lucide-react';
@@ -19,6 +19,7 @@ import {
   connectProjectEventStream,
   createExport,
   createMessage,
+  cancelProjectTasks,
   generatePageDesign,
   generatePageDraft,
   generatePageSearchQueries,
@@ -294,6 +295,10 @@ export default function Editor({
     }
   };
 
+  const hasRunningTask = pages.some((page) =>
+    [page.search_status, page.summary_status, page.draft_status, page.design_status].includes('running'),
+  );
+
   const handleOpenPage = async (pageId: string, nextSurface?: EditorSurface) => {
     activePageIdRef.current = pageId;
     if (nextSurface) {
@@ -484,6 +489,7 @@ export default function Editor({
           <button onClick={() => { void handleOpenPresentation(); }} disabled={!canPresent || isPreparingPresentation} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200 disabled:opacity-40">{isPreparingPresentation ? <LoaderCircle size={18} className="animate-spin" /> : <Play size={18} />}放映</button>
           <button onClick={() => void runAction(() => surface === 'search' ? runBatchAction(project.project_id, 'project_batch_search') : surface === 'draft' ? runBatchAction(project.project_id, 'project_batch_draft') : runBatchAction(project.project_id, 'project_batch_design'))} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200"><Sparkles size={18} />{surface === 'search' ? '批量搜索' : surface === 'draft' ? '批量初稿' : '批量设计'}</button>
           {surface === 'search' ? <button onClick={() => void runAction(() => runBatchAction(project.project_id, 'project_batch_summary'))} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200"><Wand2 size={18} />批量 summary</button> : null}
+          <button disabled={!hasRunningTask} onClick={() => void runAction(() => cancelProjectTasks(project.project_id))} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-rose-700 hover:bg-rose-50 rounded-xl border border-rose-200 disabled:opacity-40"><Square size={16} />取消</button>
           <button onClick={async () => { setIsExporting(true); try { const job = await createExport(project.project_id); window.open(getExportDownloadUrl(project.project_id, job.export_id), '_blank', 'noopener,noreferrer'); setError(null); } catch (caughtError) { setError(getErrorMessage(caughtError, '导出失败')); } finally { setIsExporting(false); } }} disabled={isExporting} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl disabled:bg-blue-300">{isExporting ? <LoaderCircle size={18} className="animate-spin" /> : <Download size={18} />}导出</button>
         </div>
       </header>
@@ -577,7 +583,6 @@ export default function Editor({
           <div className="p-5 bg-white border-t border-slate-100 space-y-3">
             {error ? <div className="text-sm text-red-600">{error}</div> : null}
             <div className="bg-slate-50 rounded-2xl flex items-end p-2.5 border border-slate-200 focus-within:border-blue-500 focus-within:ring-2 focus-within:ring-blue-100 transition-all">
-              <button className="p-2.5 text-slate-400"><Paperclip size={20} /></button>
               <textarea value={chatInput} placeholder={surface === 'search' ? '例如：把标题改成...，或者先只生成搜索词' : surface === 'draft' ? '例如：重生成这一页初稿，强调数据对比' : '例如：重生成设计稿，保留结构但增强层次'} className="flex-1 bg-transparent border-none outline-none resize-none max-h-32 min-h-[44px] py-2.5 px-3 text-sm text-slate-700" rows={1} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void handleSendMessage(); } }} />
               <button disabled={isSendingMessage || !chatInput.trim() || !activePage} onClick={() => void handleSendMessage()} className="p-2.5 text-blue-600 hover:text-blue-700 disabled:text-slate-300 disabled:cursor-not-allowed">{isSendingMessage ? <LoaderCircle size={20} className="animate-spin" /> : <Send size={20} />}</button>
             </div>

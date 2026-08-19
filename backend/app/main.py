@@ -5,13 +5,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from app.api.router import api_router
 from app.core.config import get_settings
 from app.core.db import init_db
 from app.core.logging import configure_logging
+from app.core.staticfiles import AttachmentStaticFiles
 from app.models import entities  # noqa: F401
+from app.services.tasks import start_scheduler, stop_scheduler
 
 
 @asynccontextmanager
@@ -23,12 +24,17 @@ async def lifespan(_: FastAPI):
     settings.background_path.mkdir(parents=True, exist_ok=True)
     settings.export_path.mkdir(parents=True, exist_ok=True)
     init_db()
+    start_scheduler()
     yield
+    stop_scheduler()
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
     settings.file_storage_root.mkdir(parents=True, exist_ok=True)
+    settings.upload_path.mkdir(parents=True, exist_ok=True)
+    settings.background_path.mkdir(parents=True, exist_ok=True)
+    settings.export_path.mkdir(parents=True, exist_ok=True)
     init_db()
     app = FastAPI(
         title="PPT Agent Backend",
@@ -44,7 +50,13 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(api_router, prefix=settings.api_prefix)
-    app.mount("/storage", StaticFiles(directory=settings.file_storage_root), name="storage")
+    app.mount("/storage/uploads", AttachmentStaticFiles(directory=settings.upload_path), name="storage-uploads")
+    app.mount(
+        "/storage/backgrounds",
+        AttachmentStaticFiles(directory=settings.background_path),
+        name="storage-backgrounds",
+    )
+    app.mount("/storage/exports", AttachmentStaticFiles(directory=settings.export_path), name="storage-exports")
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:

@@ -3,11 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, new_id, now_utc
-from app.models.types import EmbeddingVector
 
 
 class Project(Base):
@@ -34,8 +33,8 @@ class Project(Base):
     pages: Mapped[list["ProjectPage"]] = relationship(back_populates="project")
     exports: Mapped[list["ExportJob"]] = relationship(back_populates="project")
     source_collections: Mapped[list["SourceCollection"]] = relationship(back_populates="project")
-    retrieval_runs: Mapped[list["RetrievalRun"]] = relationship(back_populates="project")
     citations: Mapped[list["Citation"]] = relationship(back_populates="project")
+    agent_tasks: Mapped[list["AgentTask"]] = relationship(back_populates="project")
 
 
 class ProjectMessage(Base):
@@ -77,12 +76,6 @@ class RequirementForm(Base):
     id: Mapped[str] = mapped_column(primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), unique=True, index=True)
     status: Mapped[str] = mapped_column(default="pending_confirmation")
-    init_discovery_session_id: Mapped[str | None] = mapped_column(nullable=True)
-    init_refine_session_id: Mapped[str | None] = mapped_column(nullable=True)
-    active_outline_context_source: Mapped[str] = mapped_column(default="discovery")
-    summary_md: Mapped[str] = mapped_column(Text, default="")
-    outline_context_md: Mapped[str] = mapped_column(Text, default="")
-    outline_context_citations_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     fixed_items_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     init_search_queries_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     init_search_results_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
@@ -173,7 +166,6 @@ class SourceChunk(Base):
     section_path: Mapped[str] = mapped_column(Text, default="")
     content_md: Mapped[str] = mapped_column(Text, default="")
     content_for_embedding: Mapped[str] = mapped_column(Text, default="")
-    embedding: Mapped[list[float] | None] = mapped_column(EmbeddingVector(1536), nullable=True)
     token_count: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
@@ -212,7 +204,6 @@ class ResearchSession(Base):
         back_populates="research_session",
         cascade="all, delete-orphan",
     )
-    retrieval_runs: Mapped[list["RetrievalRun"]] = relationship(back_populates="research_session", cascade="all, delete-orphan")
 
 
 class ResearchSource(Base):
@@ -246,39 +237,6 @@ class ProjectResearchSource(Base):
     is_pinned: Mapped[bool] = mapped_column(Boolean, default=False)
 
     research_session: Mapped[ResearchSession] = relationship(back_populates="selected_sources")
-    source_document: Mapped[SourceDocument] = relationship()
-    chunk: Mapped[SourceChunk] = relationship()
-
-
-class RetrievalRun(Base):
-    __tablename__ = "retrieval_runs"
-
-    id: Mapped[str] = mapped_column(primary_key=True, default=new_id)
-    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
-    research_session_id: Mapped[str] = mapped_column(ForeignKey("research_sessions.id", ondelete="CASCADE"), index=True)
-    query_text: Mapped[str] = mapped_column(Text)
-    retrieval_mode: Mapped[str] = mapped_column(default="hybrid")
-    status: Mapped[str] = mapped_column(default="running")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
-
-    project: Mapped[Project] = relationship(back_populates="retrieval_runs")
-    research_session: Mapped[ResearchSession] = relationship(back_populates="retrieval_runs")
-    candidates: Mapped[list["RetrievalCandidate"]] = relationship(back_populates="retrieval_run", cascade="all, delete-orphan")
-
-
-class RetrievalCandidate(Base):
-    __tablename__ = "retrieval_candidates"
-
-    id: Mapped[str] = mapped_column(primary_key=True, default=new_id)
-    retrieval_run_id: Mapped[str] = mapped_column(ForeignKey("retrieval_runs.id", ondelete="CASCADE"), index=True)
-    source_document_id: Mapped[str] = mapped_column(ForeignKey("source_documents.id", ondelete="CASCADE"), index=True)
-    chunk_id: Mapped[str] = mapped_column(ForeignKey("source_chunks.id", ondelete="CASCADE"), index=True)
-    score_vector: Mapped[float] = mapped_column(Float, default=0.0)
-    score_keyword: Mapped[float] = mapped_column(Float, default=0.0)
-    score_final: Mapped[float] = mapped_column(Float, default=0.0)
-    selected: Mapped[bool] = mapped_column(Boolean, default=False)
-
-    retrieval_run: Mapped[RetrievalRun] = relationship(back_populates="candidates")
     source_document: Mapped[SourceDocument] = relationship()
     chunk: Mapped[SourceChunk] = relationship()
 
@@ -337,7 +295,6 @@ class ProjectPage(Base):
     outline_status: Mapped[str] = mapped_column(default="empty")
     search_status: Mapped[str] = mapped_column(default="empty")
     summary_status: Mapped[str] = mapped_column(default="empty")
-    research_status: Mapped[str] = mapped_column(default="pending")
     draft_status: Mapped[str] = mapped_column(default="pending")
     design_status: Mapped[str] = mapped_column(default="pending")
     page_search_queries_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
@@ -421,3 +378,76 @@ class ExportJob(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
 
     project: Mapped[Project] = relationship(back_populates="exports")
+
+
+class AgentTask(Base):
+    __tablename__ = "agent_tasks"
+    __table_args__ = (
+        Index("idx_agent_tasks_sched", "status", "next_run_at", "priority"),
+        Index("idx_agent_tasks_page", "page_id", "task_type"),
+    )
+
+    task_id: Mapped[str] = mapped_column(primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    page_id: Mapped[str | None] = mapped_column(ForeignKey("project_pages.id", ondelete="CASCADE"), nullable=True, index=True)
+    task_type: Mapped[str] = mapped_column(Text, index=True)
+    task_stage: Mapped[str] = mapped_column(Text, default="init")
+    status: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    next_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, index=True)
+    retry_num: Mapped[int] = mapped_column(Integer, default=0)
+    max_retry_num: Mapped[int] = mapped_column(Integer, default=3)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    task_context: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    schedule_log: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    cancel_requested: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+    project: Mapped[Project] = relationship(back_populates="agent_tasks")
+
+
+class ModelProvider(Base):
+    __tablename__ = "model_providers"
+
+    provider_id: Mapped[str] = mapped_column(primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(Text)
+    base_url: Mapped[str] = mapped_column(Text)
+    api_key: Mapped[str] = mapped_column(Text)
+    model: Mapped[str] = mapped_column(Text)
+    api_path: Mapped[str] = mapped_column(Text, default="/chat/completions")
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=120)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+    bindings: Mapped[list["ModelBinding"]] = relationship(back_populates="provider")
+
+
+class ModelBinding(Base):
+    __tablename__ = "model_bindings"
+
+    role: Mapped[str] = mapped_column(Text, primary_key=True)
+    provider_id: Mapped[str] = mapped_column(ForeignKey("model_providers.provider_id", ondelete="RESTRICT"))
+
+    provider: Mapped[ModelProvider] = relationship(back_populates="bindings")
+
+
+class SearchSettings(Base):
+    __tablename__ = "search_settings"
+
+    id: Mapped[str] = mapped_column(primary_key=True, default="default")
+    mode: Mapped[str] = mapped_column(default="bocha")
+    bocha_auth_header: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+
+class ReaderSettings(Base):
+    __tablename__ = "reader_settings"
+
+    id: Mapped[str] = mapped_column(primary_key=True, default="default")
+    mode: Mapped[str] = mapped_column(default="web_fetch")
+    tavily_api_key: Mapped[str] = mapped_column(Text, default="")
+    tavily_api_url: Mapped[str] = mapped_column(Text, default="")
+    firecrawl_api_key: Mapped[str] = mapped_column(Text, default="")
+    firecrawl_api_url: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)

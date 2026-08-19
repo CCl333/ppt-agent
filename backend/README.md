@@ -1,65 +1,121 @@
 # PPT Agent Backend
 
+FastAPI 服务，接口前缀 `/api/v1`。配置统一读仓库根目录 `.env`（复制 `.env.example`）。
+
 ## 启动
 
-项目当前直接复用仓库根目录的 `.env`。
+Windows（仓库根目录）：
 
-推荐命令：
+```powershell
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -e "backend[dev]"
+$env:PYTHONPATH="backend"
+.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+macOS / Linux：
 
 ```bash
 PYTHONPATH=backend .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-默认接口前缀：
+默认会创建 `FILE_STORAGE_ROOT` 下的 `uploads` / `backgrounds` / `exports`。数据库默认 SQLite：`sqlite:///./backend/data/ppt_agent.db`（WAL + foreign_keys）。也支持 PostgreSQL。
 
-```text
-/api/v1
-```
+健康检查：`GET /healthz`。
 
-## 当前能力
+## 阶段机
 
-已实现的主链路：
+项目阶段：`init → outline → search → draft → design → export`。每页独立状态（`empty/ready/running/confirmed/stale/failed`）。打开搜索页不会自动搜索或自动 summary，所有动作显式触发。结构变更只标 `stale`，不删 draft/design。
 
-1. 创建项目
-2. 初始化研究与需求单生成
-3. 需求确认后生成大纲与页面实体
-4. 大纲确认后生成页级研究
-5. 研究确认后生成初稿 SVG
-6. 初稿确认后生成设计稿 SVG
-7. 设计确认后导出 PPTX
+任务经 `agent_tasks` 入队，后台线程领取执行；可用 `POST /projects/{id}/tasks:cancel` 在阶段边界取消。
 
 ## 关键接口
 
+前缀均为 `/api/v1`。
+
+### 项目与事件
+
 ```text
-GET    /api/v1/projects
-POST   /api/v1/projects
-GET    /api/v1/projects/{project_id}
-GET    /api/v1/projects/{project_id}/messages
-POST   /api/v1/projects/{project_id}/messages
-GET    /api/v1/projects/{project_id}/events/stream
+GET    /projects
+POST   /projects
+GET    /projects/{project_id}
+POST   /projects/{project_id}/bootstrap:retry
+GET    /projects/{project_id}/messages
+POST   /projects/{project_id}/messages
+GET    /projects/{project_id}/events/stream
+```
 
-GET    /api/v1/projects/{project_id}/requirements/form
-POST   /api/v1/projects/{project_id}/requirements/answers:batch
-POST   /api/v1/projects/{project_id}/requirements/confirm
-POST   /api/v1/projects/{project_id}/assets/backgrounds
-GET    /api/v1/projects/{project_id}/research-sessions/init-discovery
-GET    /api/v1/projects/{project_id}/research-sessions/{session_id}/sources
+### 需求单（init）
 
-GET    /api/v1/projects/{project_id}/outline
-GET    /api/v1/projects/{project_id}/outline/storyboard
-PATCH  /api/v1/projects/{project_id}/outline/storyboard
-POST   /api/v1/projects/{project_id}/outline/confirm
+```text
+GET    /projects/{project_id}/requirements/form
+POST   /projects/{project_id}/requirements/answers:batch
+PATCH  /projects/{project_id}/requirements/answers/{question_code}
+POST   /projects/{project_id}/requirements/search-results/{source_id}:retry
+POST   /projects/{project_id}/requirements/questions
+PATCH  /projects/{project_id}/requirements/questions/{question_code}
+DELETE /projects/{project_id}/requirements/questions/{question_code}
+POST   /projects/{project_id}/requirements/confirm
+POST   /projects/{project_id}/assets/backgrounds
+```
 
-GET    /api/v1/projects/{project_id}/pages
-GET    /api/v1/projects/{project_id}/pages/{page_id}
-GET    /api/v1/projects/{project_id}/pages/{page_id}/research
-POST   /api/v1/projects/{project_id}/pages/{page_id}/research/rerun
-POST   /api/v1/projects/{project_id}/pages/{page_id}/research/confirm
-GET    /api/v1/projects/{project_id}/pages/{page_id}/draft
-POST   /api/v1/projects/{project_id}/pages/{page_id}/draft/confirm
-GET    /api/v1/projects/{project_id}/pages/{page_id}/design
-POST   /api/v1/projects/{project_id}/pages/{page_id}/design/confirm
-POST   /api/v1/projects/{project_id}/exports
-GET    /api/v1/projects/{project_id}/exports/{export_id}
-GET    /api/v1/projects/{project_id}/exports/{export_id}/download
+`POST /requirements/confirm` 仅在 `current_stage=init` 时允许，否则 409。
+
+### 大纲
+
+```text
+GET    /projects/{project_id}/outline
+PATCH  /projects/{project_id}/outline/storyboard
+```
+
+大纲阶段无聊天框；生成完成后进入搜索工作台。没有单独的 `outline/confirm` 接口。
+
+### 页面、批量与导出
+
+```text
+GET    /projects/{project_id}/pages
+GET    /projects/{project_id}/pages/{page_id}
+PATCH  /projects/{project_id}/pages/{page_id}/outline
+POST   /projects/{project_id}/pages/{page_id}/search-results/{source_id}:retry
+POST   /projects/{project_id}/pages/{page_id}/search-queries:generate
+POST   /projects/{project_id}/pages/{page_id}/search:run
+POST   /projects/{project_id}/pages/{page_id}/summary:generate
+PATCH  /projects/{project_id}/pages/{page_id}/summary
+POST   /projects/{project_id}/pages/{page_id}/draft:generate
+GET    /projects/{project_id}/pages/{page_id}/draft
+POST   /projects/{project_id}/pages/{page_id}/design:generate
+GET    /projects/{project_id}/pages/{page_id}/design
+POST   /projects/{project_id}/actions/batch
+POST   /projects/{project_id}/tasks:cancel
+POST   /projects/{project_id}/exports
+GET    /projects/{project_id}/exports/{export_id}
+GET    /projects/{project_id}/exports/{export_id}/download
+```
+
+页级资料池按 `collection_id` 隔离。批量动作会跳过未过期页，并按页并发入队。
+
+PPTX 导出：PNG 光栅作为主图，SVG 以 `asvg:svgBlip` 扩展写入。任一页缺少 ready 设计稿则 422。
+
+### 模型设置
+
+```text
+GET    /settings/models
+POST   /settings/models
+PATCH  /settings/models/{provider_id}
+DELETE /settings/models/{provider_id}
+POST   /settings/models/{provider_id}/test
+POST   /settings/models:catalog
+GET    /settings/model-bindings
+PUT    /settings/model-bindings
+GET    /settings/search
+PUT    /settings/search
+```
+
+角色有 `context`、`svg`、`search`。搜索方式可选博查 Key 或大模型联网搜索。API Key 脱敏返回。`.env` 为空时启动不崩，前端引导去配置。
+
+## 测试
+
+```powershell
+$env:PYTHONPATH="backend"
+.venv\Scripts\python.exe -m pytest backend/tests
 ```

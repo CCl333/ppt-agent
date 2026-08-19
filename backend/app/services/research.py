@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import math
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
@@ -11,7 +10,7 @@ from urllib.parse import urldefrag
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.models.base import now_utc
+from app.models.base import is_cache_fresh, now_utc
 from app.models.entities import (
     BochaSearchCache,
     Citation,
@@ -20,13 +19,12 @@ from app.models.entities import (
     ProjectResearchSource,
     ResearchSession,
     ResearchSource,
-    RetrievalCandidate,
-    RetrievalRun,
     SourceChunk,
     SourceCollection,
     SourceDocument,
     URLContentCache,
 )
+from app.services.evidence import estimate_tokens, select_evidence
 from app.services.mcp_gateway import McpGateway, ReadResult, SearchResult
 from app.services.model_gateway import ModelGateway
 from app.services.prompt_contracts import get_prompt_text, render_prompt
@@ -122,6 +120,8 @@ class ResearchService:
                         "items": self.build_search_result_cards(items),
                     }
                 )
+        if not items:
+            raise RuntimeError("搜索没有返回有效网页来源。请确认该模型已开启实时搜索，或改用博查 Key。")
         return items
 
     def build_search_result_cards(self, search_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -228,7 +228,8 @@ class ResearchService:
                 collection,
                 result,
                 read_result,
-                defer_embedding=True,
+                extra_metadata={"search_rank": candidate.get("search_rank")},
+                defer_chunks=True,
             )
             if chunks:
                 self.store_chunk_embeddings(
@@ -368,7 +369,7 @@ class ResearchService:
         *,
         on_embedding_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
-        self._store_chunk_embeddings(chunk_records, on_embedding_progress=on_embedding_progress)
+        self._store_chunks(chunk_records, on_chunk_progress=on_embedding_progress)
         return {
             "document_count": len({item["document"].id for item in chunk_records}),
             "chunk_count": len(chunk_records),
@@ -432,116 +433,39 @@ class ResearchService:
         query_plan: list[dict[str, str]],
         limit: int,
     ) -> list[dict[str, Any]]:
-        chunk_stmt = (
-            select(SourceChunk)
-            .join(SourceDocument, SourceDocument.id == SourceChunk.source_document_id)
-            .where(SourceDocument.collection_id == collection.id)
-            .options(selectinload(SourceChunk.source_document))
-        )
-        chunks = list(self.session.scalars(chunk_stmt))
-        if not chunks:
-            research_session.selected_citations_json = []
-            return []
-
-        query_texts = [item["query_text"] for item in query_plan]
-        query_embeddings = self.models.embed_texts(query_texts)
-        combined_scores: dict[str, dict[str, Any]] = {}
-
-        for query_index, query_text in enumerate(query_texts):
-            retrieval_run = RetrievalRun(
-                project_id=project.id,
-                research_session_id=research_session.id,
-                query_text=query_text,
-                retrieval_mode="hybrid" if query_embeddings else "keyword",
-                status="running",
-            )
-            self.session.add(retrieval_run)
-            self.session.flush()
-
-            query_embedding = query_embeddings[query_index] if query_index < len(query_embeddings) else None
-            ranked: list[dict[str, Any]] = []
-            for chunk in chunks:
-                keyword_score = self._keyword_score(query_text, chunk.content_for_embedding)
-                vector_score = self._cosine_similarity(query_embedding, chunk.embedding)
-                final_score = keyword_score
-                if query_embedding and chunk.embedding:
-                    final_score = (keyword_score * 0.45) + (vector_score * 0.55)
-                if final_score <= 0:
-                    continue
-                ranked.append(
-                    {
-                        "chunk": chunk,
-                        "document": chunk.source_document,
-                        "score_keyword": keyword_score,
-                        "score_vector": vector_score,
-                        "score_final": final_score,
-                    }
-                )
-            ranked.sort(key=lambda item: item["score_final"], reverse=True)
-            for rank_no, item in enumerate(ranked[:20], start=1):
-                self.session.add(
-                    RetrievalCandidate(
-                        retrieval_run_id=retrieval_run.id,
-                        source_document_id=item["document"].id,
-                        chunk_id=item["chunk"].id,
-                        score_vector=item["score_vector"],
-                        score_keyword=item["score_keyword"],
-                        score_final=item["score_final"],
-                        selected=False,
-                    )
-                )
-                combined = combined_scores.setdefault(
-                    item["chunk"].id,
-                    {
-                        "chunk": item["chunk"],
-                        "document": item["document"],
-                        "rrf_score": 0.0,
-                        "score_keyword": 0.0,
-                        "score_vector": 0.0,
-                        "usage_queries": [],
-                    },
-                )
-                combined["rrf_score"] += 1.0 / (60 + rank_no)
-                combined["score_keyword"] = max(combined["score_keyword"], item["score_keyword"])
-                combined["score_vector"] = max(combined["score_vector"], item["score_vector"])
-                combined["usage_queries"].append(query_text)
-            retrieval_run.status = "completed"
-            self.session.flush()
-
-        ranked_candidates = sorted(
-            combined_scores.values(),
-            key=lambda item: item["rrf_score"] + (item["score_vector"] * 0.1) + (item["score_keyword"] * 0.1),
-            reverse=True,
-        )
-
+        selected_items = select_evidence(self.session, collection.id, limit=limit)
         self.session.execute(
             delete(ProjectResearchSource).where(ProjectResearchSource.research_session_id == research_session.id)
         )
         self.session.execute(delete(ResearchSource).where(ResearchSource.research_session_id == research_session.id))
         self.session.flush()
+        if not selected_items:
+            research_session.selected_citations_json = []
+            return []
+
+        usage_note = ""
+        if query_plan:
+            first_query = str(query_plan[0].get("query_text") or "").strip()
+            if first_query:
+                usage_note = f"用于支撑查询：{first_query}"
 
         selected_payloads: list[dict[str, Any]] = []
         selected_texts: list[str] = []
-        for item in ranked_candidates:
-            excerpt = self._clip_excerpt(item["chunk"].content_md, limit=420)
+        for item in selected_items:
+            excerpt = self._clip_excerpt(item.chunk.content_md, limit=420)
             if self._is_duplicate_excerpt(excerpt, selected_texts):
                 continue
             selected_texts.append(excerpt)
             rank_no = len(selected_payloads) + 1
-            relevance_score = round(
-                item["rrf_score"] + (item["score_vector"] * 0.1) + (item["score_keyword"] * 0.1),
-                6,
-            )
-            usage_note = f"用于支撑查询：{item['usage_queries'][0]}" if item["usage_queries"] else ""
-            citation = self._get_or_create_citation(project.id, item["document"], item["chunk"], excerpt)
+            citation = self._get_or_create_citation(project.id, item.document, item.chunk, excerpt)
             self.session.add(
                 ProjectResearchSource(
                     research_session_id=research_session.id,
-                    source_document_id=item["document"].id,
-                    chunk_id=item["chunk"].id,
+                    source_document_id=item.document.id,
+                    chunk_id=item.chunk.id,
                     rank_no=rank_no,
                     excerpt_md=excerpt,
-                    relevance_score=relevance_score,
+                    relevance_score=float(max(0, 1000 - item.search_rank)),
                     usage_note=usage_note,
                     is_pinned=False,
                 )
@@ -549,24 +473,26 @@ class ResearchService:
             self.session.add(
                 ResearchSource(
                     research_session_id=research_session.id,
-                    title=item["document"].title,
-                    url=item["document"].source_uri,
+                    title=item.document.title,
+                    url=item.document.source_uri,
                     snippet=excerpt,
-                    content_md=item["chunk"].content_md,
+                    content_md=item.chunk.content_md,
                 )
             )
             selected_payloads.append(
                 {
                     "citation_id": citation.id,
-                    "source_document_id": item["document"].id,
-                    "chunk_id": item["chunk"].id,
-                    "title": item["document"].title,
-                    "url": item["document"].source_uri,
+                    "source_document_id": item.document.id,
+                    "chunk_id": item.chunk.id,
+                    "title": item.document.title,
+                    "url": item.document.source_uri,
                     "excerpt_md": excerpt,
                     "citation_label": citation.citation_label,
                     "rank_no": rank_no,
-                    "relevance_score": relevance_score,
+                    "relevance_score": float(max(0, 1000 - item.search_rank)),
                     "usage_note": usage_note,
+                    "search_rank": item.search_rank,
+                    "chunk_index": item.chunk.chunk_index,
                 }
             )
             if len(selected_payloads) >= limit:
@@ -620,11 +546,22 @@ class ResearchService:
         query_key = self._query_key(query_text)
         cache = self.session.scalar(select(BochaSearchCache).where(BochaSearchCache.query_key == query_key))
         now = now_utc()
-        if cache and (cache.expires_at is None or cache.expires_at > now):
+        if cache and is_cache_fresh(cache.expires_at, now):
             items = cache.result_json.get("items", [])
-            return [SearchResult(**item) for item in items if item.get("url")]
+            return [
+                SearchResult(
+                    title=str(item.get("title") or item.get("url") or ""),
+                    url=str(item.get("url") or ""),
+                    snippet=str(item.get("snippet") or item.get("bocha_summary") or ""),
+                    provider=str(item.get("provider") or "bocha-mcp"),
+                )
+                for item in items
+                if item.get("url")
+            ]
 
         results = self.mcp.search_web(query_text, limit=limit)
+        if not results:
+            return []
         payload = {"items": [item.__dict__ for item in results]}
         if cache is None:
             cache = BochaSearchCache(
@@ -647,7 +584,7 @@ class ResearchService:
         normalized_url = self._normalize_url(url)
         now = now_utc()
         cache = self.session.scalar(select(URLContentCache).where(URLContentCache.normalized_url == normalized_url))
-        if cache and cache.status == "ready" and (cache.expires_at is None or cache.expires_at > now):
+        if cache and cache.status == "ready" and is_cache_fresh(cache.expires_at, now):
             return ReadResult(
                 title=cache.title,
                 markdown_content=cache.markdown_content,
@@ -748,7 +685,8 @@ class ResearchService:
                     collection,
                     result,
                     read_result,
-                    defer_embedding=True,
+                    extra_metadata={"search_rank": candidate.get("search_rank")},
+                    defer_chunks=True,
                 )
                 candidate["title"] = read_result.title or result.title
                 candidate["content_excerpt_md"] = self._clip_excerpt(read_result.markdown_content, limit=320)
@@ -788,7 +726,8 @@ class ResearchService:
         search_result: SearchResult,
         read_result: ReadResult,
         *,
-        defer_embedding: bool = False,
+        extra_metadata: dict[str, Any] | None = None,
+        defer_chunks: bool = False,
     ) -> tuple[SourceDocument, list[dict[str, Any]], bool]:
         normalized_url = self._normalize_url(search_result.url)
         cache = self.session.scalar(select(URLContentCache).where(URLContentCache.normalized_url == normalized_url))
@@ -799,6 +738,12 @@ class ResearchService:
             )
         )
         content_hash = self._hash_text(read_result.markdown_content)
+        metadata_json = {
+            "provider": read_result.provider,
+            "snippet": search_result.snippet,
+            **read_result.metadata,
+            **(extra_metadata or {}),
+        }
         if document is None:
             document = SourceDocument(
                 collection_id=collection.id,
@@ -807,11 +752,7 @@ class ResearchService:
                 url_cache_id=cache.id if cache else None,
                 title=read_result.title or search_result.title,
                 markdown_content=read_result.markdown_content,
-                metadata_json={
-                    "provider": read_result.provider,
-                    "snippet": search_result.snippet,
-                    **read_result.metadata,
-                },
+                metadata_json=metadata_json,
                 content_hash=content_hash,
                 status="ready",
             )
@@ -821,16 +762,15 @@ class ResearchService:
         elif document.content_hash == content_hash and self.session.scalar(
             select(SourceChunk.id).where(SourceChunk.source_document_id == document.id).limit(1)
         ):
+            merged = dict(document.metadata_json or {})
+            merged.update(extra_metadata or {})
+            document.metadata_json = merged
             return document, [], True
         else:
             document.url_cache_id = cache.id if cache else document.url_cache_id
             document.title = read_result.title or search_result.title
             document.markdown_content = read_result.markdown_content
-            document.metadata_json = {
-                "provider": read_result.provider,
-                "snippet": search_result.snippet,
-                **read_result.metadata,
-            }
+            document.metadata_json = metadata_json
             document.content_hash = content_hash
             document.status = "ready"
             self.session.execute(delete(SourceChunk).where(SourceChunk.source_document_id == document.id))
@@ -838,9 +778,9 @@ class ResearchService:
             reused_existing = False
 
         chunks = self._chunk_markdown(document.title, document.markdown_content)
-        if defer_embedding:
+        if defer_chunks:
             return document, chunks, reused_existing
-        self._store_chunk_embeddings(
+        self._store_chunks(
             [
                 {
                     "document": document,
@@ -851,33 +791,16 @@ class ResearchService:
         )
         return document, [], reused_existing
 
-    def _store_chunk_embeddings(
+    def _store_chunks(
         self,
         chunk_records: list[dict[str, Any]],
         *,
-        on_embedding_progress: Callable[[dict[str, Any]], None] | None = None,
+        on_chunk_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         if not chunk_records:
             return
-        batch_size = 32
-        embeddings: list[list[float] | None] = [None] * len(chunk_records)
         total_chunks = len(chunk_records)
         total_documents = len({item["document"].id for item in chunk_records})
-        for start in range(0, len(chunk_records), batch_size):
-            batch = chunk_records[start : start + batch_size]
-            texts = [item["chunk"]["content_for_embedding"] for item in batch]
-            batch_embeddings = self.models.embed_texts(texts)
-            for index, embedding in enumerate(batch_embeddings):
-                embeddings[start + index] = embedding
-            if on_embedding_progress is not None:
-                on_embedding_progress(
-                    {
-                        "completed_chunks": min(start + len(batch), total_chunks),
-                        "total_chunks": total_chunks,
-                        "document_count": total_documents,
-                    }
-                )
-
         for index, item in enumerate(chunk_records):
             document = item["document"]
             chunk = item["chunk"]
@@ -888,10 +811,17 @@ class ResearchService:
                     section_path=chunk["section_path"],
                     content_md=chunk["content_md"],
                     content_for_embedding=chunk["content_for_embedding"],
-                    embedding=embeddings[index] if index < len(embeddings) else None,
                     token_count=chunk["token_count"],
                 )
             )
+            if on_chunk_progress is not None:
+                on_chunk_progress(
+                    {
+                        "completed_chunks": index + 1,
+                        "total_chunks": total_chunks,
+                        "document_count": total_documents,
+                    }
+                )
         self.session.flush()
 
     def _chunk_markdown(self, title: str, markdown: str) -> list[dict[str, Any]]:
@@ -1011,7 +941,7 @@ class ResearchService:
         return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
 
     def _estimate_token_count(self, text: str) -> int:
-        return max(1, len(text.split()))
+        return estimate_tokens(text)
 
     def _keyword_score(self, query: str, text: str) -> float:
         query_tokens = set(self._tokenize(query))
@@ -1019,16 +949,6 @@ class ResearchService:
         if not query_tokens or not text_tokens:
             return 0.0
         return len(query_tokens & text_tokens) / max(len(query_tokens), 1)
-
-    def _cosine_similarity(self, left: list[float] | None, right: list[float] | None) -> float:
-        if not left or not right or len(left) != len(right):
-            return 0.0
-        numerator = sum(a * b for a, b in zip(left, right))
-        left_norm = math.sqrt(sum(a * a for a in left))
-        right_norm = math.sqrt(sum(b * b for b in right))
-        if left_norm == 0 or right_norm == 0:
-            return 0.0
-        return max(0.0, numerator / (left_norm * right_norm))
 
     def _tokenize(self, text: str) -> list[str]:
         return [token for token in re.split(r"[^0-9A-Za-z\u4e00-\u9fff]+", text.lower()) if token]

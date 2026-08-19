@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Search, Plus, FileText, Clock, LoaderCircle } from 'lucide-react';
-import { ApiError, createProject, listProjects, type ProjectSummary } from '../lib/ppt-api';
+import { Search, Plus, FileText, Clock, LoaderCircle, Settings, Trash2 } from 'lucide-react';
+import { ApiError, createProject, deleteProject, getModelBindings, listProjects, type ProjectSummary } from '../lib/ppt-api';
+import ModelSettingsModal from './ModelSettingsModal';
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', {
@@ -30,6 +31,10 @@ export default function Home({ onStart }: { onStart: (project: ProjectSummary) =
   const [isLoading, setIsLoading] = useState(true);
   const [isCreating, setIsCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [needsModelSetup, setNeedsModelSetup] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<ProjectSummary | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -52,7 +57,21 @@ export default function Home({ onStart }: { onStart: (project: ProjectSummary) =
       }
     };
 
+    const loadBindings = async () => {
+      try {
+        const bindings = await getModelBindings();
+        if (!cancelled) {
+          setNeedsModelSetup(bindings.needs_setup);
+        }
+      } catch {
+        if (!cancelled) {
+          setNeedsModelSetup(true);
+        }
+      }
+    };
+
     void loadProjects();
+    void loadBindings();
     return () => {
       cancelled = true;
     };
@@ -80,9 +99,54 @@ export default function Home({ onStart }: { onStart: (project: ProjectSummary) =
     }
   };
 
+  const handleDeleteProject = async (project: ProjectSummary) => {
+    if (deletingId || isCreating) {
+      return;
+    }
+    setPendingDelete(project);
+  };
+
+  const confirmDeleteProject = async () => {
+    if (!pendingDelete || deletingId || isCreating) {
+      return;
+    }
+    const project = pendingDelete;
+    setDeletingId(project.project_id);
+    setError(null);
+    try {
+      await deleteProject(project.project_id);
+      setProjects((current) => current.filter((item) => item.project_id !== project.project_id));
+      setPendingDelete(null);
+    } catch (caughtError) {
+      if (caughtError instanceof ApiError) {
+        setError(caughtError.message);
+      } else {
+        setError('项目删除失败');
+      }
+      setPendingDelete(null);
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
   return (
     <div className="max-w-5xl mx-auto pt-32 px-6">
+      <button
+        onClick={() => setIsSettingsOpen(true)}
+        className="fixed right-6 top-6 z-40 rounded-full border border-slate-200 bg-white p-3 text-slate-500 shadow-sm hover:bg-slate-50 hover:text-slate-800"
+        aria-label="模型设置"
+      >
+        <Settings size={18} />
+      </button>
       <h1 className="text-5xl font-bold text-center mb-12 text-slate-800 tracking-tight">AI PPT 生成助手</h1>
+      {needsModelSetup ? (
+        <button
+          onClick={() => setIsSettingsOpen(true)}
+          className="max-w-3xl mx-auto mb-6 block w-full rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-left text-sm text-amber-800 hover:bg-amber-100"
+        >
+          尚未完成模型、搜索或解析配置。点击此处导入并绑定后才能生成 PPT。
+        </button>
+      ) : null}
 
       <div
         className={`max-w-3xl mx-auto rounded-[2rem] border border-slate-100 bg-white p-5 shadow-lg shadow-slate-200/50 transition-shadow hover:shadow-xl hover:shadow-slate-200/50 ${
@@ -162,6 +226,18 @@ export default function Home({ onStart }: { onStart: (project: ProjectSummary) =
                   <div className={`absolute right-3 top-3 rounded-md px-2 py-1 text-[10px] font-medium backdrop-blur-md ${projectPreviewTone(project)}`}>
                     {projectPreviewLabel(project)}
                   </div>
+                  <button
+                    type="button"
+                    aria-label="删除项目"
+                    disabled={deletingId === project.project_id}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void handleDeleteProject(project);
+                    }}
+                    className="absolute left-3 top-3 rounded-lg border border-white/40 bg-white/90 p-1.5 text-slate-400 opacity-0 shadow-sm backdrop-blur-md transition-all hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600 group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {deletingId === project.project_id ? <LoaderCircle size={14} className="animate-spin" /> : <Trash2 size={14} />}
+                  </button>
                 </div>
                 <h3 className="font-medium text-slate-800 group-hover:text-blue-600 transition-colors line-clamp-2">
                   {project.title}
@@ -171,6 +247,56 @@ export default function Home({ onStart }: { onStart: (project: ProjectSummary) =
             ))}
         </div>
       </div>
+      <ModelSettingsModal
+        open={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+        onBindingsChange={setNeedsModelSetup}
+      />
+      {pendingDelete ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 p-6 backdrop-blur-sm"
+          onClick={() => {
+            if (!deletingId) {
+              setPendingDelete(null);
+            }
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-project-title"
+            className="w-full max-w-md rounded-[1.75rem] border border-slate-200 bg-white p-6 shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3 id="delete-project-title" className="text-lg font-semibold text-slate-800">
+              删除项目
+            </h3>
+            <p className="mt-3 text-sm leading-6 text-slate-600">
+              确定删除「{pendingDelete.title}」？删除后无法恢复。
+            </p>
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                type="button"
+                disabled={Boolean(deletingId)}
+                onClick={() => setPendingDelete(null)}
+                className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={Boolean(deletingId)}
+                onClick={() => {
+                  void confirmDeleteProject();
+                }}
+                className="rounded-xl bg-rose-600 px-4 py-2 text-sm font-medium text-white hover:bg-rose-700 disabled:opacity-40"
+              >
+                {deletingId ? '删除中...' : '确认删除'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

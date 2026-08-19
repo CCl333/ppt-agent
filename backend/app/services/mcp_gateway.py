@@ -30,10 +30,18 @@ class McpGateway:
         self.settings = settings or get_settings()
 
     def search_web(self, query: str, limit: int = 5) -> list[SearchResult]:
-        if not self.settings.mcp_bocha_auth_header:
-            raise RuntimeError("未配置 Bocha 搜索鉴权信息")
+        from app.services.search_settings import snapshot_search_runtime
+
+        runtime = snapshot_search_runtime()
+        if runtime.mode == "llm":
+            return self._search_with_llm(query, limit)
+        return self._search_with_bocha(query, limit, runtime.bocha_auth_header)
+
+    def _search_with_bocha(self, query: str, limit: int, auth_header: str) -> list[SearchResult]:
+        if not auth_header:
+            raise RuntimeError("未配置 Bocha 搜索鉴权信息，请在设置页填写博查 Key，或改用大模型搜索")
         try:
-            headers = {"Authorization": self.settings.mcp_bocha_auth_header}
+            headers = {"Authorization": auth_header}
             response = httpx.post(
                 "https://api.bochaai.com/v1/web-search",
                 headers=headers,
@@ -45,29 +53,30 @@ class McpGateway:
         except Exception as exc:
             raise RuntimeError(f"bocha search failed: {exc}") from exc
 
+    def _search_with_llm(self, query: str, limit: int) -> list[SearchResult]:
+        from app.services.model_gateway import ModelGateway
+
+        rows = ModelGateway(self.settings).search_live(query, limit=limit)
+        return [
+            SearchResult(
+                title=row["title"],
+                url=row["url"],
+                snippet=row["snippet"],
+                provider="llm-search",
+            )
+            for row in rows
+            if row.get("url")
+        ]
+
     def read_url_markdown(self, url: str) -> ReadResult:
-        providers: list[str] = []
-        if self.settings.mcp_jina_url:
-            providers.append("jina")
-        if self.settings.mcp_firecrawl_url:
-            providers.append("firecrawl")
-        if self.settings.mcp_fetch_url:
-            providers.append("fetch")
-        if not providers:
-            raise RuntimeError("未配置任何 Markdown 读取 provider")
+        from app.services.reader_settings import snapshot_reader_runtime
 
-        last_error: Exception | None = None
-        for provider in providers:
-            try:
-                if provider == "jina":
-                    return self._read_with_jina(url)
-                if provider == "firecrawl":
-                    return self._read_with_firecrawl(url)
-                return self._read_with_fetch(url)
-            except Exception as exc:
-                last_error = exc
-
-        raise RuntimeError(f"all markdown readers failed for {url}: {last_error}")
+        runtime = snapshot_reader_runtime()
+        if runtime.mode == "tavily":
+            return self._read_with_tavily(url, runtime)
+        if runtime.mode == "firecrawl":
+            return self._read_with_firecrawl(url, runtime)
+        return self._read_with_web_fetch(url, runtime)
 
     def _parse_bocha_results(self, payload: dict[str, Any], limit: int) -> list[SearchResult]:
         candidates = payload.get("data", payload)
@@ -87,61 +96,97 @@ class McpGateway:
             if item.get("url") or item.get("link")
         ]
 
-    def _read_with_jina(self, url: str) -> ReadResult:
-        normalized = re.sub(r"^https?://", "", url, flags=re.IGNORECASE)
-        headers: dict[str, str] = {}
-        if self.settings.mcp_jina_auth_header:
-            headers["Authorization"] = self.settings.mcp_jina_auth_header
-        response = httpx.get(f"https://r.jina.ai/http://{normalized}", headers=headers, timeout=30)
+    def _read_with_web_fetch(self, url: str, runtime) -> ReadResult:
+        errors: list[str] = []
+        if runtime.tavily_api_key:
+            try:
+                result = self._read_with_tavily(url, runtime)
+                return ReadResult(
+                    title=result.title,
+                    markdown_content=result.markdown_content,
+                    provider="web_fetch",
+                    metadata={**result.metadata, "reader": "tavily"},
+                )
+            except Exception as exc:
+                errors.append(f"tavily: {exc}")
+        if runtime.firecrawl_api_key:
+            try:
+                result = self._read_with_firecrawl(url, runtime)
+                return ReadResult(
+                    title=result.title,
+                    markdown_content=result.markdown_content,
+                    provider="web_fetch",
+                    metadata={**result.metadata, "reader": "firecrawl", "fallback": bool(errors)},
+                )
+            except Exception as exc:
+                errors.append(f"firecrawl: {exc}")
+        if not runtime.tavily_api_key and not runtime.firecrawl_api_key:
+            raise RuntimeError("未配置 Tavily / Firecrawl，请在设置页填写解析 Key，或改用 grok-search web_fetch 所需的密钥")
+        raise RuntimeError(f"grok-search web_fetch 失败: {url}: {'; '.join(errors)}")
+
+    def _read_with_tavily(self, url: str, runtime) -> ReadResult:
+        if not runtime.tavily_api_key:
+            raise RuntimeError("未配置 Tavily Key，请在设置页填写")
+        response = httpx.post(
+            runtime.tavily_extract_url,
+            headers={"Authorization": f"Bearer {runtime.tavily_api_key}"},
+            json={
+                "api_key": runtime.tavily_api_key,
+                "urls": [url],
+                "format": "markdown",
+            },
+            timeout=45,
+        )
         response.raise_for_status()
-        raw_markdown = response.text.strip()
-        markdown = self._strip_jina_wrapper(raw_markdown)
+        payload = response.json()
+        failed = payload.get("failed_results") or payload.get("failedUrls") or []
+        results = payload.get("results") or payload.get("data") or []
+        row = results[0] if isinstance(results, list) and results else {}
+        markdown = str(
+            row.get("raw_content")
+            or row.get("markdown")
+            or row.get("content")
+            or payload.get("raw_content")
+            or ""
+        ).strip()
         if len(markdown) < 120:
-            raise RuntimeError("jina markdown too short")
+            detail = failed[0] if failed else "tavily markdown too short"
+            raise RuntimeError(str(detail))
+        title = str(row.get("title") or "").strip() or self._extract_markdown_title(url, markdown)
         return ReadResult(
-            title=self._extract_markdown_title(url, raw_markdown),
+            title=title,
             markdown_content=markdown,
-            provider="jina",
+            provider="tavily",
             metadata={"source_url": url},
         )
 
-    def _read_with_firecrawl(self, url: str) -> ReadResult:
+    def _read_with_firecrawl(self, url: str, runtime) -> ReadResult:
+        if not runtime.firecrawl_api_key:
+            raise RuntimeError("未配置 Firecrawl Key，请在设置页填写")
         response = httpx.post(
-            self.settings.mcp_firecrawl_url.rstrip("/"),
+            runtime.firecrawl_scrape_url,
+            headers={"Authorization": f"Bearer {runtime.firecrawl_api_key}"},
             json={"url": url, "formats": ["markdown"]},
             timeout=45,
         )
         response.raise_for_status()
         payload = response.json()
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         markdown = (
             payload.get("markdown")
-            or payload.get("data", {}).get("markdown")
+            or data.get("markdown")
             or payload.get("result", {}).get("markdown")
             or ""
         ).strip()
         if len(markdown) < 120:
             raise RuntimeError("firecrawl markdown too short")
+        metadata = data.get("metadata") or payload.get("metadata") or {}
+        title = str(metadata.get("title") or "").strip() or self._extract_markdown_title(url, markdown)
         return ReadResult(
-            title=self._extract_markdown_title(url, markdown),
+            title=title,
             markdown_content=markdown,
             provider="firecrawl",
-            metadata={"source_url": url, "payload_meta": payload.get("metadata", {})},
-        )
-
-    def _read_with_fetch(self, url: str) -> ReadResult:
-        response = httpx.get(url, timeout=30, follow_redirects=True)
-        response.raise_for_status()
-        content_type = (response.headers.get("content-type") or "").lower()
-        if "text/markdown" not in content_type and "text/plain" not in content_type:
-            raise RuntimeError("fetch provider did not return markdown/plain text")
-        markdown = response.text.strip()
-        if len(markdown) < 120:
-            raise RuntimeError("fetch markdown too short")
-        return ReadResult(
-            title=self._extract_markdown_title(url, markdown),
-            markdown_content=markdown,
-            provider="fetch",
-            metadata={"source_url": url},
+            metadata={"source_url": url, "payload_meta": metadata},
         )
 
     def _extract_markdown_title(self, url: str, markdown: str) -> str:
@@ -150,21 +195,3 @@ class McpGateway:
             if cleaned:
                 return cleaned[:180]
         return url
-
-    def _strip_jina_wrapper(self, markdown: str) -> str:
-        lines = markdown.splitlines()
-        if len(lines) < 5:
-            return markdown
-        if not lines[0].startswith("Title:"):
-            return markdown
-
-        body_start = None
-        for index, line in enumerate(lines):
-            if line.strip() == "Markdown Content:":
-                body_start = index + 1
-                break
-        if body_start is None:
-            return markdown
-
-        cleaned = "\n".join(lines[body_start:]).strip()
-        return cleaned or markdown

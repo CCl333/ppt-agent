@@ -37,6 +37,22 @@ def create_project(
     return service.create_project(payload.title, payload.request_text)
 
 
+@router.delete("/{project_id}")
+def delete_project(
+    project_id: str,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.delete_project(project_id)
+
+
+@router.post("/{project_id}/bootstrap:retry")
+def retry_bootstrap(
+    project_id: str,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.retry_bootstrap(project_id)
+
+
 @router.get("/{project_id}")
 def get_project(
     project_id: str,
