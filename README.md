@@ -100,7 +100,6 @@ Copy-Item .env.example .env
 - `CONTEXT_LLM_API_KEY`：文本模型 API Key（首次启动灌入模型库）
 - `SVG_LLM_API_KEY`：SVG 生成模型 API Key
 - `MCP_BOCHA_URL` / `MCP_BOCHA_AUTH_HEADER`：Bocha 检索服务
-- `MCP_JINA_URL` / `MCP_JINA_AUTH_HEADER`：Jina 检索服务
 
 ### 3. 安装依赖
 

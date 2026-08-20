@@ -26,7 +26,7 @@ $env:PYTHONPATH="backend"
 ```
 
 - 配置统一读仓库根 `.env`（复制 `.env.example`）。关键项：`DATABASE_URL`（本地可用 `sqlite:///./backend/data/ppt_agent.db`）、`CONTEXT_LLM_API_KEY`、`SVG_LLM_API_KEY`、`MCP_BOCHA_URL`、`TAVILY_API_KEY`（抓全文）。搜索/解析/模型也可在设置页配置并存库（`services/*_settings.py`），`.env` 只作种子。
-- **已失效的配置项，不要照旧文档使用**：`EMBEDDING_API_KEY` / `EMBEDDING_*` 在 `core/config.py` 里**根本不存在**（`extra="ignore"` 会静默吞掉），全仓也没有任何 `/embeddings` 调用——`store_chunk_embeddings()` 只做切块入库，`vector_status` 字段和前端"向量完成"徽章都是重构残留，检索走的是 `services/evidence.py` 的确定性 `select_evidence`（Bocha 排名 + 每文档前 6 段 + token 预算），没有向量。`MCP_JINA_URL` 虽在 config 里但 `mcp_gateway` 不用它，抓全文只有 tavily / firecrawl / web_fetch（`services/reader_settings.py`）。
+- 检索走 `services/evidence.py` 的确定性 `select_evidence`（可选关键词相关性 + Bocha 排名 + token 预算），没有向量。抓全文只有 tavily / firecrawl / web_fetch（`services/reader_settings.py`）。
 - 测试：pyproject 配置了 pytest（`testpaths = ["tests"]`，需 `pip install -e "backend[dev]"`），但 `backend/tests/` 目前不存在——新增测试放在该目录。
 - 前端换后端地址：`$env:VITE_API_PROXY_TARGET="http://host:8000"`。
 

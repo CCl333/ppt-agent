@@ -15,7 +15,7 @@ function formatDate(value: string): string {
 
 function projectPreviewLabel(project: ProjectSummary): string {
   if (project.preview_surface === 'design') return '首页设计稿';
-  if (project.preview_surface === 'draft') return '首页初稿';
+  if (project.preview_surface === 'draft') return '首页策划稿';
   return '方案兜底';
 }
 

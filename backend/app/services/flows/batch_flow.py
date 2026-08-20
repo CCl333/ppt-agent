@@ -26,7 +26,7 @@ class BatchFlowMixin:
         run = AgentRunRecorder(
             service=self,
             project=project,
-            stage=project.current_stage if project.current_stage != "outline" else "search",
+            stage=project.current_stage,
             scope_type="project",
             target_page_id=None,
             title=f"批量执行：{action_type}",

@@ -35,12 +35,13 @@ _ROLE_MISSING_MESSAGES = {
 }
 _SEARCH_SYSTEM = (
     "你必须使用实时网页搜索，只根据检索到的公开网页作答。"
-    "只输出 JSON 对象：{\"items\":[{\"title\":\"...\",\"url\":\"https://...\",\"snippet\":\"...\"}]}。"
-    "url 必须是检索返回的真实链接。禁止编造来源。若没有检索结果，返回 {\"items\":[]}。"
+    "按给定标题整理这一页需要的资料，输出 JSON 对象："
+    "{\"digest_md\":\"整理稿正文（Markdown）\",\"items\":[{\"title\":\"...\",\"url\":\"https://...\",\"snippet\":\"...\"}]}。"
+    "url 必须是检索返回的真实链接。禁止编造来源。若没有检索结果，返回 {\"digest_md\":\"\",\"items\":[]}。"
 )
 _GROK_SEARCH_SYSTEM = (
     "你必须使用实时网页搜索，只根据检索到的公开网页作答。"
-    "在回答末尾用 Markdown 链接列出信源，每条一行：- [标题](https://...) 一句话摘要。"
+    "按给定标题整理这一页需要的资料：先输出整理稿正文（Markdown），再在回答末尾用 Markdown 链接列出信源，每条一行：- [标题](https://...) 一句话摘要。"
     "url 必须是检索返回的真实链接。禁止编造来源。若没有检索结果，写「没有检索结果」。"
 )
 _MD_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
@@ -464,6 +465,56 @@ def _is_live_search_unsupported(exc: Exception) -> bool:
     return any(item in text for item in needles)
 
 
+@dataclass(frozen=True)
+class LiveSearchDigest:
+    answer: str
+    items: list[dict[str, str]]
+
+
+def _payload_message_text(payload: dict[str, Any]) -> str:
+    try:
+        text = payload["choices"][0]["message"]["content"] or ""
+        if str(text).strip():
+            return str(text)
+    except (KeyError, IndexError, TypeError):
+        pass
+    chunks: list[str] = []
+    for part in payload.get("content") or []:
+        if isinstance(part, dict) and part.get("type") == "text":
+            chunks.append(str(part.get("text") or ""))
+    joined = "".join(chunks).strip()
+    if joined:
+        return joined
+    try:
+        return _extract_responses_text(payload)
+    except Exception:
+        return ""
+
+
+def _loads_json_object(text: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        wrapped = re.search(r"\{[\s\S]*\}", text)
+        if not wrapped:
+            return None
+        try:
+            parsed = json.loads(wrapped.group(0))
+        except json.JSONDecodeError:
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def parse_search_live_answer(payload: dict[str, Any]) -> str:
+    text = _payload_message_text(payload).strip()
+    if not text:
+        return ""
+    parsed = _loads_json_object(text)
+    if isinstance(parsed, dict) and "digest_md" in parsed:
+        return str(parsed.get("digest_md") or "").strip()
+    return text
+
+
 def parse_search_live_payload(payload: dict[str, Any], *, limit: int) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -594,7 +645,7 @@ class ModelGateway:
         )
         return extract_and_validate_svg(text)
 
-    def search_live(self, query: str, *, limit: int = 5) -> list[dict[str, str]]:
+    def search_live(self, query: str, *, limit: int = 5) -> LiveSearchDigest:
         client = self._client("search")
         system_prompt = _GROK_SEARCH_SYSTEM if _looks_like_grok(client.config) else _SEARCH_SYSTEM
         try:
@@ -607,7 +658,10 @@ class ModelGateway:
             raise
         except httpx.RemoteProtocolError as exc:
             raise RuntimeError("搜索模型连接中断，请稍后重试") from exc
-        return parse_search_live_payload(payload, limit=limit)
+        return LiveSearchDigest(
+            answer=parse_search_live_answer(payload),
+            items=parse_search_live_payload(payload, limit=limit),
+        )
 
     def _client(self, role: str, *, required: bool = True) -> _OpenAICompatibleClient | None:
         snapshot = snapshot_bound_provider(role)

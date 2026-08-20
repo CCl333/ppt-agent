@@ -50,6 +50,22 @@ def make_project(
         },
         ai_questions_json=questions if questions is not None else [{"question_code": "q1", "label": "补充问题"}],
         init_corpus_digest_json={"document_count": document_count},
+        init_search_results_json=(
+            [
+                {
+                    "id": "init-src",
+                    "query_text": "fixture",
+                    "query_purpose": "fixture",
+                    "search_rank": 1,
+                    "title": "初始化摘要",
+                    "url": "https://example.com/init",
+                    "bocha_summary": "fixture summary",
+                    "snippet": "fixture summary",
+                }
+            ]
+            if document_count
+            else []
+        ),
         fixed_items_json={},
     )
     session.add(form)
@@ -92,7 +108,7 @@ def make_content_page(
                 "bocha_summary": "fixture summary",
                 "snippet": "fixture summary",
                 "read_status": "ready",
-                "vector_status": "ready",
+                "chunk_status": "ready",
             }
         ],
         page_corpus_digest_json={"document_count": 1},
@@ -166,7 +182,7 @@ def add_page_chunk(
         source_document_id=document.id,
         chunk_index=0,
         content_md=content,
-        content_for_embedding=content,
+        content_for_match=content,
         token_count=len(content),
     )
     session.add(chunk)

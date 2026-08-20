@@ -45,8 +45,6 @@ class InitFlowMixin:
                     {"step_code": "I2", "step_name": "生成初始化搜索词", "reason": "把原始需求翻译成项目级查询。"},
                     {"step_code": "I3", "step_name": "执行 Bocha 搜索", "reason": "获取首轮搜索摘要。"},
                     {"step_code": "I4", "step_name": "生成页数推荐和问题", "reason": "基于搜索摘要快速产出固定项与问题。"},
-                    {"step_code": "I5", "step_name": "抓取全文并写入 init_corpus", "reason": "把摘要结果扩展成可引用正文。"},
-                    {"step_code": "I6", "step_name": "切块入库 init_corpus", "reason": "把正文切块，供后续确定性选证据使用。"},
                 ],
             )
         )
@@ -139,93 +137,11 @@ class InitFlowMixin:
                 }
             )
             run.step_completed("I4", "生成页数推荐和问题", {"question_count": len(requirement_form.ai_questions_json)})
-
-            current_step_code = "I5"
-            current_step_name = "抓取全文并写入 init_corpus"
-            run.step_started("I5", "抓取全文并写入 init_corpus", "把摘要结果扩展成可引用正文。")
-            init_collection = self.research.get_or_create_init_collection(project)
-
-            def on_init_read_progress(payload: dict[str, Any]) -> None:
-                run.step_progress(
-                    "I5",
-                    "抓取全文并写入 init_corpus",
-                    progress={
-                        "current": payload["completed"],
-                        "total": payload["total"],
-                        "label": f"已处理 {payload['completed']}/{payload['total']} 条来源",
-                    },
-                    result={
-                        "ingested_count": payload["ingested_count"],
-                        "failed_count": payload["failed_count"],
-                    },
-                )
-
-            candidate_sources, pending_chunk_records, read_summary = self.research.hydrate_search_results(
-                collection=init_collection,
-                search_results=search_results,
-                replace=True,
-                on_read_progress=on_init_read_progress,
-            )
-            candidate_sources = self.research.refresh_search_result_cards(candidate_sources)
-            requirement_form.init_search_results_json = candidate_sources
-            run.data_updated(
-                {
-                    "entity": "requirement_form",
-                    "update_kind": "init_read",
-                    "result_count": len(candidate_sources),
-                    "read_ready": sum(1 for item in candidate_sources if item.get("read_status") in {"ready", "reused"}),
-                    "read_failed": sum(1 for item in candidate_sources if item.get("read_status") == "failed"),
-                }
-            )
-            run.step_completed(
-                "I5",
-                "抓取全文并写入 init_corpus",
-                {
-                    "result_count": len(candidate_sources),
-                    "read_ready": sum(1 for item in candidate_sources if item.get("read_status") in {"ready", "reused"}),
-                    "read_failed": sum(1 for item in candidate_sources if item.get("read_status") == "failed"),
-                    **read_summary,
-                },
-            )
-
-            current_step_code = "I6"
-            current_step_name = "切块入库 init_corpus"
-            run.step_started("I6", "切块入库 init_corpus", "把正文切块，供后续确定性选证据使用。")
-
-            def on_init_chunk_progress(payload: dict[str, Any]) -> None:
-                run.step_progress(
-                    "I6",
-                    "切块入库 init_corpus",
-                    progress={
-                        "current": payload["completed_chunks"],
-                        "total": payload["total_chunks"],
-                        "label": f"已写入 {payload['completed_chunks']}/{payload['total_chunks']} 个 chunk",
-                    },
-                    result={"document_count": payload["document_count"]},
-                )
-
-            embedding_stats = self.research.store_chunk_embeddings(
-                pending_chunk_records,
-                on_embedding_progress=on_init_chunk_progress,
-            )
-            candidate_sources = self.research.refresh_search_result_cards(candidate_sources)
-            digest = self.research.build_collection_digest(init_collection.id)
-            requirement_form.init_search_results_json = candidate_sources
-            requirement_form.init_corpus_digest_json = digest
-            run.data_updated(
-                {
-                    "entity": "requirement_form",
-                    "update_kind": "init_chunked",
-                    "document_count": digest.get("document_count", 0),
-                    "chunk_count": digest.get("chunk_count", 0),
-                }
-            )
-            run.step_completed("I6", "切块入库 init_corpus", {**digest, **embedding_stats})
             run.set_recommendations(requirement_form.suggested_actions_json)
             self._persist_agent_message(
                 run=run,
-                content_md="初始化资料已准备完成。现在可以填写页数、风格和补充问题答案；如果资料方向不对，也可以直接要求重跑项目级搜索。",
-                result_snapshot={"requirement_form_status": requirement_form.status},
+                content_md="初始化搜索摘要已准备完成。现在可以填写页数、风格和补充问题答案；如果资料方向不对，也可以直接要求重跑项目级搜索。",
+                result_snapshot={"requirement_form_status": requirement_form.status, "result_count": len(search_results)},
             )
             run.complete()
         except Exception as exc:

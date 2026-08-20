@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import {
   ApiError,
+  confirmOutline,
   connectProjectEventStream,
   createExport,
   createMessage,
@@ -33,6 +34,7 @@ import {
   patchPageOutline,
   patchStoryboard,
   patchPageSummary,
+  patchPageDraft,
   retryPageSearchResult,
   runBatchAction,
   runPageSearch,
@@ -86,9 +88,11 @@ export default function Editor({
   const [titleDraft, setTitleDraft] = useState('');
   const [bulletDraft, setBulletDraft] = useState('');
   const [summaryDraft, setSummaryDraft] = useState('');
+  const [draftSvgDraft, setDraftSvgDraft] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [isSavingOutline, setIsSavingOutline] = useState(false);
   const [isSavingSummary, setIsSavingSummary] = useState(false);
+  const [isSavingDraft, setIsSavingDraft] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [isDataModalOpen, setIsDataModalOpen] = useState(false);
@@ -214,15 +218,25 @@ export default function Editor({
   }, [onProjectUpdated, project.project_id]);
 
   useEffect(() => {
+    if (project.current_stage === 'outline') {
+      setSurface('outline');
+    } else if (surface === 'outline') {
+      setSurface('search');
+    }
+  }, [project.current_stage]);
+
+  useEffect(() => {
     if (!activePage) {
       setTitleDraft('');
       setBulletDraft('');
       setSummaryDraft('');
+      setDraftSvgDraft('');
       return;
     }
     setTitleDraft(activePage.title);
     setBulletDraft(activePage.content_outline.join('\n'));
     setSummaryDraft(activePage.page_summary_md);
+    setDraftSvgDraft(activePage.draft?.draft_svg_markup ?? '');
   }, [activePage]);
 
   const handleSaveOutline = async () => {
@@ -259,15 +273,31 @@ export default function Editor({
     }
   };
 
+  const handleSaveDraft = async () => {
+    if (!activePage || isSavingDraft) return;
+    setIsSavingDraft(true);
+    try {
+      const nextPage = await patchPageDraft(project.project_id, activePage.page_id, draftSvgDraft);
+      setActivePage(nextPage);
+      setPages((current) => replacePageSummary(current, nextPage));
+      setError(null);
+    } catch (caughtError) {
+      setError(getErrorMessage(caughtError, '策划稿保存失败'));
+    } finally {
+      setIsSavingDraft(false);
+    }
+  };
+
   const sendMessage = async (content: string, options?: { clearInput?: boolean }) => {
     const normalizedContent = content.trim();
-    if (!normalizedContent || isSendingMessage || !activePage) return;
+    const isOutlineSurface = surface === 'outline' || project.current_stage === 'outline';
+    if (!normalizedContent || isSendingMessage || (!isOutlineSurface && !activePage)) return;
     setIsSendingMessage(true);
     try {
       const message = await createMessage(project.project_id, {
-        scope_type: 'page',
-        target_page_id: activePage.page_id,
-        ui_surface: surface as UiSurface,
+        scope_type: isOutlineSurface ? 'project' : 'page',
+        target_page_id: isOutlineSurface ? null : activePage?.page_id ?? null,
+        ui_surface: (isOutlineSurface ? 'outline' : surface) as UiSurface,
         content_md: normalizedContent,
       });
       setMessages((current) => mergeMessageList(current, [message]));
@@ -432,22 +462,28 @@ export default function Editor({
     }
   };
 
-  const previewMarkup = surface === 'design' ? activePage?.design?.design_svg_markup ?? null : surface === 'draft' ? activePage?.draft?.draft_svg_markup ?? null : null;
-  const searchDisabled = activePage?.page_role !== 'content';
-  const canPresent = surface !== 'search' && pages.length > 0;
+  const handleConfirmOutline = async () => {
+    const nextProject = await confirmOutline(project.project_id);
+    onProjectUpdated(nextProject);
+    setSurface('search');
+  };
 
-  if (project.current_stage === 'outline') {
+  const previewMarkup = surface === 'design' ? activePage?.design?.design_svg_markup ?? null : surface === 'draft' ? activePage?.draft?.draft_svg_markup ?? null : null;
+  const searchDisabled = activePage?.page_role !== 'content' || project.current_stage !== 'search';
+  const canPresent = surface !== 'search' && surface !== 'outline' && pages.length > 0;
+
+  if (project.current_stage === 'outline' && !outline) {
     return (
       <div className="h-screen flex flex-col bg-[#f8f9fa]">
         <header className="h-14 bg-white border-b border-slate-200 flex items-center px-6 justify-between shrink-0">
           <button onClick={onBack} className="flex items-center gap-2 text-slate-500 hover:text-slate-800 text-sm font-medium"><ArrowLeft size={18} />返回</button>
           <div className="font-semibold text-slate-800">大纲生成中</div>
-          <div className="text-sm text-slate-400">{outline ? '大纲已生成，等待切换' : '正在处理'}</div>
+          <div className="text-sm text-slate-400">正在处理</div>
         </header>
         <div className="flex-1 flex overflow-hidden p-6 gap-6">
           <div className="flex-1 rounded-[2rem] border border-slate-200 bg-white shadow-sm p-8 space-y-4">
-            <div className="text-2xl font-semibold text-slate-800">正在生成大纲并切换到搜索工作台</div>
-            <div className="text-sm text-slate-500 leading-relaxed">右侧卡片会实时显示当前步骤和异常。这个阶段结束后会自动进入搜索工作台。</div>
+            <div className="text-2xl font-semibold text-slate-800">正在生成大纲</div>
+            <div className="text-sm text-slate-500 leading-relaxed">右侧卡片会实时显示当前步骤和异常。生成完成后可以修改章节，再确认进入资料阶段。</div>
           </div>
           <div className="w-[440px] bg-white border border-slate-200 rounded-[2rem] flex flex-col overflow-hidden shadow-sm">
             <div className="flex-1 overflow-y-auto p-5 space-y-6 bg-slate-50/50">
@@ -464,6 +500,54 @@ export default function Editor({
     );
   }
 
+  if (project.current_stage === 'outline') {
+    return (
+      <div className="h-screen flex flex-col bg-[#f8f9fa] text-slate-800">
+        <header className="h-16 bg-white border-b border-slate-200 flex items-center justify-between shrink-0 shadow-sm px-6">
+          <button onClick={onBack} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200"><ArrowLeft size={18} />返回</button>
+          <div className="font-semibold text-slate-800">确认大纲</div>
+          <button onClick={() => void runAction(handleConfirmOutline)} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl">确认大纲，开始按页找资料</button>
+        </header>
+        <div className="flex-1 flex overflow-hidden">
+          <div className="flex-1 overflow-hidden">
+            <StoryboardPanel
+              outline={outline}
+              pages={pages}
+              activePageId={activePage?.page_id ?? null}
+              surface="outline"
+              isSaving={isSavingStoryboard}
+              onJump={(pageId) => {
+                void runAction(() => handleOpenPage(pageId, 'outline'));
+              }}
+              onReorder={handleStoryboardReorder}
+            />
+          </div>
+          <div className="w-[440px] bg-white border-l border-slate-200 flex flex-col shrink-0 shadow-sm">
+            <div className="flex-1 overflow-y-auto p-5 space-y-6 bg-slate-50/50">
+              {liveRunList.map((run) => <div key={run.agent_run_id} className="flex justify-start"><AgentActivityCard run={run} /></div>)}
+              {messages.map((message) => message.role === 'assistant' ? (
+                <div key={message.id} className="flex justify-start">
+                  {agentRunFromMessage(message) ? <AgentActivityCard run={{...agentRunFromMessage(message)!, content_md: message.content_md}} accent="emerald" /> : <div className="bg-white border border-slate-200 shadow-sm px-5 py-4 rounded-2xl rounded-tl-sm max-w-[95%] w-full"><p className="text-sm text-slate-600 whitespace-pre-wrap">{message.content_md}</p></div>}
+                </div>
+              ) : (
+                <div key={message.id} className="flex justify-end">
+                  <div className="bg-blue-600 text-white px-5 py-4 rounded-2xl rounded-tr-sm max-w-[95%]"><p className="text-sm whitespace-pre-wrap">{message.content_md}</p></div>
+                </div>
+              ))}
+            </div>
+            <div className="p-5 bg-white border-t border-slate-100 space-y-3">
+              {error ? <div className="text-sm text-red-600">{error}</div> : null}
+              <div className="bg-slate-50 rounded-2xl flex items-end p-2.5 border border-slate-200">
+                <textarea value={chatInput} placeholder="例如：把第三章改成风险与对策，或增加一页案例" className="flex-1 bg-transparent border-none outline-none resize-none max-h-32 min-h-[44px] py-2.5 px-3 text-sm text-slate-700" rows={1} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void handleSendMessage(); } }} />
+                <button disabled={isSendingMessage || !chatInput.trim()} onClick={() => void handleSendMessage()} className="p-2.5 text-blue-600 hover:text-blue-700 disabled:text-slate-300">{isSendingMessage ? <LoaderCircle size={20} className="animate-spin" /> : <Send size={20} />}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="h-screen flex flex-col bg-[#f8f9fa] text-slate-800">
       <header className="h-16 bg-white border-b border-slate-200 flex items-center justify-between shrink-0 shadow-sm">
@@ -471,7 +555,7 @@ export default function Editor({
           <div className="flex bg-slate-100 p-1 rounded-xl border border-slate-200/50 w-[220px]">
             {(['search', 'draft', 'design'] as const).map((item) => (
               <button key={item} onClick={() => setSurface(item)} className={`flex-1 py-1.5 rounded-lg text-xs font-semibold transition-all ${surface === item ? 'bg-white shadow-sm text-slate-800 border border-slate-200/50' : 'text-slate-500 hover:text-slate-700'}`}>
-                {item === 'search' ? '搜索' : item === 'draft' ? '初稿' : '设计稿'}
+                {item === 'search' ? '资料' : item === 'draft' ? '策划稿' : '设计稿'}
               </button>
             ))}
           </div>
@@ -487,7 +571,7 @@ export default function Editor({
           <button onClick={() => setIsStoryboardOpen((current) => !current)} className={`flex items-center gap-2 px-4 py-2.5 text-sm font-semibold rounded-xl border transition-all ${isStoryboardOpen ? 'border-blue-200 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-700 hover:bg-slate-100'}`}><StickyNote size={18} />便利贴</button>
           <button onClick={onBack} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200"><ArrowLeft size={18} />返回</button>
           <button onClick={() => { void handleOpenPresentation(); }} disabled={!canPresent || isPreparingPresentation} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200 disabled:opacity-40">{isPreparingPresentation ? <LoaderCircle size={18} className="animate-spin" /> : <Play size={18} />}放映</button>
-          <button onClick={() => void runAction(() => surface === 'search' ? runBatchAction(project.project_id, 'project_batch_search') : surface === 'draft' ? runBatchAction(project.project_id, 'project_batch_draft') : runBatchAction(project.project_id, 'project_batch_design'))} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200"><Sparkles size={18} />{surface === 'search' ? '批量搜索' : surface === 'draft' ? '批量初稿' : '批量设计'}</button>
+          <button onClick={() => void runAction(() => surface === 'search' ? runBatchAction(project.project_id, 'project_batch_search') : surface === 'draft' ? runBatchAction(project.project_id, 'project_batch_draft') : runBatchAction(project.project_id, 'project_batch_design'))} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200"><Sparkles size={18} />{surface === 'search' ? '批量搜索' : surface === 'draft' ? '批量策划稿' : '批量设计'}</button>
           {surface === 'search' ? <button onClick={() => void runAction(() => runBatchAction(project.project_id, 'project_batch_summary'))} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200"><Wand2 size={18} />批量 summary</button> : null}
           <button disabled={!hasRunningTask} onClick={() => void runAction(() => cancelProjectTasks(project.project_id))} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-rose-700 hover:bg-rose-50 rounded-xl border border-rose-200 disabled:opacity-40"><Square size={16} />取消</button>
           <button onClick={async () => { setIsExporting(true); try { const job = await createExport(project.project_id); window.open(getExportDownloadUrl(project.project_id, job.export_id), '_blank', 'noopener,noreferrer'); setError(null); } catch (caughtError) { setError(getErrorMessage(caughtError, '导出失败')); } finally { setIsExporting(false); } }} disabled={isExporting} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl disabled:bg-blue-300">{isExporting ? <LoaderCircle size={18} className="animate-spin" /> : <Download size={18} />}导出</button>
@@ -519,13 +603,13 @@ export default function Editor({
         <div className="flex-1 flex flex-col overflow-hidden bg-[#f3f4f6]">
           <div className="border-b border-slate-200 bg-white px-8 py-5 flex items-center justify-between gap-6">
             <div><div className="text-xs uppercase tracking-wide text-slate-400">{activePage?.page_role} / {activePage?.part_title || '未分组'}</div><div className="text-2xl font-semibold text-slate-800">{activePage?.title || '未选择页面'}</div></div>
-            {surface === 'search' ? <div className="flex flex-wrap gap-2 justify-end">{renderStatusPill('搜索结果', `${searchStats.total} 条`, 'slate')}{renderStatusPill('全文完成', `${searchStats.readReady}/${searchStats.total}`, searchStats.readReady ? 'emerald' : 'amber')}{renderStatusPill('向量完成', `${searchStats.vectorReady}/${searchStats.total}`, searchStats.vectorReady ? 'blue' : 'amber')}</div> : null}
+            {surface === 'search' ? <div className="flex flex-wrap gap-2 justify-end">{renderStatusPill('搜索结果', `${searchStats.total} 条`, 'slate')}{renderStatusPill('全文完成', `${searchStats.readReady}/${searchStats.total}`, searchStats.readReady ? 'emerald' : 'amber')}{renderStatusPill('入库完成', `${searchStats.chunkReady}/${searchStats.total}`, searchStats.chunkReady ? 'blue' : 'amber')}</div> : null}
           </div>
           <div className="flex-1 overflow-auto p-8">
             {surface === 'search' ? (
               <div className="space-y-6">
                 <div className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm space-y-4">
-                  <div className="flex items-center justify-between"><div><div className="text-lg font-semibold text-slate-800">当前页资料池</div><div className="text-sm text-slate-500 mt-1">Bocha 摘要、全文抓取和向量化状态会持续写回这里。</div></div><div className="text-sm text-slate-500">文档 {activePage?.page_corpus_digest.document_count ?? 0} / chunk {activePage?.page_corpus_digest.chunk_count ?? 0}</div></div>
+                  <div className="flex items-center justify-between"><div><div className="text-lg font-semibold text-slate-800">当前页资料池</div><div className="text-sm text-slate-500 mt-1">搜索摘要、整理稿和全文抓取状态会持续写回这里。</div></div><div className="text-sm text-slate-500">文档 {activePage?.page_corpus_digest.document_count ?? 0} / chunk {activePage?.page_corpus_digest.chunk_count ?? 0}</div></div>
                   {searchDisabled ? <div className="text-sm text-slate-500">固定页不参与页级搜索，直接使用大纲结构进入 draft/design。</div> : activePage?.page_search_results.length ? <div className="space-y-4">{activePage.page_search_results.map((item) => <SearchResultCard key={item.id} item={item} onRetry={(sourceId) => { void handleRetrySearchResult(sourceId); }} retrying={Boolean(retryingSearchSourceIds[item.id])} allowRetry={!isPageSearchRunning} />)}</div> : <div className="text-sm text-slate-400">当前页还没有资料池结果。右侧聊天栏会实时显示 agent 进度。</div>}
                 </div>
                 <div className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm space-y-4">
@@ -533,7 +617,20 @@ export default function Editor({
                   {activePage?.page_summary_md ? <div className="rounded-2xl bg-slate-50 border border-slate-100 p-4 text-sm text-slate-600 leading-relaxed whitespace-pre-wrap">{activePage.page_summary_md}</div> : <div className="text-sm text-slate-400">当前页 summary 尚未生成。</div>}
                 </div>
               </div>
-            ) : <SvgCanvas markup={previewMarkup} placeholder={surface === 'draft' ? '当前页初稿尚未生成' : '当前页设计稿尚未生成'} />}
+            ) : (
+              <div className="space-y-4">
+                {surface === 'draft' ? (
+                  <div className="rounded-[2rem] border border-slate-200 bg-white px-6 py-4 shadow-sm flex items-center justify-between gap-4">
+                    <div>
+                      <div className="text-lg font-semibold text-slate-800">策划稿</div>
+                      <div className="text-sm text-slate-500 mt-1">在这一步定稿内容，确认后再生成设计稿。</div>
+                    </div>
+                    <button onClick={() => setIsDataModalOpen(true)} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"><FileText size={14} className="inline mr-1" />编辑策划稿</button>
+                  </div>
+                ) : null}
+                <SvgCanvas markup={previewMarkup} placeholder={surface === 'draft' ? '当前页策划稿尚未生成' : '当前页设计稿尚未生成'} />
+              </div>
+            )}
           </div>
         </div>
 
@@ -549,7 +646,7 @@ export default function Editor({
                   <button disabled={!activePage || searchDisabled} onClick={() => activePage && void runAction(() => generatePageSummary(project.project_id, activePage.page_id))} className="rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-40">生成 summary</button>
                 </>
               ) : surface === 'draft' ? (
-                <button disabled={!activePage} onClick={() => activePage && void runAction(() => generatePageDraft(project.project_id, activePage.page_id))} className="rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-40">生成当前页初稿</button>
+                <button disabled={!activePage} onClick={() => activePage && void runAction(() => generatePageDraft(project.project_id, activePage.page_id))} className="rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-40">生成当前页策划稿</button>
               ) : (
                 <button disabled={!activePage} onClick={() => activePage && void runAction(() => generatePageDesign(project.project_id, activePage.page_id))} className="rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-40">生成当前页设计稿</button>
               )}
@@ -583,7 +680,7 @@ export default function Editor({
           <div className="p-5 bg-white border-t border-slate-100 space-y-3">
             {error ? <div className="text-sm text-red-600">{error}</div> : null}
             <div className="bg-slate-50 rounded-2xl flex items-end p-2.5 border border-slate-200 focus-within:border-blue-500 focus-within:ring-2 focus-within:ring-blue-100 transition-all">
-              <textarea value={chatInput} placeholder={surface === 'search' ? '例如：把标题改成...，或者先只生成搜索词' : surface === 'draft' ? '例如：重生成这一页初稿，强调数据对比' : '例如：重生成设计稿，保留结构但增强层次'} className="flex-1 bg-transparent border-none outline-none resize-none max-h-32 min-h-[44px] py-2.5 px-3 text-sm text-slate-700" rows={1} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void handleSendMessage(); } }} />
+              <textarea value={chatInput} placeholder={surface === 'search' ? '例如：把标题改成...，或者先只生成搜索词' : surface === 'draft' ? '例如：重生成这一页策划稿，强调数据对比' : '例如：重生成设计稿，保留结构但增强层次'} className="flex-1 bg-transparent border-none outline-none resize-none max-h-32 min-h-[44px] py-2.5 px-3 text-sm text-slate-700" rows={1} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void handleSendMessage(); } }} />
               <button disabled={isSendingMessage || !chatInput.trim() || !activePage} onClick={() => void handleSendMessage()} className="p-2.5 text-blue-600 hover:text-blue-700 disabled:text-slate-300 disabled:cursor-not-allowed">{isSendingMessage ? <LoaderCircle size={20} className="animate-spin" /> : <Send size={20} />}</button>
             </div>
             <div className="flex items-center justify-between text-[11px] text-slate-400"><div className="flex items-center gap-1"><Database size={12} />页面上下文已绑定</div><div className="flex items-center gap-1"><Search size={12} />按 Enter 发送，Shift + Enter 换行</div></div>
@@ -599,14 +696,18 @@ export default function Editor({
         titleDraft={titleDraft}
         bulletDraft={bulletDraft}
         summaryDraft={summaryDraft}
+        draftSvgDraft={draftSvgDraft}
         onTitleChange={setTitleDraft}
         onBulletChange={setBulletDraft}
         onSummaryChange={setSummaryDraft}
+        onDraftSvgChange={setDraftSvgDraft}
         onSaveOutline={() => void handleSaveOutline()}
         onSaveSummary={() => void handleSaveSummary()}
+        onSaveDraft={() => void handleSaveDraft()}
         onClose={() => setIsDataModalOpen(false)}
         isSavingOutline={isSavingOutline}
         isSavingSummary={isSavingSummary}
+        isSavingDraft={isSavingDraft}
       />
       {isPresentationOpen ? (
         <PresentationPlayer

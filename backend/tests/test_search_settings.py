@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.services.mcp_gateway import McpGateway
+from app.services.model_gateway import LiveSearchDigest
 from app.services.search_settings import SearchRuntime, normalize_bocha_auth_header
 
 
@@ -38,6 +39,42 @@ def test_search_settings_masks_key_and_keeps_blank(client):
 
     listed = client.get("/api/v1/settings/search").json()
     assert listed["bocha_configured"] is True
+
+
+def test_search_settings_tavily_masks_key_and_keeps_blank(client):
+    saved = client.put(
+        "/api/v1/settings/search",
+        json={"mode": "tavily", "tavily_api_key": "tvly-live-secret-aaa", "tavily_api_url": "https://api.tavily.com"},
+    ).json()
+    assert saved["mode"] == "tavily"
+    assert saved["tavily_configured"] is True
+    assert saved["tavily_api_key_masked"] == "tvl***aaa"
+    assert saved["tavily_api_url"] == "https://api.tavily.com"
+    assert "tavily_api_key" not in saved
+
+    kept = client.put("/api/v1/settings/search", json={"tavily_api_key": ""}).json()
+    assert kept["tavily_api_key_masked"] == "tvl***aaa"
+    assert kept["mode"] == "tavily"
+
+
+def test_search_settings_rejects_unknown_mode(client):
+    response = client.put("/api/v1/settings/search", json={"mode": "bing"})
+    assert response.status_code == 422
+    assert "tavily" in response.json()["detail"]
+
+
+def test_tavily_mode_ready_without_llm_binding(client):
+    created = client.post("/api/v1/settings/models", json=_provider_payload()).json()
+    client.put(
+        "/api/v1/settings/model-bindings",
+        json={"context": created["provider_id"], "svg": created["provider_id"]},
+    )
+    client.put(
+        "/api/v1/settings/search",
+        json={"mode": "tavily", "tavily_api_key": "tvly-live-secret-aaa"},
+    )
+    bound = client.get("/api/v1/settings/model-bindings").json()
+    assert bound["needs_setup"] is False
 
 
 def test_llm_search_needs_binding(client):
@@ -117,6 +154,54 @@ def test_search_web_bocha_missing_key(monkeypatch):
         assert "未配置 Bocha 搜索鉴权信息" in str(exc)
 
 
+def test_search_web_tavily_uses_runtime(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"results": [{"title": "A", "url": "https://example.com/tavily", "content": "s"}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        "app.services.search_settings.snapshot_search_runtime",
+        lambda: SearchRuntime(
+            mode="tavily",
+            bocha_auth_header="",
+            tavily_api_key="tvly-db",
+            tavily_api_url="https://api.tavily.com",
+        ),
+    )
+    monkeypatch.setattr("app.services.mcp_gateway.httpx.post", fake_post)
+    results = McpGateway().search_web("北京旅游", limit=4)
+    assert captured["url"] == "https://api.tavily.com/search"
+    assert captured["headers"] == {"Authorization": "Bearer tvly-db"}
+    assert captured["json"]["query"] == "北京旅游"
+    assert captured["json"]["max_results"] == 4
+    assert results[0].url == "https://example.com/tavily"
+    assert results[0].provider == "tavily"
+    assert results[0].snippet == "s"
+
+
+def test_search_web_tavily_missing_key(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.search_settings.snapshot_search_runtime",
+        lambda: SearchRuntime(mode="tavily", bocha_auth_header="", tavily_api_key=""),
+    )
+    try:
+        McpGateway().search_web("q")
+        raise AssertionError("should have failed")
+    except RuntimeError as exc:
+        assert "未配置 Tavily 搜索 Key" in str(exc)
+
+
 def test_search_web_llm_uses_bound_model(monkeypatch):
     monkeypatch.setattr(
         "app.services.search_settings.snapshot_search_runtime",
@@ -124,11 +209,35 @@ def test_search_web_llm_uses_bound_model(monkeypatch):
     )
     monkeypatch.setattr(
         "app.services.model_gateway.ModelGateway.search_live",
-        lambda self, query, limit=5: [{"title": "T", "url": "https://example.com/a", "snippet": "s"}],
+        lambda self, query, limit=5: LiveSearchDigest(
+            answer="整理稿",
+            items=[{"title": "T", "url": "https://example.com/a", "snippet": "s"}],
+        ),
     )
     results = McpGateway().search_web("q", limit=5)
-    assert results[0].provider == "llm-search"
-    assert results[0].url == "https://example.com/a"
+    assert results[0].title == "整理稿"
+    assert results[0].snippet == "整理稿"
+    assert results[0].url.startswith("llm-search://digest/")
+    assert results[1].provider == "llm-search"
+    assert results[1].url == "https://example.com/a"
+
+
+def test_search_web_llm_keeps_digest_when_items_empty(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.search_settings.snapshot_search_runtime",
+        lambda: SearchRuntime(mode="llm", bocha_auth_header=""),
+    )
+    monkeypatch.setattr(
+        "app.services.model_gateway.ModelGateway.search_live",
+        lambda self, query, limit=5: LiveSearchDigest(
+            answer="只有整理稿，没有信源列表。",
+            items=[],
+        ),
+    )
+    results = McpGateway().search_web("q", limit=5)
+    assert len(results) == 1
+    assert results[0].title == "整理稿"
+    assert "只有整理稿" in results[0].snippet
 
 
 def test_is_cache_fresh_accepts_naive_datetime():
@@ -264,8 +373,9 @@ def test_grok_live_search_uses_streaming_chat_completions(monkeypatch):
     assert body["stream"] is True
     assert "response_format" not in body
     assert "tools" not in body
-    assert items[0]["url"] == "https://example.com/a"
-    assert items[0]["title"] == "A"
+    assert items.items[0]["url"] == "https://example.com/a"
+    assert items.items[0]["title"] == "A"
+    assert "[A](https://example.com/a)" in items.answer
 
 
 def test_search_live_empty_payload_returns_empty_list(monkeypatch):
@@ -288,7 +398,9 @@ def test_search_live_empty_payload_returns_empty_list(monkeypatch):
             )
         ),
     )
-    assert ModelGateway().search_live("q") == []
+    result = ModelGateway().search_live("q")
+    assert result.items == []
+    assert "没有检索结果" in result.answer
 
 
 def test_search_query_summaries_keeps_results_when_one_query_empty(db_session, monkeypatch):

@@ -138,7 +138,7 @@ PROMPT_TEXTS: dict[str, str] = {
 }
 """.strip(),
     "init.question_refine_with_retrieval.user": """
-任务：结合 init_corpus 证据修订初始化问题。
+任务：结合背景调研摘要修订初始化问题。
 
 输入数据(JSON)：
 {
@@ -148,7 +148,7 @@ PROMPT_TEXTS: dict[str, str] = {
   "current_page_count_options": {{current_page_count_options_json}},
   "current_questions": {{current_questions_json}},
   "question_patch": {{question_patch_json}},
-  "init_corpus_evidence": {{init_corpus_evidence_json}}
+  "context_digest": {{context_digest_json}}
 }
 """.strip(),
     "outline.generate.system": """
@@ -211,7 +211,7 @@ PROMPT_TEXTS: dict[str, str] = {
   "style_preset": "{{style_preset}}",
   "background_asset_path": "{{background_asset_path}}",
   "answers": {{answers_json}},
-  "init_corpus_evidence": {{init_corpus_evidence_json}}
+  "context_digest": {{context_digest_json}}
 }
 """.strip(),
     "page.search_query_expand.system": """
@@ -367,7 +367,8 @@ PROMPT_TEXTS: dict[str, str] = {
 12. 对于 `page_update_outline_in_search`，如果能直接提取 patch，也可以填写 `data_updates.page_patch`。
 13. 对于 `page_summary_edit`，如果能直接提取 patch，也可以填写 `data_updates.summary_patch`。
 14. `init_confirm_to_outline` 仅当 `ui_surface` 为 `init` 时允许返回；其他界面必须 `reject`，禁止用该动作回滚流程或重建页面。
-15. 批量动作、整页搜索、summary/draft/design、`outline_generate`、`init_refresh_search` 必须 `should_execute=true` 才会执行；否则只给建议。`requires_confirmation=true` 时不要执行。
+15. `outline_confirm_to_search` 仅当 `ui_surface` 为 `outline` 时允许返回；其他界面必须 `reject`，禁止用该动作回滚流程。
+16. 批量动作、整页搜索、summary/draft/design、`outline_generate`、`init_refresh_search` 必须 `should_execute=true` 才会执行；否则只给建议。`requires_confirmation=true` 时不要执行。
 
 允许的 action_type：
 - init_refresh_search
@@ -377,6 +378,7 @@ PROMPT_TEXTS: dict[str, str] = {
 - init_update_answer
 - init_confirm_to_outline  # 仅 ui_surface=init
 - outline_generate
+- outline_confirm_to_search  # 仅 ui_surface=outline
 - page_update_outline_in_search
 - page_generate_search_queries
 - page_search_run

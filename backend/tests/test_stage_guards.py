@@ -38,3 +38,5 @@ def test_router_prompt_limits_confirm_to_init_surface():
     prompt = PROMPT_TEXTS["workspace.intent_router.system"]
     assert "init_confirm_to_outline" in prompt
     assert "仅当 `ui_surface` 为 `init`" in prompt
+    assert "outline_confirm_to_search" in prompt
+    assert "仅当 `ui_surface` 为 `outline`" in prompt

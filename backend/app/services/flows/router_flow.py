@@ -107,7 +107,7 @@ class RouterFlowMixin:
                     self.confirm_requirements(project.id, note_md=message.content_md)
                     self._persist_agent_message(
                         run=run,
-                        content_md="初始化信息已满足要求，系统开始生成大纲。大纲完成后会直接进入搜索工作台。",
+                        content_md="初始化信息已满足要求，系统开始生成大纲。大纲完成后请先确认，再按页找资料。",
                         result_snapshot={"current_stage": "outline"},
                     )
                     run.complete()
@@ -118,6 +118,38 @@ class RouterFlowMixin:
                         step_name="确认初始化并生成大纲",
                         exc=exc,
                         content_md="确认初始化失败。错误已经保留在当前动作卡片中。",
+                        result_snapshot={"current_stage": project.current_stage},
+                    )
+                return
+
+            if action_type == "outline_confirm_to_search":
+                if ui_surface != "outline" or project.current_stage != "outline":
+                    self._persist_agent_message(
+                        run=run,
+                        content_md="当前不在大纲界面，不能确认大纲并进入资料阶段。",
+                        result_snapshot={
+                            "rejected_action": action_type,
+                            "ui_surface": ui_surface,
+                            "current_stage": project.current_stage,
+                        },
+                    )
+                    run.complete("rejected")
+                    return
+                try:
+                    self._advance_outline_to_search(project)
+                    self._persist_agent_message(
+                        run=run,
+                        content_md="大纲已确认，可以开始按页找资料。",
+                        result_snapshot={"current_stage": "search"},
+                    )
+                    run.complete()
+                except Exception as exc:
+                    self._finalize_run_failure(
+                        run=run,
+                        step_code=action_type,
+                        step_name="确认大纲并进入资料阶段",
+                        exc=exc,
+                        content_md="确认大纲失败。错误已经保留在当前动作卡片中。",
                         result_snapshot={"current_stage": project.current_stage},
                     )
                 return
@@ -143,8 +175,8 @@ class RouterFlowMixin:
                 self.run_outline_flow(project.id)
                 self._persist_agent_message(
                     run=run,
-                    content_md="已按你的要求生成大纲并进入搜索工作台。",
-                    result_snapshot={"current_stage": "search", "action_type": action_type},
+                    content_md="已按你的要求生成大纲。请先确认后再开始按页找资料。",
+                    result_snapshot={"current_stage": "outline", "action_type": action_type},
                 )
                 run.complete()
                 return
@@ -167,45 +199,18 @@ class RouterFlowMixin:
                         run.step_completed(action_type, "更新初始化答案", result_snapshot)
                         content_md = "初始化答案已更新。系统没有自动重跑搜索，你可以继续修改，或明确要求重跑项目级搜索。"
                     else:
-                        run.step_started("init_retrieval", "检索 init_corpus 证据", "问题增改前先从 init_corpus 做检索。")
-                        init_collection = self.research.get_or_create_init_collection(project)
-                        retrieval_query_plan = self.research.build_query_plan(
-                            scope_type="project",
-                            session_role="init_question_refine",
-                            request_text=project.request_text,
-                            project_stage="init",
-                            project_title=project.title,
-                            fixed_fields=self._build_fixed_field_values(project, requirement_form),
-                            answers=requirement_form.answers_json or {},
-                            latest_instruction=message.content_md,
-                        )
-                        refine_session = self.research.create_session(
-                            project_id=project.id,
-                            page_id=None,
-                            scope_type="project",
-                            session_role="init_question_refine",
-                            research_goal="为初始化问题增删改提供项目级证据。",
-                            query_plan=retrieval_query_plan,
-                            context_snapshot={"latest_instruction": message.content_md},
-                        )
-                        evidence = self.research.retrieve_for_collection(
-                            project=project,
-                            collection=init_collection,
-                            research_session=refine_session,
-                            query_plan=retrieval_query_plan,
-                            limit=200,
-                        )
-                        refine_session.status = "completed" if evidence else "failed"
-                        run.step_completed("init_retrieval", "检索 init_corpus 证据", {"citation_count": len(evidence)})
+                        run.step_started("init_retrieval", "读取搜索摘要", "问题增改前先看首轮搜索摘要。")
+                        evidence = self.research.search_results_as_evidence(requirement_form.init_search_results_json)
                         if not evidence:
-                            raise RuntimeError("init_corpus 没有可用证据，不能修订问题")
+                            raise RuntimeError("首轮搜索结果为空，不能修订问题")
+                        run.step_completed("init_retrieval", "读取搜索摘要", {"citation_count": len(evidence)})
                         package = self.generator.refine_init_questions_with_retrieval(
                             project_title=project.title,
                             request_text=project.request_text,
                             latest_instruction=message.content_md,
                             current_questions=requirement_form.ai_questions_json or [],
                             current_page_count_options=requirement_form.page_count_options_json or [],
-                            init_corpus_evidence=evidence,
+                            context_digest=evidence,
                             question_patch=decision["data_updates"].get("question_patch")
                             if isinstance(decision["data_updates"].get("question_patch"), dict)
                             else None,
@@ -224,7 +229,7 @@ class RouterFlowMixin:
                             }
                         )
                         run.step_completed(action_type, "按证据修订初始化问题", result_snapshot)
-                        content_md = "已结合 init_corpus 证据更新问题集合。当前不会自动重跑搜索；如果要基于新问题重新看资料，请明确要求重跑项目级搜索。"
+                        content_md = "已结合首轮搜索摘要更新问题集合。当前不会自动重跑搜索；如果要基于新问题重新看资料，请明确要求重跑项目级搜索。"
                     self._persist_agent_message(run=run, content_md=content_md, result_snapshot=result_snapshot)
                     run.complete()
                 except Exception as exc:
@@ -334,7 +339,7 @@ class RouterFlowMixin:
                     result_snapshot = patch
                     content_md = "当前页 summary 已按你的要求改写，draft/design 已标记为 stale。"
                 elif action_type == "page_draft_generate":
-                    step_name = "生成页面初稿"
+                    step_name = "生成页面策划稿"
                     run.step_started(action_type, step_name, "基于当前页 summary 生成 draft。")
                     result_snapshot = self._run_page_draft(project=project, page=page, latest_instruction=message.content_md)
                     run.data_updated(
@@ -346,7 +351,7 @@ class RouterFlowMixin:
                         }
                     )
                     run.step_completed(action_type, step_name, result_snapshot)
-                    content_md = "当前页初稿已生成。"
+                    content_md = "当前页策划稿已生成。"
                 elif action_type == "page_design_generate":
                     step_name = "生成页面设计稿"
                     run.step_started(action_type, step_name, "基于当前页 draft 生成 design。")

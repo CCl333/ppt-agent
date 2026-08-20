@@ -180,11 +180,11 @@ class GenerationService:
         latest_instruction: str,
         current_questions: list[dict[str, Any]],
         current_page_count_options: list[dict[str, Any]],
-        init_corpus_evidence: list[dict[str, Any]],
+        context_digest: list[dict[str, Any]],
         question_patch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if not init_corpus_evidence:
-            raise RuntimeError("init.question_refine_with_retrieval 缺少 init_corpus 证据")
+        if not context_digest:
+            raise RuntimeError("首轮搜索结果为空，不能修订问题")
         result = self.models.context_json(
             get_prompt_text("init.question_refine_with_retrieval.system"),
             render_prompt(
@@ -196,7 +196,7 @@ class GenerationService:
                     "current_questions_json": current_questions,
                     "current_page_count_options_json": current_page_count_options,
                     "question_patch_json": question_patch or {},
-                    "init_corpus_evidence_json": init_corpus_evidence,
+                    "context_digest_json": context_digest,
                 },
             ),
         )
@@ -218,7 +218,7 @@ class GenerationService:
         style_preset: str,
         background_asset_path: str | None,
         answers: dict[str, Any],
-        init_corpus_evidence: list[dict[str, Any]],
+        context_digest: list[dict[str, Any]],
     ) -> dict[str, Any]:
         result = self.models.context_json(
             get_prompt_text("outline.generate.system"),
@@ -231,7 +231,7 @@ class GenerationService:
                     "style_preset": style_preset,
                     "background_asset_path": background_asset_path or "",
                     "answers_json": answers,
-                    "init_corpus_evidence_json": init_corpus_evidence,
+                    "context_digest_json": context_digest,
                 },
             ),
         )

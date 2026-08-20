@@ -29,3 +29,11 @@ def patch_storyboard(
     service: PptAgentService = Depends(get_service),
 ) -> dict:
     return service.patch_storyboard(project_id, payload.model_dump()["parts"])
+
+
+@router.post("/outline/confirm")
+def confirm_outline(
+    project_id: str,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.confirm_outline(project_id)

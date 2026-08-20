@@ -13,7 +13,7 @@ export type PresentationSlide = {
 };
 
 function slidePlaceholder(surface: PresentationSurface): string {
-  return surface === 'draft' ? '当前页初稿尚未生成' : '当前页设计稿尚未生成';
+  return surface === 'draft' ? '当前页策划稿尚未生成' : '当前页设计稿尚未生成';
 }
 
 function slideRoleLabel(pageRole: string): string {
@@ -83,7 +83,7 @@ export default function PresentationPlayer({
           <div className="min-w-0 space-y-2">
             <div className="flex items-center gap-2 text-xs uppercase tracking-[0.24em] text-white/50">
               {surface === 'draft' ? <FileText size={14} /> : <Palette size={14} />}
-              {surface === 'draft' ? '初稿放映' : '设计稿放映'}
+              {surface === 'draft' ? '策划稿放映' : '设计稿放映'}
             </div>
             <div className="truncate text-lg font-semibold text-white">{activeSlide.title}</div>
           </div>

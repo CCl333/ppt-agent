@@ -10,7 +10,7 @@ export class ApiError extends Error {
 
 export type ProjectStage = 'init' | 'outline' | 'search' | 'draft' | 'design' | 'export';
 export type ScopeType = 'project' | 'page';
-export type UiSurface = 'init' | 'outline_loading' | 'search' | 'draft' | 'design';
+export type UiSurface = 'init' | 'outline' | 'search' | 'draft' | 'design';
 export type PreviewSurface = 'design' | 'draft' | 'document' | 'fallback';
 
 export interface WorkflowConstraint {
@@ -84,8 +84,9 @@ export interface InitSearchResult {
   snippet?: string;
   content_excerpt_md?: string;
   read_status?: string;
-  vector_status?: string;
+  chunk_status?: string;
   source_document_id?: string | null;
+  source_kind?: string;
 }
 
 export interface CorpusDigest {
@@ -161,8 +162,9 @@ export interface PageSearchResult {
   snippet?: string;
   content_excerpt_md?: string;
   read_status?: string;
-  vector_status?: string;
+  chunk_status?: string;
   source_document_id?: string | null;
+  source_kind?: string;
 }
 
 export interface PageSummary {
@@ -311,7 +313,7 @@ export interface ActionJobResponse {
 }
 
 export type ModelRole = 'context' | 'svg' | 'search';
-export type SearchMode = 'bocha' | 'llm';
+export type SearchMode = 'bocha' | 'llm' | 'tavily';
 export type ReaderMode = 'tavily' | 'firecrawl' | 'web_fetch';
 
 export interface ModelProvider {
@@ -343,6 +345,10 @@ export interface SearchSettings {
   bocha_configured: boolean;
   bocha_auth_header_masked: string;
   bocha_from_env: boolean;
+  tavily_configured: boolean;
+  tavily_api_key_masked: string;
+  tavily_api_url: string;
+  tavily_from_env: boolean;
 }
 
 export interface ReaderSettings {
@@ -524,6 +530,12 @@ export async function uploadBackground(projectId: string, file: File): Promise<{
   });
 }
 
+export async function confirmOutline(projectId: string): Promise<ProjectSummary> {
+  return request<ProjectSummary>(`/projects/${projectId}/outline/confirm`, {
+    method: 'POST',
+  });
+}
+
 export async function getOutline(projectId: string): Promise<OutlineResponse> {
   return request<OutlineResponse>(`/projects/${projectId}/outline`);
 }
@@ -595,6 +607,13 @@ export async function patchPageSummary(projectId: string, pageId: string, summar
   return request<PageSummary>(`/projects/${projectId}/pages/${pageId}/summary`, {
     method: 'PATCH',
     body: JSON.stringify({summary_md: summaryMd}),
+  });
+}
+
+export async function patchPageDraft(projectId: string, pageId: string, svgMarkup: string): Promise<PageSummary> {
+  return request<PageSummary>(`/projects/${projectId}/pages/${pageId}/draft`, {
+    method: 'PATCH',
+    body: JSON.stringify({svg_markup: svgMarkup}),
   });
 }
 
@@ -690,7 +709,12 @@ export async function getSearchSettings(): Promise<SearchSettings> {
   return request<SearchSettings>('/settings/search');
 }
 
-export async function putSearchSettings(payload: {mode?: SearchMode; bocha_auth_header?: string}): Promise<SearchSettings> {
+export async function putSearchSettings(payload: {
+  mode?: SearchMode;
+  bocha_auth_header?: string;
+  tavily_api_key?: string;
+  tavily_api_url?: string;
+}): Promise<SearchSettings> {
   return request<SearchSettings>('/settings/search', {
     method: 'PUT',
     body: JSON.stringify(payload),

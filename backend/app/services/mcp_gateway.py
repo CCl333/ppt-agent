@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -7,6 +8,9 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings, get_settings
+
+LLM_DIGEST_SNIPPET_LIMIT = 2400
+_EMPTY_DIGEST_ANSWERS = {"", "没有检索结果"}
 
 
 @dataclass(frozen=True)
@@ -35,6 +39,8 @@ class McpGateway:
         runtime = snapshot_search_runtime()
         if runtime.mode == "llm":
             return self._search_with_llm(query, limit)
+        if runtime.mode == "tavily":
+            return self._search_with_tavily(query, limit, runtime)
         return self._search_with_bocha(query, limit, runtime.bocha_auth_header)
 
     def _search_with_bocha(self, query: str, limit: int, auth_header: str) -> list[SearchResult]:
@@ -53,20 +59,63 @@ class McpGateway:
         except Exception as exc:
             raise RuntimeError(f"bocha search failed: {exc}") from exc
 
-    def _search_with_llm(self, query: str, limit: int) -> list[SearchResult]:
-        from app.services.model_gateway import ModelGateway
-
-        rows = ModelGateway(self.settings).search_live(query, limit=limit)
-        return [
-            SearchResult(
-                title=row["title"],
-                url=row["url"],
-                snippet=row["snippet"],
-                provider="llm-search",
+    def _search_with_tavily(self, query: str, limit: int, runtime) -> list[SearchResult]:
+        if not runtime.tavily_api_key:
+            raise RuntimeError("未配置 Tavily 搜索 Key，请在设置页填写，或改用博查 / 大模型搜索")
+        try:
+            response = httpx.post(
+                runtime.tavily_search_url,
+                headers={"Authorization": f"Bearer {runtime.tavily_api_key}"},
+                json={
+                    "api_key": runtime.tavily_api_key,
+                    "query": query,
+                    "max_results": limit,
+                    "search_depth": "basic",
+                    "include_raw_content": False,
+                    "include_answer": False,
+                },
+                timeout=45,
             )
-            for row in rows
-            if row.get("url")
-        ]
+            response.raise_for_status()
+            return self._parse_tavily_results(response.json(), limit)
+        except Exception as exc:
+            raise RuntimeError(f"tavily search failed: {exc}") from exc
+
+    def search_web_digest(self, query: str, limit: int = 8):
+        from app.services.model_gateway import LiveSearchDigest, ModelGateway
+
+        digest = ModelGateway(self.settings).search_live(query, limit=limit)
+        if not isinstance(digest, LiveSearchDigest):
+            raise RuntimeError("搜索模型没有返回整理稿")
+        return digest
+
+    def _search_with_llm(self, query: str, limit: int) -> list[SearchResult]:
+        digest = self.search_web_digest(query, limit)
+        results: list[SearchResult] = []
+        answer = (digest.answer or "").strip()
+        if answer not in _EMPTY_DIGEST_ANSWERS:
+            digest_key = hashlib.sha256(query.strip().encode("utf-8")).hexdigest()[:16]
+            results.append(
+                SearchResult(
+                    title="整理稿",
+                    url=f"llm-search://digest/{digest_key}",
+                    snippet=answer[:LLM_DIGEST_SNIPPET_LIMIT],
+                    provider="llm-search",
+                )
+            )
+        for row in digest.items:
+            url = str(row.get("url") or "").strip()
+            if not url:
+                continue
+            results.append(
+                SearchResult(
+                    title=str(row.get("title") or url),
+                    url=url,
+                    snippet=str(row.get("snippet") or ""),
+                    provider="llm-search",
+                )
+            )
+        return results
 
     def read_url_markdown(self, url: str) -> ReadResult:
         from app.services.reader_settings import snapshot_reader_runtime
@@ -95,6 +144,27 @@ class McpGateway:
             for index, item in enumerate(items[:limit], start=1)
             if item.get("url") or item.get("link")
         ]
+
+    def _parse_tavily_results(self, payload: dict[str, Any], limit: int) -> list[SearchResult]:
+        items = payload.get("results") or payload.get("data") or []
+        if not isinstance(items, list):
+            items = []
+        results: list[SearchResult] = []
+        for index, item in enumerate(items[:limit], start=1):
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or item.get("link") or "").strip()
+            if not url.startswith("http://") and not url.startswith("https://"):
+                continue
+            results.append(
+                SearchResult(
+                    title=str(item.get("title") or item.get("name") or f"来源 {index}"),
+                    url=url,
+                    snippet=str(item.get("content") or item.get("snippet") or item.get("description") or ""),
+                    provider="tavily",
+                )
+            )
+        return results
 
     def _read_with_web_fetch(self, url: str, runtime) -> ReadResult:
         errors: list[str] = []

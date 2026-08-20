@@ -24,7 +24,7 @@ from app.models.entities import (
     SourceDocument,
     URLContentCache,
 )
-from app.services.evidence import estimate_tokens, select_evidence
+from app.services.evidence import estimate_tokens, keyword_score, select_evidence, tokenize
 from app.services.mcp_gateway import McpGateway, ReadResult, SearchResult
 from app.services.model_gateway import ModelGateway
 from app.services.prompt_contracts import get_prompt_text, render_prompt
@@ -105,6 +105,9 @@ class ResearchService:
                     "title": result.title,
                     "url": normalized_url,
                     "bocha_summary": result.snippet,
+                    "snippet": result.snippet,
+                    "content_excerpt_md": result.snippet if normalized_url.startswith("llm-search://") else "",
+                    "source_kind": "llm_answer" if normalized_url.startswith("llm-search://") else "url",
                 }
                 items.append(payload)
                 query_results.append(payload)
@@ -139,8 +142,9 @@ class ResearchService:
                     "snippet": item.get("snippet") or item.get("bocha_summary") or "",
                     "content_excerpt_md": item.get("content_excerpt_md") or "",
                     "read_status": item.get("read_status") or "pending",
-                    "vector_status": item.get("vector_status") or "pending",
+                    "chunk_status": item.get("chunk_status") or "pending",
                     "source_document_id": item.get("source_document_id"),
+                    "source_kind": item.get("source_kind") or "",
                 }
             )
         return cards
@@ -175,7 +179,7 @@ class ResearchService:
             if document is None:
                 refreshed["source_document_id"] = None
                 refreshed["read_status"] = "failed" if refreshed.get("read_status") == "failed" else "pending"
-                refreshed["vector_status"] = "failed" if refreshed.get("read_status") == "failed" else "pending"
+                refreshed["chunk_status"] = "failed" if refreshed.get("read_status") == "failed" else "pending"
                 refreshed_cards.append(refreshed)
                 continue
 
@@ -184,7 +188,7 @@ class ResearchService:
                 refreshed["content_excerpt_md"] = self._clip_excerpt(document.markdown_content, limit=320)
             if refreshed.get("read_status") in {"", "pending", "failed"}:
                 refreshed["read_status"] = "ready"
-            refreshed["vector_status"] = "ready" if str(source_document_id) in chunk_document_ids else "pending"
+            refreshed["chunk_status"] = "ready" if str(source_document_id) in chunk_document_ids else "pending"
             refreshed_cards.append(refreshed)
         return refreshed_cards
 
@@ -232,7 +236,7 @@ class ResearchService:
                 defer_chunks=True,
             )
             if chunks:
-                self.store_chunk_embeddings(
+                self.store_chunks(
                     [
                         {
                             "document": document,
@@ -244,23 +248,15 @@ class ResearchService:
             candidate["title"] = read_result.title or result.title
             candidate["content_excerpt_md"] = self._clip_excerpt(read_result.markdown_content, limit=320)
             candidate["read_status"] = "reused" if reused_existing and candidate.get("read_status") != "failed" else "ready"
-            candidate["vector_status"] = "pending"
+            candidate["chunk_status"] = "pending"
             candidate["source_document_id"] = document.id
         except Exception:
             candidate["content_excerpt_md"] = ""
             candidate["read_status"] = "failed"
-            candidate["vector_status"] = "failed"
+            candidate["chunk_status"] = "failed"
             candidate["source_document_id"] = None
 
         return self.refresh_search_result_cards([candidate])[0]
-
-    def get_or_create_init_collection(self, project: Project) -> SourceCollection:
-        return self._get_or_create_collection(
-            project_id=project.id,
-            collection_type="init_knowledge",
-            page_id=None,
-            title=f"{project.title} 初始化资料池",
-        )
 
     def get_or_create_page_collection(self, project: Project, page: ProjectPage) -> SourceCollection:
         return self._get_or_create_collection(
@@ -292,14 +288,130 @@ class ResearchService:
             search_results=search_results,
             replace=replace,
         )
-        self.store_chunk_embeddings(pending_chunk_records)
+        self.store_chunks(pending_chunk_records)
         for candidate in candidate_sources:
             if candidate.get("source_document_id") and candidate.get("read_status") != "failed":
-                candidate["vector_status"] = "ready"
+                candidate["chunk_status"] = "ready"
         failed_urls = read_summary.get("failed_urls") or []
         if not read_summary.get("ingested_count") and failed_urls:
             raise RuntimeError(f"研究来源读取全部失败: {failed_urls[0]}")
         return candidate_sources, self.build_collection_digest(collection.id)
+
+    def ingest_llm_answer(
+        self,
+        *,
+        collection: SourceCollection,
+        page: ProjectPage,
+        answer: str,
+        sources: list[dict[str, Any]],
+        query_text: str = "",
+        page_title: str = "",
+        replace: bool = True,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        cleaned = (answer or "").strip()
+        if not cleaned:
+            raise RuntimeError("搜索模型没有返回整理稿。请确认该模型已开启实时搜索，或改用博查 Key。")
+        if replace:
+            self.clear_collection(collection)
+
+        existing_answers = self.session.scalar(
+            select(func.count(SourceDocument.id)).where(
+                SourceDocument.collection_id == collection.id,
+                SourceDocument.source_type == "llm_answer",
+            )
+        ) or 0
+        round_no = int(existing_answers) + 1
+        title = f"整理稿：{(page_title or '').strip() or page.page_code}"
+        source_uri = f"llm-search://{page.id}/{round_no}"
+        search_result = SearchResult(
+            title=title,
+            url=source_uri,
+            snippet=cleaned[:320],
+            provider="llm-search",
+        )
+        read_result = ReadResult(
+            title=title,
+            markdown_content=cleaned,
+            provider="llm-search",
+            metadata={"sources": sources, "search_mode": "llm"},
+        )
+        document, chunks, _reused = self._upsert_source_document(
+            collection,
+            search_result,
+            read_result,
+            extra_metadata={"search_rank": 0},
+            defer_chunks=True,
+            source_type="llm_answer",
+        )
+        pending_chunk_records = [
+            {"document": document, "chunk": chunk}
+            for chunk in chunks
+        ]
+        digest_card = {
+            "id": self._hash_text(f"{query_text}|{source_uri}"),
+            "query_text": query_text,
+            "query_purpose": "页级整理稿",
+            "search_rank": 0,
+            "title": title,
+            "url": source_uri,
+            "bocha_summary": cleaned[:320],
+            "snippet": cleaned[:320],
+            "content_excerpt_md": self._clip_excerpt(cleaned, limit=320),
+            "read_status": "ready",
+            "chunk_status": "pending",
+            "source_document_id": document.id,
+            "source_kind": "llm_answer",
+        }
+        source_cards: list[dict[str, Any]] = [digest_card]
+        seen_urls = {source_uri}
+        for index, row in enumerate(sources, start=1):
+            url = self._normalize_url(str(row.get("url") or ""))
+            if not url or url in seen_urls:
+                continue
+            if not url.startswith("http://") and not url.startswith("https://"):
+                continue
+            seen_urls.add(url)
+            source_cards.append(
+                {
+                    "id": self._hash_text(f"{query_text}|{url}"),
+                    "query_text": query_text,
+                    "query_purpose": str(row.get("snippet") or "信源"),
+                    "search_rank": index,
+                    "title": str(row.get("title") or url),
+                    "url": url,
+                    "bocha_summary": str(row.get("snippet") or ""),
+                    "snippet": str(row.get("snippet") or ""),
+                    "content_excerpt_md": "",
+                    "read_status": "pending",
+                    "chunk_status": "pending",
+                    "source_document_id": None,
+                    "source_kind": "llm_source",
+                }
+            )
+        return source_cards, pending_chunk_records
+
+    def search_results_as_evidence(self, search_results: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        evidence: list[dict[str, Any]] = []
+        for index, raw in enumerate(search_results or [], start=1):
+            if not isinstance(raw, dict):
+                continue
+            title = str(raw.get("title") or "").strip()
+            snippet = str(
+                raw.get("content_excerpt_md") or raw.get("snippet") or raw.get("bocha_summary") or ""
+            ).strip()
+            url = str(raw.get("url") or "").strip()
+            if not title and not snippet and not url:
+                continue
+            evidence.append(
+                {
+                    "title": title or url,
+                    "url": url,
+                    "excerpt_md": snippet or url,
+                    "rank_no": index,
+                    "search_rank": raw.get("search_rank") or index,
+                }
+            )
+        return evidence
 
     def hydrate_search_results(
         self,
@@ -332,7 +444,7 @@ class ResearchService:
                 "bocha_summary": item.get("bocha_summary") or "",
                 "content_excerpt_md": "",
                 "read_status": "pending",
-                "vector_status": "pending",
+                "chunk_status": "pending",
                 "source_document_id": None,
             }
             cached_result = self._get_cached_read_result(normalized_url)
@@ -363,13 +475,13 @@ class ResearchService:
             "failed_urls": failed_urls,
         }
 
-    def store_chunk_embeddings(
+    def store_chunks(
         self,
         chunk_records: list[dict[str, Any]],
         *,
-        on_embedding_progress: Callable[[dict[str, Any]], None] | None = None,
+        on_chunk_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
-        self._store_chunks(chunk_records, on_chunk_progress=on_embedding_progress)
+        self._store_chunks(chunk_records, on_chunk_progress=on_chunk_progress)
         return {
             "document_count": len({item["document"].id for item in chunk_records}),
             "chunk_count": len(chunk_records),
@@ -432,8 +544,19 @@ class ResearchService:
         research_session: ResearchSession,
         query_plan: list[dict[str, str]],
         limit: int,
+        excerpt_limit: int = 420,
     ) -> list[dict[str, Any]]:
-        selected_items = select_evidence(self.session, collection.id, limit=limit)
+        query_terms = [
+            str(item.get("query_text") or "").strip()
+            for item in query_plan
+            if str(item.get("query_text") or "").strip()
+        ]
+        selected_items = select_evidence(
+            self.session,
+            collection.id,
+            limit=limit,
+            query_terms=query_terms or None,
+        )
         self.session.execute(
             delete(ProjectResearchSource).where(ProjectResearchSource.research_session_id == research_session.id)
         )
@@ -452,11 +575,16 @@ class ResearchService:
         selected_payloads: list[dict[str, Any]] = []
         selected_texts: list[str] = []
         for item in selected_items:
-            excerpt = self._clip_excerpt(item.chunk.content_md, limit=420)
+            excerpt = self._clip_excerpt(item.chunk.content_md, limit=excerpt_limit)
             if self._is_duplicate_excerpt(excerpt, selected_texts):
                 continue
             selected_texts.append(excerpt)
             rank_no = len(selected_payloads) + 1
+            relevance = (
+                item.relevance_score
+                if query_terms
+                else float(max(0, 1000 - item.search_rank))
+            )
             citation = self._get_or_create_citation(project.id, item.document, item.chunk, excerpt)
             self.session.add(
                 ProjectResearchSource(
@@ -465,7 +593,7 @@ class ResearchService:
                     chunk_id=item.chunk.id,
                     rank_no=rank_no,
                     excerpt_md=excerpt,
-                    relevance_score=float(max(0, 1000 - item.search_rank)),
+                    relevance_score=relevance,
                     usage_note=usage_note,
                     is_pinned=False,
                 )
@@ -489,7 +617,7 @@ class ResearchService:
                     "excerpt_md": excerpt,
                     "citation_label": citation.citation_label,
                     "rank_no": rank_no,
-                    "relevance_score": float(max(0, 1000 - item.search_rank)),
+                    "relevance_score": relevance,
                     "usage_note": usage_note,
                     "search_rank": item.search_rank,
                     "chunk_index": item.chunk.chunk_index,
@@ -704,7 +832,7 @@ class ResearchService:
                 ingested_count += 1
             except Exception as exc:
                 candidate["read_status"] = "failed"
-                candidate["vector_status"] = "failed"
+                candidate["chunk_status"] = "failed"
                 candidate_sources.append(candidate)
                 failed_urls.append(f"{normalized_url}: {exc}")
             if on_candidate_progress is not None:
@@ -728,6 +856,7 @@ class ResearchService:
         *,
         extra_metadata: dict[str, Any] | None = None,
         defer_chunks: bool = False,
+        source_type: str = "url",
     ) -> tuple[SourceDocument, list[dict[str, Any]], bool]:
         normalized_url = self._normalize_url(search_result.url)
         cache = self.session.scalar(select(URLContentCache).where(URLContentCache.normalized_url == normalized_url))
@@ -747,7 +876,7 @@ class ResearchService:
         if document is None:
             document = SourceDocument(
                 collection_id=collection.id,
-                source_type="url",
+                source_type=source_type,
                 source_uri=normalized_url,
                 url_cache_id=cache.id if cache else None,
                 title=read_result.title or search_result.title,
@@ -768,6 +897,7 @@ class ResearchService:
             return document, [], True
         else:
             document.url_cache_id = cache.id if cache else document.url_cache_id
+            document.source_type = source_type or document.source_type
             document.title = read_result.title or search_result.title
             document.markdown_content = read_result.markdown_content
             document.metadata_json = metadata_json
@@ -810,7 +940,7 @@ class ResearchService:
                     chunk_index=chunk["chunk_index"],
                     section_path=chunk["section_path"],
                     content_md=chunk["content_md"],
-                    content_for_embedding=chunk["content_for_embedding"],
+                    content_for_match=chunk["content_for_match"],
                     token_count=chunk["token_count"],
                 )
             )
@@ -835,14 +965,14 @@ class ResearchService:
             if not content:
                 buffer = []
                 return
-            content_for_embedding = f"{title}\n{current_section}\n{content}".strip()
+            content_for_match = f"{title}\n{current_section}\n{content}".strip()
             chunks.append(
                 {
                     "chunk_index": len(chunks),
                     "section_path": current_section,
                     "content_md": content[:4000],
-                    "content_for_embedding": content_for_embedding[:5000],
-                    "token_count": self._estimate_token_count(content_for_embedding),
+                    "content_for_match": content_for_match[:5000],
+                    "token_count": self._estimate_token_count(content_for_match),
                 }
             )
             buffer = []
@@ -868,7 +998,7 @@ class ResearchService:
                     "chunk_index": 0,
                     "section_path": title or "正文",
                     "content_md": content,
-                    "content_for_embedding": f"{title}\n{content}".strip()[:5000],
+                    "content_for_match": f"{title}\n{content}".strip()[:5000],
                     "token_count": self._estimate_token_count(content),
                 }
             )
@@ -944,14 +1074,10 @@ class ResearchService:
         return estimate_tokens(text)
 
     def _keyword_score(self, query: str, text: str) -> float:
-        query_tokens = set(self._tokenize(query))
-        text_tokens = set(self._tokenize(text))
-        if not query_tokens or not text_tokens:
-            return 0.0
-        return len(query_tokens & text_tokens) / max(len(query_tokens), 1)
+        return keyword_score(query, text)
 
     def _tokenize(self, text: str) -> list[str]:
-        return [token for token in re.split(r"[^0-9A-Za-z\u4e00-\u9fff]+", text.lower()) if token]
+        return tokenize(text)
 
     def _clip_excerpt(self, content: str, limit: int = 220) -> str:
         cleaned = re.sub(r"\s+", " ", content).strip()

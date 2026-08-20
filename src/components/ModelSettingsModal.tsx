@@ -55,6 +55,8 @@ export default function ModelSettingsModal({
   const [searchSettings, setSearchSettings] = useState<SearchSettings | null>(null);
   const [readerSettings, setReaderSettings] = useState<ReaderSettings | null>(null);
   const [bochaKey, setBochaKey] = useState('');
+  const [searchTavilyKey, setSearchTavilyKey] = useState('');
+  const [searchTavilyUrl, setSearchTavilyUrl] = useState('https://api.tavily.com');
   const [tavilyKey, setTavilyKey] = useState('');
   const [firecrawlKey, setFirecrawlKey] = useState('');
   const [tavilyUrl, setTavilyUrl] = useState('https://api.tavily.com');
@@ -97,6 +99,7 @@ export default function ModelSettingsModal({
         setBindings(bindingResponse.items);
         setSearchSettings(searchResponse);
         setReaderSettings(readerResponse);
+        setSearchTavilyUrl(searchResponse.tavily_api_url || 'https://api.tavily.com');
         setTavilyUrl(readerResponse.tavily_api_url || 'https://api.tavily.com');
         setFirecrawlUrl(readerResponse.firecrawl_api_url || 'https://api.firecrawl.dev/v2');
         setNeedsSetup(bindingResponse.needs_setup);
@@ -310,6 +313,37 @@ export default function ModelSettingsModal({
       await refreshSetup();
     } catch (caughtError) {
       setError(caughtError instanceof ApiError ? caughtError.message : '博查 Key 保存失败');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleSaveSearchTavily = async () => {
+    if (!searchSettings?.tavily_configured && !searchTavilyKey.trim()) {
+      setError('请输入 Tavily Key');
+      return;
+    }
+    setIsSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const payload: {mode: SearchMode; tavily_api_key?: string; tavily_api_url?: string} = {
+        mode: 'tavily',
+      };
+      if (searchTavilyKey.trim()) {
+        payload.tavily_api_key = searchTavilyKey.trim();
+      }
+      if (searchTavilyUrl.trim()) {
+        payload.tavily_api_url = searchTavilyUrl.trim();
+      }
+      const next = await putSearchSettings(payload);
+      setSearchSettings(next);
+      setSearchTavilyKey('');
+      setSearchTavilyUrl(next.tavily_api_url);
+      setNotice('Tavily 搜索配置已保存');
+      await refreshSetup();
+    } catch (caughtError) {
+      setError(caughtError instanceof ApiError ? caughtError.message : 'Tavily 搜索配置保存失败');
     } finally {
       setIsSaving(false);
     }
@@ -577,10 +611,10 @@ export default function ModelSettingsModal({
             <div>
               <h3 className="text-lg font-semibold text-slate-800">搜索配置</h3>
               <p className="text-sm text-slate-400 mt-1">
-                博查走独立搜索 API；大模型搜索需绑定支持联网检索的模型，不会用聊天结果编造链接。
+                博查和 Tavily 走独立搜索 API，返回真实网页链接。大模型搜索只有上游真正执行联网检索时才可用。
               </p>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
               <button
                 type="button"
                 onClick={() => {
@@ -598,6 +632,20 @@ export default function ModelSettingsModal({
               <button
                 type="button"
                 onClick={() => {
+                  void handleSearchMode('tavily');
+                }}
+                className={`rounded-2xl border px-4 py-3 text-left ${
+                  searchSettings?.mode === 'tavily'
+                    ? 'border-blue-300 bg-blue-50 text-blue-800'
+                    : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                }`}
+              >
+                <div className="font-medium">Tavily 搜索</div>
+                <div className="text-xs mt-1 opacity-80">调用 Tavily Search，返回可核验的网页结果。</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
                   void handleSearchMode('llm');
                 }}
                 className={`rounded-2xl border px-4 py-3 text-left ${
@@ -610,15 +658,15 @@ export default function ModelSettingsModal({
                 <div className="text-xs mt-1 opacity-80">使用模型库中已导入、支持实时网页搜索的模型。</div>
               </button>
             </div>
-            {searchSettings?.mode !== 'llm' ? (
+            {searchSettings?.mode === 'bocha' ? (
               <div className="space-y-3">
-                <Field label={searchSettings?.bocha_configured ? '博查 Key（留空表示不修改）' : '博查 Key'}>
+                <Field label={searchSettings.bocha_configured ? '博查 Key（留空表示不修改）' : '博查 Key'}>
                   <input
                     type="password"
                     value={bochaKey}
                     onChange={(event) => setBochaKey(event.target.value)}
                     placeholder={
-                      searchSettings?.bocha_auth_header_masked
+                      searchSettings.bocha_auth_header_masked
                         ? `当前 ${searchSettings.bocha_auth_header_masked}`
                         : 'Bearer sk-... 或直接粘贴 Key'
                     }
@@ -627,9 +675,9 @@ export default function ModelSettingsModal({
                 </Field>
                 <div className="flex items-center justify-between gap-3">
                   <p className="text-[11px] text-slate-400">
-                    {searchSettings?.bocha_from_env
+                    {searchSettings.bocha_from_env
                       ? '当前使用 .env 中的博查 Key，保存后以页面配置为准。'
-                      : searchSettings?.bocha_configured
+                      : searchSettings.bocha_configured
                         ? '已保存博查 Key，输入新值才会覆盖。'
                         : '填写后立即生效，无需重启后端。'}
                   </p>
@@ -645,7 +693,52 @@ export default function ModelSettingsModal({
                   </button>
                 </div>
               </div>
-            ) : (
+            ) : null}
+            {searchSettings?.mode === 'tavily' ? (
+              <div className="space-y-3">
+                <Field label={searchSettings.tavily_configured ? 'Tavily Key（留空表示不修改）' : 'Tavily Key'}>
+                  <input
+                    type="password"
+                    value={searchTavilyKey}
+                    onChange={(event) => setSearchTavilyKey(event.target.value)}
+                    placeholder={
+                      searchSettings.tavily_api_key_masked
+                        ? `当前 ${searchSettings.tavily_api_key_masked}`
+                        : 'tvly-...'
+                    }
+                    className={inputClass}
+                  />
+                </Field>
+                <Field label="Tavily API URL">
+                  <input
+                    value={searchTavilyUrl}
+                    onChange={(event) => setSearchTavilyUrl(event.target.value)}
+                    placeholder="https://api.tavily.com"
+                    className={inputClass}
+                  />
+                </Field>
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-[11px] text-slate-400">
+                    {searchSettings.tavily_from_env
+                      ? '当前使用 .env 中的 Tavily Key，保存后以页面配置为准。'
+                      : searchSettings.tavily_configured
+                        ? '已保存 Tavily Key，输入新值才会覆盖。'
+                        : '填写后立即生效，无需重启后端。'}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void handleSaveSearchTavily();
+                    }}
+                    disabled={isSaving}
+                    className="h-10 shrink-0 rounded-xl bg-blue-600 px-4 text-sm text-white font-medium hover:bg-blue-700 disabled:bg-blue-300"
+                  >
+                    保存密钥
+                  </button>
+                </div>
+              </div>
+            ) : null}
+            {searchSettings?.mode === 'llm' ? (
               <Field label="搜索模型">
                 <select
                   value={searchBinding?.provider_id ?? ''}
@@ -662,10 +755,10 @@ export default function ModelSettingsModal({
                   ))}
                 </select>
                 <p className="text-[11px] text-slate-400">
-                  Grok（含 rightapi）会按 grok-search MCP 的方式走流式 /chat/completions 并抽取真实链接；即使兼容协议选了 Responses 也会改走这条搜索路径。不支持联网的接口会直接失败，不会伪造结果。
+                  需要上游真正执行 web_search。当前 Grok 中转通常只会让模型口头搜索，请改用 Tavily 或博查。
                 </p>
               </Field>
-            )}
+            ) : null}
           </section>
 
           <section className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm space-y-4">

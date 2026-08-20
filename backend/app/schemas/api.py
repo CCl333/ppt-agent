@@ -67,6 +67,10 @@ class SummaryPatchRequest(BaseModel):
     summary_md: str = Field(min_length=1)
 
 
+class DraftPatchRequest(BaseModel):
+    svg_markup: str = Field(min_length=1)
+
+
 class StoryboardPagePatchRequest(BaseModel):
     page_id: str | None = None
     title: str = Field(min_length=1)
@@ -126,6 +130,8 @@ class ModelBindingsPutRequest(BaseModel):
 class SearchSettingsPutRequest(BaseModel):
     mode: str | None = None
     bocha_auth_header: str | None = None
+    tavily_api_key: str | None = None
+    tavily_api_url: str | None = None
 
 
 class ReaderSettingsPutRequest(BaseModel):

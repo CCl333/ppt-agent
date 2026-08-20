@@ -95,95 +95,31 @@ class PageFlowMixin:
                     "query_count": len(queries),
                 }
             )
-            run.step_started("page_search_bocha", "执行 Bocha 搜索", "先获取搜索摘要结果，再决定后续抓取。")
 
-        def on_query_completed(payload: dict[str, Any]) -> None:
-            page.page_search_results_json = payload["items"]
-            if run is not None:
-                run.data_updated(
-                    {
-                        "entity": "page",
-                        "page_id": page.id,
-                        "update_kind": "search_results",
-                        "query_index": payload["query_index"],
-                        "query_total": payload["query_total"],
-                        "result_count": payload["result_count"],
-                    }
-                )
-                run.step_progress(
-                    "page_search_bocha",
-                    "执行 Bocha 搜索",
-                    progress={
-                        "current": payload["query_index"],
-                        "total": payload["query_total"],
-                        "label": f"已完成 {payload['query_index']}/{payload['query_total']} 条查询",
-                    },
-                    result={"result_count": payload["result_count"]},
-                )
+        from app.services.search_settings import snapshot_search_runtime
 
-        search_results = self.research.search_query_summaries(
-            queries,
-            limit_per_query=4,
-            on_query_completed=on_query_completed if run is not None else None,
-        )
-        if run is not None:
-            run.step_completed("page_search_bocha", "执行 Bocha 搜索", {"result_count": len(search_results)})
         collection = self.research.get_or_create_page_collection(project, page)
-        if run is not None:
-            run.step_started("page_search_read", "抓取全文并写入资料池", "把搜索结果扩展成可引用正文。")
-
-        def on_read_progress(payload: dict[str, Any]) -> None:
-            if run is None:
-                return
-            run.step_progress(
-                "page_search_read",
-                "抓取全文并写入资料池",
-                progress={
-                    "current": payload["completed"],
-                    "total": payload["total"],
-                    "label": f"已处理 {payload['completed']}/{payload['total']} 条来源",
-                },
-                result={
-                    "ingested_count": payload["ingested_count"],
-                    "failed_count": payload["failed_count"],
-                },
+        if snapshot_search_runtime().mode == "llm":
+            candidate_sources, pending_chunk_records = self._collect_page_llm_digest(
+                page=page,
+                queries=queries,
+                collection=collection,
+                replace_existing=replace_existing,
+                run=run,
             )
-
-        candidate_sources, pending_chunk_records, read_summary = self.research.hydrate_search_results(
-            collection=collection,
-            search_results=search_results,
-            replace=replace_existing,
-            on_read_progress=on_read_progress if run is not None else None,
-        )
-        candidate_sources = self.research.refresh_search_result_cards(candidate_sources)
-        page.page_search_results_json = candidate_sources
-        read_ready = sum(1 for item in candidate_sources if item.get("read_status") in {"ready", "reused"})
-        read_failed = sum(1 for item in candidate_sources if item.get("read_status") == "failed")
-        if run is not None:
-            run.data_updated(
-                {
-                    "entity": "page",
-                    "page_id": page.id,
-                    "update_kind": "search_read",
-                    "result_count": len(candidate_sources),
-                    "read_ready": read_ready,
-                    "read_failed": read_failed,
-                }
-            )
-            run.step_completed(
-                "page_search_read",
-                "抓取全文并写入资料池",
-                {
-                    "result_count": len(candidate_sources),
-                    "read_ready": read_ready,
-                    "read_failed": read_failed,
-                },
+        else:
+            candidate_sources, pending_chunk_records = self._collect_page_bocha_sources(
+                page=page,
+                queries=queries,
+                collection=collection,
+                replace_existing=replace_existing,
+                run=run,
             )
 
         if run is not None:
             run.step_started("page_search_chunk", "切块入库资料池", "把正文切块，供后续确定性选证据使用。")
 
-        def on_embedding_progress(payload: dict[str, Any]) -> None:
+        def on_chunk_progress(payload: dict[str, Any]) -> None:
             if run is None:
                 return
             run.step_progress(
@@ -197,9 +133,9 @@ class PageFlowMixin:
                 result={"document_count": payload["document_count"]},
             )
 
-        embedding_stats = self.research.store_chunk_embeddings(
+        chunk_stats = self.research.store_chunks(
             pending_chunk_records,
-            on_embedding_progress=on_embedding_progress if run is not None else None,
+            on_chunk_progress=on_chunk_progress if run is not None else None,
         )
         candidate_sources = self.research.refresh_search_result_cards(candidate_sources)
         digest = self.research.build_collection_digest(collection.id)
@@ -238,10 +174,172 @@ class PageFlowMixin:
                 {
                     "document_count": digest.get("document_count", 0),
                     "chunk_count": digest.get("chunk_count", 0),
-                    **embedding_stats,
+                    **chunk_stats,
                 },
             )
+        self.session.flush()
         return {"query_count": len(queries), "result_count": len(candidate_sources), **digest}
+
+    def _build_page_search_intent(
+        self,
+        page: ProjectPage,
+        queries: list[dict[str, str]],
+    ) -> str:
+        brief = self._get_current_brief(page)
+        title = brief.title if brief else page.page_code
+        outline = "；".join(brief.content_outline_json or []) if brief else ""
+        query_lines = "\n".join(
+            f"- {item.get('query_text')}" for item in queries if item.get("query_text")
+        )
+        return (
+            f"请为这一页PPT整理资料。\n"
+            f"页面标题：{title}\n"
+            f"所属章节：{page.part_title or ''}\n"
+            f"内容要点：{outline}\n"
+            f"检索问题：\n{query_lines}"
+        )
+
+    def _collect_page_llm_digest(
+        self,
+        *,
+        page: ProjectPage,
+        queries: list[dict[str, str]],
+        collection,
+        replace_existing: bool,
+        run,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if run is not None:
+            run.step_started(
+                "page_search_digest",
+                "让搜索模型整理该页资料",
+                "一次调用搜索模型，把整理稿写入本页资料池，不再重新抓取网页。",
+            )
+        intent = self._build_page_search_intent(page, queries)
+        digest = self.research.mcp.search_web_digest(intent, limit=8)
+        answer = (digest.answer or "").strip()
+        if not answer or answer == "没有检索结果":
+            raise RuntimeError("搜索模型没有返回整理稿。请确认该模型已开启实时搜索，或改用博查 Key。")
+        brief = self._get_current_brief(page)
+        candidate_sources, pending_chunk_records = self.research.ingest_llm_answer(
+            collection=collection,
+            page=page,
+            answer=answer,
+            sources=digest.items,
+            query_text=intent,
+            page_title=brief.title if brief else page.page_code,
+            replace=replace_existing,
+        )
+        candidate_sources = self.research.refresh_search_result_cards(candidate_sources)
+        page.page_search_results_json = candidate_sources
+        if run is not None:
+            run.data_updated(
+                {
+                    "entity": "page",
+                    "page_id": page.id,
+                    "update_kind": "search_results",
+                    "result_count": len(candidate_sources),
+                }
+            )
+            run.step_completed(
+                "page_search_digest",
+                "让搜索模型整理该页资料",
+                {"result_count": len(candidate_sources), "has_digest": True},
+            )
+        return candidate_sources, pending_chunk_records
+
+    def _collect_page_bocha_sources(
+        self,
+        *,
+        page: ProjectPage,
+        queries: list[dict[str, str]],
+        collection,
+        replace_existing: bool,
+        run,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if run is not None:
+            run.step_started("page_search_bocha", "执行 Bocha 搜索", "先获取搜索摘要结果，再决定后续抓取。")
+
+        def on_query_completed(payload: dict[str, Any]) -> None:
+            page.page_search_results_json = payload["items"]
+            if run is not None:
+                run.data_updated(
+                    {
+                        "entity": "page",
+                        "page_id": page.id,
+                        "update_kind": "search_results",
+                        "query_index": payload["query_index"],
+                        "query_total": payload["query_total"],
+                        "result_count": payload["result_count"],
+                    }
+                )
+                run.step_progress(
+                    "page_search_bocha",
+                    "执行 Bocha 搜索",
+                    progress={
+                        "current": payload["query_index"],
+                        "total": payload["query_total"],
+                        "label": f"已完成 {payload['query_index']}/{payload['query_total']} 条查询",
+                    },
+                    result={"result_count": payload["result_count"]},
+                )
+
+        search_results = self.research.search_query_summaries(
+            queries,
+            limit_per_query=4,
+            on_query_completed=on_query_completed if run is not None else None,
+        )
+        if run is not None:
+            run.step_completed("page_search_bocha", "执行 Bocha 搜索", {"result_count": len(search_results)})
+            run.step_started("page_search_read", "抓取全文并写入资料池", "把搜索结果扩展成可引用正文。")
+
+        def on_read_progress(payload: dict[str, Any]) -> None:
+            if run is None:
+                return
+            run.step_progress(
+                "page_search_read",
+                "抓取全文并写入资料池",
+                progress={
+                    "current": payload["completed"],
+                    "total": payload["total"],
+                    "label": f"已处理 {payload['completed']}/{payload['total']} 条来源",
+                },
+                result={
+                    "ingested_count": payload["ingested_count"],
+                    "failed_count": payload["failed_count"],
+                },
+            )
+
+        candidate_sources, pending_chunk_records, _read_summary = self.research.hydrate_search_results(
+            collection=collection,
+            search_results=search_results,
+            replace=replace_existing,
+            on_read_progress=on_read_progress if run is not None else None,
+        )
+        candidate_sources = self.research.refresh_search_result_cards(candidate_sources)
+        page.page_search_results_json = candidate_sources
+        read_ready = sum(1 for item in candidate_sources if item.get("read_status") in {"ready", "reused"})
+        read_failed = sum(1 for item in candidate_sources if item.get("read_status") == "failed")
+        if run is not None:
+            run.data_updated(
+                {
+                    "entity": "page",
+                    "page_id": page.id,
+                    "update_kind": "search_read",
+                    "result_count": len(candidate_sources),
+                    "read_ready": read_ready,
+                    "read_failed": read_failed,
+                }
+            )
+            run.step_completed(
+                "page_search_read",
+                "抓取全文并写入资料池",
+                {
+                    "result_count": len(candidate_sources),
+                    "read_ready": read_ready,
+                    "read_failed": read_failed,
+                },
+            )
+        return candidate_sources, pending_chunk_records
 
     def _run_page_summary(
         self,
@@ -279,7 +377,8 @@ class PageFlowMixin:
             collection=collection,
             research_session=session,
             query_plan=query_plan,
-            limit=20,
+            limit=30,
+            excerpt_limit=1200,
         )
         summary_package = self.generator.summarize_selected_sources(
             scope_type="page",
@@ -313,7 +412,7 @@ class PageFlowMixin:
             summary_md = self._build_fixed_page_summary(brief.title, brief.content_outline_json)
             summary_source = "outline_brief"
         if not summary_md:
-            raise RuntimeError("当前页 summary 为空，不能生成初稿")
+            raise RuntimeError("当前页 summary 为空，不能生成策划稿")
         self._set_project_stage_at_least(project, "draft")
         page_context = {
             "page": {
@@ -357,7 +456,7 @@ class PageFlowMixin:
     ) -> dict[str, Any]:
         draft = self._get_current_draft(page)
         if not draft:
-            raise RuntimeError("当前页初稿为空，不能生成设计稿")
+            raise RuntimeError("当前页策划稿为空，不能生成设计稿")
         if not project.style_preset:
             raise RuntimeError("style_preset 未设置，不能生成设计稿")
         self._set_project_stage_at_least(project, "design")
@@ -399,7 +498,7 @@ class PageFlowMixin:
         run = AgentRunRecorder(
             service=self,
             project=project,
-            stage=project.current_stage if project.current_stage != "outline" else "search",
+            stage=project.current_stage,
             scope_type="page",
             target_page_id=page.id,
             title=f"执行页面动作：{action_type}",
@@ -458,9 +557,9 @@ class PageFlowMixin:
                     }
                 )
                 run.step_completed(action_type, step_name, result_snapshot)
-                message = "当前页 summary 已生成。系统没有自动继续出初稿。"
+                message = "当前页 summary 已生成。系统没有自动继续出策划稿。"
             elif action_type == "page_draft_generate":
-                step_name = "生成页面初稿"
+                step_name = "生成页面策划稿"
                 run.step_started(action_type, step_name, "基于当前页 summary 生成 draft。")
                 result_snapshot = self._run_page_draft(project=project, page=page, latest_instruction=latest_instruction)
                 run.data_updated(
@@ -472,7 +571,7 @@ class PageFlowMixin:
                     }
                 )
                 run.step_completed(action_type, step_name, result_snapshot)
-                message = "当前页初稿已生成。"
+                message = "当前页策划稿已生成。"
             elif action_type == "page_design_generate":
                 step_name = "生成页面设计稿"
                 run.step_started(action_type, step_name, "基于当前页 draft 和 style_preset 生成 design。")

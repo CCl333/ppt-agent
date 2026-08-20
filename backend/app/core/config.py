@@ -38,8 +38,6 @@ class Settings(BaseSettings):
     mcp_bocha_url: str | None = None
     mcp_bocha_auth_header: str | None = None
     mcp_fetch_url: str | None = None
-    mcp_jina_url: str | None = None
-    mcp_jina_auth_header: str | None = None
     mcp_firecrawl_url: str | None = None
     mcp_markitdown_url: str | None = None
     tavily_api_key: str | None = None

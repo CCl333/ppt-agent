@@ -31,7 +31,7 @@ class OutlineFlowMixin:
             stage="outline",
             scope_type="project",
             target_page_id=None,
-            title="生成大纲并切换到搜索工作台",
+            title="生成大纲并等待确认",
             origin="system",
         )
         run.start()
@@ -41,12 +41,12 @@ class OutlineFlowMixin:
                 target_stage="outline",
                 target_page_id=None,
                 action_type="outline_generate",
-                reason="固定项齐备后生成大纲，并直接进入搜索工作台。",
+                reason="固定项齐备后生成大纲，确认后再进入资料阶段。",
                 execution_plan=[
-                    {"step_code": "O2", "step_name": "从 init_corpus 检索证据", "reason": "大纲只能使用项目级资料池。"},
-                    {"step_code": "O3", "step_name": "生成大纲", "reason": "根据需求、固定项和证据生成章节与页面。"},
+                    {"step_code": "O2", "step_name": "整理搜索摘要", "reason": "大纲使用首轮搜索摘要。"},
+                    {"step_code": "O3", "step_name": "生成大纲", "reason": "根据需求、固定项和背景调研摘要生成章节与页面。"},
                     {"step_code": "O4", "step_name": "落库页面实体", "reason": "创建页面和首个版本。"},
-                    {"step_code": "O5", "step_name": "切换到搜索页", "reason": "完成后直接进入搜索工作台，不自动搜索。"},
+                    {"step_code": "O5", "step_name": "等待确认大纲", "reason": "确认后再按页找资料。"},
                 ],
             )
         )
@@ -55,42 +55,17 @@ class OutlineFlowMixin:
         project.page_count_target = page_count_target
         project.style_preset = str(fixed_fields.get("style_preset") or project.style_preset or "")
         current_step_code = "O2"
-        current_step_name = "从 init_corpus 检索证据"
+        current_step_name = "整理搜索摘要"
         try:
-            run.step_started("O2", "从 init_corpus 检索证据", "大纲只能使用项目级资料池。")
-            init_collection = self.research.get_or_create_init_collection(project)
-            evidence_query_plan = self.research.build_query_plan(
-                scope_type="project",
-                session_role="outline_generate",
-                request_text=project.request_text,
-                project_stage="outline",
-                project_title=project.title,
-                fixed_fields=fixed_fields,
-                answers=requirement_form.answers_json or {},
-                latest_instruction=requirement_form.latest_instruction or "",
-            )
-            evidence_session = self.research.create_session(
-                project_id=project.id,
-                page_id=None,
-                scope_type="project",
-                session_role="outline_generate",
-                research_goal="为大纲生成筛选项目级证据。",
-                query_plan=evidence_query_plan,
-                context_snapshot={"request_text": project.request_text, "fixed_fields": fixed_fields},
-            )
-            evidence = self.research.retrieve_for_collection(
-                project=project,
-                collection=init_collection,
-                research_session=evidence_session,
-                query_plan=evidence_query_plan,
-                limit=200,
-            )
-            evidence_session.status = "completed" if evidence else "failed"
-            run.step_completed("O2", "从 init_corpus 检索证据", {"citation_count": len(evidence)})
+            run.step_started("O2", "整理搜索摘要", "大纲使用首轮搜索摘要，不再抓取全文。")
+            evidence = self.research.search_results_as_evidence(requirement_form.init_search_results_json)
+            if not evidence:
+                raise RuntimeError("首轮搜索结果为空，不能生成大纲")
+            run.step_completed("O2", "整理搜索摘要", {"citation_count": len(evidence)})
 
             current_step_code = "O3"
             current_step_name = "生成大纲"
-            run.step_started("O3", "生成大纲", "根据需求、固定项和证据生成章节与页面。")
+            run.step_started("O3", "生成大纲", "根据需求、固定项和背景调研摘要生成章节与页面。")
             outline_payload = self.generator.generate_outline(
                 project_title=project.title,
                 request_text=project.request_text,
@@ -98,7 +73,7 @@ class OutlineFlowMixin:
                 style_preset=project.style_preset or "",
                 background_asset_path=project.background_asset_path,
                 answers=requirement_form.answers_json or {},
-                init_corpus_evidence=evidence,
+                context_digest=evidence,
             )
             run.step_completed("O3", "生成大纲", {"part_count": len(outline_payload["ppt_outline"].get("parts", []))})
 
@@ -113,7 +88,7 @@ class OutlineFlowMixin:
                 outline_json=outline_payload,
             )
             self.session.add(outline)
-            project.current_stage = "search"
+            project.current_stage = "outline"
             run.data_updated(
                 {
                     "entity": "project",
@@ -124,28 +99,23 @@ class OutlineFlowMixin:
             run.step_completed("O4", "落库页面实体", {"page_count": len(self.list_pages(project.id))})
 
             current_step_code = "O5"
-            current_step_name = "切换到搜索页"
-            run.step_started("O5", "切换到搜索页", "完成后直接进入搜索工作台，不自动搜索。")
-            run.status_changed({"current_stage": "search"})
-            run.step_completed("O5", "切换到搜索页", {"current_stage": "search"})
+            current_step_name = "等待确认大纲"
+            run.step_started("O5", "等待确认大纲", "大纲已生成，确认后再按页找资料。")
+            run.status_changed({"current_stage": "outline"})
+            run.step_completed("O5", "等待确认大纲", {"current_stage": "outline"})
             run.set_recommendations(
                 [
                     {
-                        "code": "page_generate_search_queries",
-                        "label": "先为当前页生成搜索词",
-                        "reason": "进入搜索页后默认不自动搜索，先看当前页职责是否正确。",
-                    },
-                    {
-                        "code": "project_batch_search",
-                        "label": "需要时再批量搜索",
-                        "reason": "只有用户明确要求批量执行时才跑全项目。",
-                    },
+                        "code": "outline_confirm_to_search",
+                        "label": "确认大纲，开始按页找资料",
+                        "reason": "先改标题/要点或增删页，确认后再进入资料阶段。",
+                    }
                 ]
             )
             self._persist_agent_message(
                 run=run,
-                content_md="大纲生成完成，系统已进入搜索工作台。当前没有自动搜索任何页面，你可以先修改当前页标题和要点，再决定是否生成搜索词或执行搜索。",
-                result_snapshot={"current_stage": "search"},
+                content_md="大纲已生成。请先确认章节和页面结构，确认后再开始按页找资料。",
+                result_snapshot={"current_stage": "outline"},
             )
             run.complete()
         except Exception as exc:

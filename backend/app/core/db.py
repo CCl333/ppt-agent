@@ -40,6 +40,13 @@ _SCHEMA_UPGRADES: dict[str, list[tuple[str, str]]] = {
     "page_brief_versions": [
         ("section_title", "TEXT"),
     ],
+    "source_chunks": [
+        ("content_for_match", "TEXT"),
+    ],
+    "search_settings": [
+        ("tavily_api_key", "TEXT"),
+        ("tavily_api_url", "TEXT"),
+    ],
     "research_sessions": [
         ("page_brief_version_id", "TEXT"),
         ("based_on_session_id", "TEXT"),
@@ -53,6 +60,10 @@ _SCHEMA_UPGRADES: dict[str, list[tuple[str, str]]] = {
         ("created_by_agent_run_id", "TEXT"),
         ("candidate_sources_json", "JSON"),
     ],
+}
+
+_SCHEMA_DROPS: dict[str, list[str]] = {
+    "source_chunks": ["content_for_embedding"],
 }
 
 
@@ -152,3 +163,12 @@ def _apply_schema_upgrades(engine: Engine) -> None:
                 if column_name in existing:
                     continue
                 conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}"))
+        inspector = inspect(engine)
+        for table_name, columns in _SCHEMA_DROPS.items():
+            if table_name not in inspector.get_table_names():
+                continue
+            existing = {column["name"] for column in inspector.get_columns(table_name)}
+            for column_name in columns:
+                if column_name not in existing:
+                    continue
+                conn.execute(text(f"ALTER TABLE {table_name} DROP COLUMN {column_name}"))

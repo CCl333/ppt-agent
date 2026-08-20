@@ -474,7 +474,7 @@ function StoryboardPageCard({
           active={active && surface === 'draft'}
           disabled={jumpDisabled}
           icon={<FileText size={18} />}
-          label="初稿"
+          label="策划稿"
           onClick={() => pageId && onJump(pageId, 'draft')}
         />
         <JumpButton

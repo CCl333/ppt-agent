@@ -5,7 +5,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.schemas.api import BatchActionRequest, CancelTasksRequest, ExportCreateRequest, PageActionRequest, PageOutlinePatchRequest, SummaryPatchRequest
+from app.schemas.api import BatchActionRequest, CancelTasksRequest, DraftPatchRequest, ExportCreateRequest, PageActionRequest, PageOutlinePatchRequest, SummaryPatchRequest
 from app.services.orchestrator import PptAgentService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["pages"])
@@ -111,6 +111,16 @@ def get_page_draft(
     service: PptAgentService = Depends(get_service),
 ) -> dict:
     return service.get_page_draft(project_id, page_id)
+
+
+@router.patch("/pages/{page_id}/draft")
+def patch_page_draft(
+    project_id: str,
+    page_id: str,
+    payload: DraftPatchRequest,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.patch_page_draft(project_id, page_id, payload.svg_markup)
 
 
 @router.post("/pages/{page_id}/design:generate")

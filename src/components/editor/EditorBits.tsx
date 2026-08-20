@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FC } from 'react';
 import { FileText, X } from 'lucide-react';
 import type { PageSummary } from '../../lib/ppt-api';
 
-export type EditorSurface = 'search' | 'draft' | 'design';
+export type EditorSurface = 'outline' | 'search' | 'draft' | 'design';
 
 export function renderStageBadge(label: string, value: string) {
   const tone =
@@ -121,8 +121,10 @@ export const SvgCanvas: FC<{ markup: string | null; placeholder: string }> = ({ 
 };
 
 function pagePreviewLabel(surface: EditorSurface): string {
+  if (surface === 'outline') return '大纲';
+  if (surface === 'search') return '资料';
   if (surface === 'design') return '设计稿';
-  if (surface === 'draft') return '初稿';
+  if (surface === 'draft') return '策划稿';
   return '要点';
 }
 
@@ -144,14 +146,17 @@ function pageSurfaceMarkup(page: PageSummary, surface: EditorSurface): string | 
 
 function pageSurfacePlaceholder(page: PageSummary, surface: EditorSurface): string {
   if (surface === 'draft') {
-    if (page.draft_status === 'running') return '初稿生成中';
-    if (page.draft_status === 'failed') return '初稿生成失败';
-    return '初稿尚未生成';
+    if (page.draft_status === 'running') return '策划稿生成中';
+    if (page.draft_status === 'failed') return '策划稿生成失败';
+    return '策划稿尚未生成';
   }
   if (surface === 'design') {
     if (page.design_status === 'running') return '设计稿生成中';
     if (page.design_status === 'failed') return '设计稿生成失败';
     return '设计稿尚未生成';
+  }
+  if (surface === 'outline') {
+    return '大纲结构';
   }
   return '无要点';
 }
@@ -267,9 +272,10 @@ export const SearchResultCard: FC<{
       : item.read_status === 'ready' || item.read_status === 'reused'
       ? 'emerald'
       : 'amber';
-  const vectorTone = item.vector_status === 'ready' ? 'blue' : item.vector_status === 'failed' ? 'rose' : 'amber';
-  const retryLabel = item.read_status === 'failed' ? '重试正文与向量化' : '重新向量化';
-  const showRetry = Boolean(onRetry) && Boolean(allowRetry) && (item.read_status === 'failed' || item.vector_status !== 'ready');
+  const isLlmAnswer = item.source_kind === 'llm_answer';
+  const chunkTone = item.chunk_status === 'ready' ? 'blue' : item.chunk_status === 'failed' ? 'rose' : 'amber';
+  const retryLabel = item.read_status === 'failed' ? '补充抓取全文' : '重新入库';
+  const showRetry = Boolean(onRetry) && Boolean(allowRetry) && !isLlmAnswer && (item.read_status === 'failed' || item.chunk_status !== 'ready');
   return (
     <div className="rounded-[1.5rem] border border-slate-200 bg-white p-5 shadow-sm space-y-3">
       <div className="flex items-start justify-between gap-3">
@@ -287,8 +293,8 @@ export const SearchResultCard: FC<{
       </div>
       <div className="flex flex-wrap gap-2">
         {renderStatusPill('搜索', `R${item.search_rank}`, 'slate')}
-        {renderStatusPill('全文', item.read_status ?? 'pending', readTone)}
-        {renderStatusPill('向量', item.vector_status ?? 'pending', vectorTone)}
+        {renderStatusPill(isLlmAnswer ? '模型已读' : '全文', isLlmAnswer ? 'ready' : (item.read_status ?? 'pending'), isLlmAnswer ? 'emerald' : readTone)}
+        {renderStatusPill('入库', item.chunk_status ?? 'pending', chunkTone)}
       </div>
       <div className="text-xs text-slate-500">{item.query_text}</div>
       <p className="text-sm text-slate-600 leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
@@ -317,14 +323,18 @@ export const DataModal: FC<{
   titleDraft: string;
   bulletDraft: string;
   summaryDraft: string;
+  draftSvgDraft: string;
   onTitleChange: (value: string) => void;
   onBulletChange: (value: string) => void;
   onSummaryChange: (value: string) => void;
+  onDraftSvgChange: (value: string) => void;
   onSaveOutline: () => void;
   onSaveSummary: () => void;
+  onSaveDraft: () => void;
   onClose: () => void;
   isSavingOutline: boolean;
   isSavingSummary: boolean;
+  isSavingDraft: boolean;
 }> = ({
   open,
   surface,
@@ -332,14 +342,18 @@ export const DataModal: FC<{
   titleDraft,
   bulletDraft,
   summaryDraft,
+  draftSvgDraft,
   onTitleChange,
   onBulletChange,
   onSummaryChange,
+  onDraftSvgChange,
   onSaveOutline,
   onSaveSummary,
+  onSaveDraft,
   onClose,
   isSavingOutline,
   isSavingSummary,
+  isSavingDraft,
 }) => {
   if (!open || !page) {
     return null;
@@ -397,6 +411,20 @@ export const DataModal: FC<{
               </button>
             </div>
           </div>
+          {surface === 'draft' ? (
+            <div className="rounded-2xl border border-slate-200 bg-white p-5 space-y-4">
+              <div>
+                <div className="font-semibold text-slate-800">策划稿 SVG</div>
+                <div className="mt-1 text-xs text-slate-500">在这一步定稿内容，确认后再生成设计稿。</div>
+              </div>
+              <textarea value={draftSvgDraft} onChange={(event) => onDraftSvgChange(event.target.value)} rows={14} className="w-full rounded-2xl border border-slate-200 px-4 py-3 text-xs font-mono text-slate-700 outline-none resize-none focus:border-blue-500" placeholder="在这里粘贴或修改策划稿 SVG。" />
+              <div className="flex justify-end">
+                <button onClick={onSaveDraft} disabled={isSavingDraft} className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-2 text-sm font-semibold text-blue-700 hover:bg-blue-100 disabled:opacity-40">
+                  {isSavingDraft ? '保存中...' : '保存策划稿'}
+                </button>
+              </div>
+            </div>
+          ) : null}
         </div>
       </div>
     </div>

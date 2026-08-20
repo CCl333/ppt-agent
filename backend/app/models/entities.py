@@ -165,7 +165,7 @@ class SourceChunk(Base):
     chunk_index: Mapped[int] = mapped_column(default=0)
     section_path: Mapped[str] = mapped_column(Text, default="")
     content_md: Mapped[str] = mapped_column(Text, default="")
-    content_for_embedding: Mapped[str] = mapped_column(Text, default="")
+    content_for_match: Mapped[str] = mapped_column(Text, default="")
     token_count: Mapped[int] = mapped_column(default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
@@ -438,6 +438,8 @@ class SearchSettings(Base):
     id: Mapped[str] = mapped_column(primary_key=True, default="default")
     mode: Mapped[str] = mapped_column(default="bocha")
     bocha_auth_header: Mapped[str] = mapped_column(Text, default="")
+    tavily_api_key: Mapped[str] = mapped_column(Text, default="")
+    tavily_api_url: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
 
 

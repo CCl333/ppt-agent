@@ -49,11 +49,11 @@ export function shouldRefreshFromEvent(event: ProjectEvent): boolean {
 }
 
 export function summarizeSourcePipeline(
-  items: Array<{read_status?: string; vector_status?: string}>,
+  items: Array<{read_status?: string; chunk_status?: string}>,
 ): {
   total: number;
   readReady: number;
-  vectorReady: number;
+  chunkReady: number;
   failed: number;
 } {
   return items.reduce(
@@ -62,14 +62,14 @@ export function summarizeSourcePipeline(
       if (item.read_status === 'ready' || item.read_status === 'reused') {
         summary.readReady += 1;
       }
-      if (item.vector_status === 'ready') {
-        summary.vectorReady += 1;
+      if (item.chunk_status === 'ready') {
+        summary.chunkReady += 1;
       }
-      if (item.read_status === 'failed' || item.vector_status === 'failed') {
+      if (item.read_status === 'failed' || item.chunk_status === 'failed') {
         summary.failed += 1;
       }
       return summary;
     },
-    {total: 0, readReady: 0, vectorReady: 0, failed: 0},
+    {total: 0, readReady: 0, chunkReady: 0, failed: 0},
   );
 }

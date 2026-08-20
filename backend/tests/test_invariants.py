@@ -62,13 +62,28 @@ def test_requirement_form_unanswered_question_returns_422(service, db_session):
     assert "补充问题未完成" in str(exc.value.detail)
 
 
-def test_requirement_form_missing_init_corpus_returns_422(service, db_session):
+def test_requirement_form_gate_accepts_search_results_without_corpus(service, db_session):
     project = make_project(db_session, stage="init", document_count=0)
     form = project.requirement_form
+    form.init_search_results_json = [
+        {
+            "title": "摘要来源",
+            "url": "https://example.com/a",
+            "snippet": "可用于大纲的搜索摘要",
+        }
+    ]
+    form.init_corpus_digest_json = {"document_count": 0}
+    service._validate_requirement_form(project, form)
+
+
+def test_requirement_form_missing_search_results_returns_422(service, db_session):
+    project = make_project(db_session, stage="init", document_count=0)
+    form = project.requirement_form
+    form.init_search_results_json = []
     with pytest.raises(HTTPException) as exc:
         service._validate_requirement_form(project, form)
     assert exc.value.status_code == 422
-    assert "初始化资料池尚未建立" in str(exc.value.detail)
+    assert "首轮搜索结果为空" in str(exc.value.detail)
 
 
 def test_page_b_evidence_excludes_page_a_chunks(db_session):

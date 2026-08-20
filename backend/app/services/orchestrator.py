@@ -37,6 +37,7 @@ from app.services.tasks import (
     wake_scheduler,
 )
 from app.services.generation import GenerationService
+from app.services.svg import extract_and_validate_svg
 from app.services.research import ResearchService
 from app.services.flows.batch_flow import BatchFlowMixin
 from app.services.flows.init_flow import InitFlowMixin
@@ -66,6 +67,7 @@ _GATED_EXECUTE_ACTIONS = {
     "project_batch_summary",
     "project_batch_draft",
     "project_batch_design",
+    "outline_confirm_to_search",
 }
 WORKFLOW_CONSTRAINTS = [
     {
@@ -477,26 +479,30 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
     def retry_requirement_source(self, project_id: str, source_id: str) -> dict[str, Any]:
         project = self._require_project(project_id)
         requirement_form = self._require_requirement_form(project)
-        search_results = self.research.refresh_search_result_cards(requirement_form.init_search_results_json or [])
+        search_results = self.research.build_search_result_cards(requirement_form.init_search_results_json or [])
         source = next((item for item in search_results if item.get("id") == source_id), None)
         if source is None:
             raise HTTPException(status_code=404, detail="指定资料不存在")
+        query_text = str(source.get("query_text") or "").strip()
+        if not query_text:
+            raise HTTPException(status_code=422, detail="该条搜索结果没有对应查询词，请重跑项目级搜索")
 
-        init_collection = self.research.get_or_create_init_collection(project)
-        refreshed_source = self.research.retry_search_result_card(
-            collection=init_collection,
-            search_result=source,
+        refreshed_items = self.research.search_query_summaries(
+            [
+                {
+                    "query_text": query_text,
+                    "query_purpose": str(source.get("query_purpose") or ""),
+                }
+            ],
+            limit_per_query=3,
         )
-        self.session.refresh(requirement_form)
-        latest_search_results = self.research.refresh_search_result_cards(requirement_form.init_search_results_json or [])
-        requirement_form.init_search_results_json = [
-            refreshed_source if item.get("id") == source_id else item
-            for item in latest_search_results
+        refreshed_cards = self.research.build_search_result_cards(refreshed_items)
+        kept = [
+            item
+            for item in search_results
+            if str(item.get("query_text") or "").strip() != query_text
         ]
-        requirement_form.init_search_results_json = self.research.refresh_search_result_cards(
-            requirement_form.init_search_results_json
-        )
-        requirement_form.init_corpus_digest_json = self.research.build_collection_digest(init_collection.id)
+        requirement_form.init_search_results_json = kept + refreshed_cards
         append_event(
             self.session,
             project_id=project.id,
@@ -507,10 +513,8 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
                 "entity": "requirement_form",
                 "update_kind": "init_source_retry",
                 "source_id": source_id,
-                "read_status": refreshed_source.get("read_status"),
-                "vector_status": refreshed_source.get("vector_status"),
-                "document_count": requirement_form.init_corpus_digest_json.get("document_count", 0),
-                "chunk_count": requirement_form.init_corpus_digest_json.get("chunk_count", 0),
+                "query_text": query_text,
+                "result_count": len(requirement_form.init_search_results_json),
             },
         )
         self.session.commit()
@@ -552,7 +556,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             self.session,
             project_id=project.id,
             event_type="workspace.data.updated",
-            stage=project.current_stage if project.current_stage != "outline" else "search",
+            stage=project.current_stage,
             scope_type="page",
             target_page_id=page.id,
             payload={
@@ -561,7 +565,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
                 "update_kind": "search_result_retry",
                 "source_id": source_id,
                 "read_status": refreshed_source.get("read_status"),
-                "vector_status": refreshed_source.get("vector_status"),
+                "chunk_status": refreshed_source.get("chunk_status"),
                 "document_count": page.page_corpus_digest_json.get("document_count", 0),
                 "chunk_count": page.page_corpus_digest_json.get("chunk_count", 0),
             },
@@ -637,6 +641,43 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         enqueue_project_task(self.session, project_id=project.id, task_type="outline")
         self.session.commit()
         wake_scheduler()
+        return self.serialize_project(project)
+
+    def _advance_outline_to_search(self, project: Project) -> None:
+        if project.current_stage != "outline":
+            raise RuntimeError("当前不在大纲确认阶段")
+        if not self._get_current_outline(project.id):
+            raise RuntimeError("大纲尚未生成")
+        cas = self.session.execute(
+            update(Project)
+            .where(Project.id == project.id, Project.current_stage == "outline")
+            .values(current_stage="search")
+        )
+        if cas.rowcount != 1:
+            raise RuntimeError("当前不在大纲确认阶段")
+        project.current_stage = "search"
+        append_event(
+            self.session,
+            project_id=project.id,
+            event_type="status.changed",
+            stage="search",
+            scope_type="project",
+            payload={"current_stage": "search"},
+        )
+
+    def confirm_outline(self, project_id: str) -> dict[str, Any]:
+        project = self._require_project(project_id)
+        try:
+            self._advance_outline_to_search(project)
+        except RuntimeError as exc:
+            detail = str(exc)
+            status_code = (
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+                if "尚未生成" in detail
+                else status.HTTP_409_CONFLICT
+            )
+            raise HTTPException(status_code=status_code, detail=detail) from exc
+        self.session.commit()
         return self.serialize_project(project)
 
     def upload_background(self, project_id: str, file: UploadFile) -> dict[str, Any]:
@@ -847,6 +888,34 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         self.session.commit()
         return self.serialize_page(page, include_versions=True)
 
+    def patch_page_draft(self, project_id: str, page_id: str, svg_markup: str) -> dict[str, Any]:
+        page = self._require_page(project_id, page_id)
+        try:
+            markup = extract_and_validate_svg(svg_markup)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        current = self._get_current_draft(page)
+        version_no = (
+            (self.session.scalar(select(func.count(DraftVersion.id)).where(DraftVersion.page_id == page.id)) or 0) + 1
+        )
+        draft = DraftVersion(
+            project_id=page.project_id,
+            page_id=page.id,
+            version_no=version_no,
+            status="ready",
+            page_brief_version_id=current.page_brief_version_id if current else page.current_brief_version_id,
+            research_session_id=current.research_session_id if current else page.current_research_session_id,
+            draft_svg_markup=markup,
+        )
+        self.session.add(draft)
+        self.session.flush()
+        page.current_draft_version_id = draft.id
+        page.draft_status = "ready"
+        page.design_status = "stale" if page.current_design_version_id else "empty"
+        self._update_artifact_staleness(page)
+        self.session.commit()
+        return self.serialize_page(page, include_versions=True)
+
     def queue_page_action(
         self,
         project_id: str,
@@ -855,7 +924,12 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         *,
         replace_existing: bool = True,
     ) -> dict[str, Any]:
+        project = self._require_project(project_id)
         self._require_page(project_id, page_id)
+        if action_type in {"page_search_run", "page_search_refresh", "page_generate_search_queries"} and (
+            PROJECT_STAGE_ORDER.get(project.current_stage, 0) < PROJECT_STAGE_ORDER["search"]
+        ):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先确认大纲后再按页找资料")
         agent_run_id = new_id()
         task = enqueue_page_action(
             self.session,
@@ -871,7 +945,11 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         return {"status": "queued", "agent_run_id": agent_run_id, "task_id": task.task_id}
 
     def queue_batch_action(self, project_id: str, action_type: str) -> dict[str, Any]:
-        self._require_project(project_id)
+        project = self._require_project(project_id)
+        if action_type == "project_batch_search" and (
+            PROJECT_STAGE_ORDER.get(project.current_stage, 0) < PROJECT_STAGE_ORDER["search"]
+        ):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先确认大纲后再按页找资料")
         agent_run_id = new_id()
         tasks = enqueue_batch_action(
             self.session,
@@ -895,7 +973,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         page = self._require_page(project_id, page_id)
         draft = self._get_current_draft(page)
         if not draft:
-            raise HTTPException(status_code=404, detail="当前页初稿尚未生成")
+            raise HTTPException(status_code=404, detail="当前页策划稿尚未生成")
         return self.serialize_draft(draft)
 
     def get_page_design(self, project_id: str, page_id: str) -> dict[str, Any]:
@@ -1221,8 +1299,8 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         ]
         if missing:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"补充问题未完成: {', '.join(missing)}")
-        if not form.init_corpus_digest_json.get("document_count"):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="初始化资料池尚未建立")
+        if not form.init_search_results_json:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="首轮搜索结果为空")
 
     def _get_current_outline(self, project_id: str) -> OutlineVersion | None:
         stmt = (
@@ -1512,7 +1590,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
                 {"step_code": "page_summary_generate", "step_name": "生成页面 summary", "reason": "只从当前页资料池内召回并生成摘要。"},
             ],
             "page_draft_generate": [
-                {"step_code": "page_draft_generate", "step_name": "生成页面初稿", "reason": "基于当前页 summary 生成 draft。"},
+                {"step_code": "page_draft_generate", "step_name": "生成页面策划稿", "reason": "基于当前页 summary 生成 draft。"},
             ],
             "page_design_generate": [
                 {"step_code": "page_design_generate", "step_name": "生成页面设计稿", "reason": "基于当前页 draft 生成 design。"},
@@ -1590,7 +1668,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
                 {"code": "page_summary_generate", "label": "生成当前页 summary", "reason": "资料池已经建立，现在可以只在当前页内做召回摘要。"}
             ],
             "page_summary_generate": [
-                {"code": "page_draft_generate", "label": "生成当前页初稿", "reason": "summary 已准备好，可以继续出稿。"}
+                {"code": "page_draft_generate", "label": "生成当前页策划稿", "reason": "summary 已准备好，可以继续出稿。"}
             ],
             "page_draft_generate": [
                 {"code": "page_design_generate", "label": "生成当前页设计稿", "reason": "draft 已准备好，可以继续做设计增强。"}
@@ -1599,7 +1677,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
                 {"code": "project_batch_summary", "label": "批量生成 summary", "reason": "批量搜索完成后，可以继续批量做页级摘要。"}
             ],
             "project_batch_summary": [
-                {"code": "project_batch_draft", "label": "批量生成 draft", "reason": "所有页 summary 准备好后再批量出初稿。"}
+                {"code": "project_batch_draft", "label": "批量生成策划稿", "reason": "所有页 summary 准备好后再批量出策划稿。"}
             ],
             "project_batch_draft": [
                 {"code": "project_batch_design", "label": "批量生成 design", "reason": "draft 已到位后可以继续批量设计。"}
