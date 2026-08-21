@@ -16,6 +16,7 @@ from app.models.entities import (
     RequirementForm,
     ResearchSession,
 )
+from app.services.clarification import CLARIFICATION_INTRO, merge_clarification_questions
 from app.services.tasks import enqueue_batch_action, wake_scheduler
 
 
@@ -101,6 +102,7 @@ class InitFlowMixin:
             search_results = self.research.search_query_summaries(
                 query_plan,
                 limit_per_query=4,
+                search_round=1,
                 on_query_completed=on_init_query_completed,
             )
             requirement_form.init_search_results_json = self.research.build_search_result_cards(search_results)
@@ -115,13 +117,17 @@ class InitFlowMixin:
                 init_search_results=search_results,
             )
             requirement_form.page_count_options_json = package["page_count_options"]
-            requirement_form.ai_questions_json = package["ai_questions"]
+            requirement_form.ai_questions_json = merge_clarification_questions(
+                package["ai_questions"],
+                request_text=project.request_text,
+                existing=list(requirement_form.ai_questions_json or []) + list(package.get("ai_questions") or []),
+            )
             requirement_form.status = "ready"
             requirement_form.suggested_actions_json = [
                 {
                     "code": "fill_required_fields",
-                    "label": "补全固定项和问题答案",
-                    "reason": "先完成页数、风格和问题答案，再进入大纲。",
+                    "label": "先确认受众、场合、时长和演示标题",
+                    "reason": "结构化澄清完成后再补页数、风格和进入大纲。",
                 },
                 {
                     "code": "refresh_init_search",
@@ -140,7 +146,7 @@ class InitFlowMixin:
             run.set_recommendations(requirement_form.suggested_actions_json)
             self._persist_agent_message(
                 run=run,
-                content_md="初始化搜索摘要已准备完成。现在可以填写页数、风格和补充问题答案；如果资料方向不对，也可以直接要求重跑项目级搜索。",
+                content_md=CLARIFICATION_INTRO,
                 result_snapshot={"requirement_form_status": requirement_form.status, "result_count": len(search_results)},
             )
             run.complete()

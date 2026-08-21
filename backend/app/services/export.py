@@ -7,9 +7,10 @@ from pathlib import Path
 
 from lxml import etree
 from pptx import Presentation
-from pptx.util import Emu, Inches
+from pptx.util import Emu
 
 from app.services.svg import canvas_size, extract_and_validate_svg
+from app.services.svg_pptx import SLIDE_HEIGHT_EMU, SLIDE_WIDTH_EMU, add_svg_slide
 
 A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -47,13 +48,37 @@ def rasterize_svg_to_png(svg_markup: str) -> bytes:
     return png
 
 
-def build_pptx(slides: list[tuple[str, str]], export_path: Path) -> Path:
+def build_pptx(
+    slides: list[tuple[str, str]],
+    export_path: Path,
+    *,
+    mode: str = "shapes",
+) -> Path:
     if not slides:
         raise RuntimeError("当前项目没有可导出的设计稿页面")
+    if mode == "image":
+        return _build_pptx_image(slides, export_path)
+    if mode != "shapes":
+        raise RuntimeError(f"不支持的导出模式: {mode}")
+    return _build_pptx_shapes(slides, export_path)
 
+
+def _build_pptx_shapes(slides: list[tuple[str, str]], export_path: Path) -> Path:
     presentation = Presentation()
-    presentation.slide_width = Inches(13.333333)
-    presentation.slide_height = Inches(7.5)
+    presentation.slide_width = Emu(SLIDE_WIDTH_EMU)
+    presentation.slide_height = Emu(SLIDE_HEIGHT_EMU)
+    for _page_code, svg_markup in slides:
+        add_svg_slide(presentation, extract_and_validate_svg(svg_markup))
+    export_path = Path(export_path)
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+    presentation.save(str(export_path))
+    return export_path
+
+
+def _build_pptx_image(slides: list[tuple[str, str]], export_path: Path) -> Path:
+    presentation = Presentation()
+    presentation.slide_width = Emu(SLIDE_WIDTH_EMU)
+    presentation.slide_height = Emu(SLIDE_HEIGHT_EMU)
     blank_layout = presentation.slide_layouts[6]
     svg_blobs: list[bytes] = []
 

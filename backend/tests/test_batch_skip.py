@@ -8,10 +8,10 @@ def test_batch_search_skips_ready_pages(db_session):
     project = make_project(db_session, stage="search")
     ready = make_content_page(db_session, project, page_code="page-03", title="已有资料", sort_order=1)
     ready.search_status = "ready"
-    ready.page_corpus_digest_json = {"document_count": 2}
+    ready.page_corpus_digest_json = {"document_count": 2, "content_chars": 1200}
     empty = make_content_page(db_session, project, page_code="page-04", title="空页", sort_order=2)
     empty.search_status = "empty"
-    empty.page_corpus_digest_json = {"document_count": 0}
+    empty.page_corpus_digest_json = {"document_count": 0, "content_chars": 0}
     db_session.commit()
 
     assert _batch_page_eligible(ready, "project_batch_search") is False
@@ -37,3 +37,14 @@ def test_batch_summary_skips_ready_but_reruns_stale(db_session):
 
     assert _batch_page_eligible(ready, "project_batch_summary") is False
     assert _batch_page_eligible(stale, "project_batch_summary") is True
+
+
+def test_batch_summary_skips_pages_with_too_little_corpus(db_session):
+    project = make_project(db_session, stage="search")
+    thin = make_content_page(db_session, project, page_code="page-03", title="资料池只有引用标记", sort_order=1)
+    thin.summary_status = "stale"
+    # 线上坏数据的真实形态：document_count=1，但整份资料只有 `[6]` 三个字符。
+    thin.page_corpus_digest_json = {"document_count": 1, "content_chars": 3}
+    db_session.commit()
+
+    assert _batch_page_eligible(thin, "project_batch_summary") is False

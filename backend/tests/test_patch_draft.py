@@ -56,3 +56,25 @@ def test_patch_page_draft_keeps_previous_version_retrievable(service, db_session
     current = db_session.get(DraftVersion, page.current_draft_version_id)
     assert current is not None
     assert current.version_no == previous.version_no + 1
+
+
+def test_patch_page_draft_rejects_text_outside_content_plan(service, db_session):
+    project = make_project(db_session, stage="draft")
+    page = make_content_page(db_session, project, page_code="page-03", title="策划页", sort_order=1)
+    previous = db_session.get(DraftVersion, page.current_draft_version_id)
+    assert previous is not None
+    previous.content_plan_json = {
+        "page_code": "page-03",
+        "title": "策划页",
+        "subtitle": "",
+        "badge": "",
+        "blocks": [{"role": "point", "label": "要点一", "note": "解释"}],
+        "footer": {},
+    }
+    db_session.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        service.patch_page_draft(project.id, page.id, VALID_SVG)
+    assert exc.value.status_code == 422
+    db_session.refresh(page)
+    assert page.current_draft_version_id == previous.id

@@ -69,6 +69,16 @@ def get_messages(
     return {"items": service.list_messages(project_id)}
 
 
+@router.get("/{project_id}/events")
+def get_events(
+    project_id: str,
+    after_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=500),
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.list_events(project_id, after_id=after_id, limit=limit)
+
+
 @router.post("/{project_id}/messages")
 def create_message(
     project_id: str,

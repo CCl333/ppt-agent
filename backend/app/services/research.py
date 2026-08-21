@@ -28,6 +28,7 @@ from app.services.evidence import estimate_tokens, keyword_score, select_evidenc
 from app.services.mcp_gateway import McpGateway, ReadResult, SearchResult
 from app.services.model_gateway import ModelGateway
 from app.services.prompt_contracts import get_prompt_text, render_prompt
+from app.services.search_plan import copy_plan_fields, normalize_query_plan, stamp_search_results
 
 
 class ResearchService:
@@ -72,17 +73,17 @@ class ResearchService:
                 },
             ),
         )
-        queries = result.get("queries")
-        normalized = self._normalize_query_items(queries)
-        if not normalized:
+        queries = normalize_query_plan(result)
+        if not queries:
             raise RuntimeError("research.query_rewrite 没有返回有效 queries")
-        return normalized
+        return queries
 
     def search_query_summaries(
         self,
         query_plan: list[dict[str, str]],
         *,
         limit_per_query: int = 3,
+        search_round: int = 1,
         on_query_completed: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         seen_urls: set[str] = set()
@@ -108,7 +109,11 @@ class ResearchService:
                     "snippet": result.snippet,
                     "content_excerpt_md": result.snippet if normalized_url.startswith("llm-search://") else "",
                     "source_kind": "llm_answer" if normalized_url.startswith("llm-search://") else "url",
+                    "image_url": result.image_url,
+                    "extra_images": list(result.extra_images),
                 }
+                payload.update(copy_plan_fields(query_item))
+                payload["round"] = int(search_round)
                 items.append(payload)
                 query_results.append(payload)
             if on_query_completed is not None:
@@ -120,12 +125,13 @@ class ResearchService:
                         "query_purpose": query_purpose,
                         "query_result_count": len(query_results),
                         "result_count": len(items),
+                        "search_round": int(search_round),
                         "items": self.build_search_result_cards(items),
                     }
                 )
         if not items:
             raise RuntimeError("搜索没有返回有效网页来源。请确认该模型已开启实时搜索，或改用博查 Key。")
-        return items
+        return stamp_search_results(items, search_round=search_round)
 
     def build_search_result_cards(self, search_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         cards: list[dict[str, Any]] = []
@@ -145,6 +151,9 @@ class ResearchService:
                     "chunk_status": item.get("chunk_status") or "pending",
                     "source_document_id": item.get("source_document_id"),
                     "source_kind": item.get("source_kind") or "",
+                    "image_url": item.get("image_url") or "",
+                    "extra_images": item.get("extra_images") or [],
+                    **copy_plan_fields(item),
                 }
             )
         return cards
@@ -307,6 +316,7 @@ class ResearchService:
         query_text: str = "",
         page_title: str = "",
         replace: bool = True,
+        search_round: int = 1,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         cleaned = (answer or "").strip()
         if not cleaned:
@@ -320,7 +330,7 @@ class ResearchService:
                 SourceDocument.source_type == "llm_answer",
             )
         ) or 0
-        round_no = int(existing_answers) + 1
+        round_no = int(search_round) if search_round else int(existing_answers) + 1
         title = f"整理稿：{(page_title or '').strip() or page.page_code}"
         source_uri = f"llm-search://{page.id}/{round_no}"
         search_result = SearchResult(
@@ -388,7 +398,7 @@ class ResearchService:
                     "source_kind": "llm_source",
                 }
             )
-        return source_cards, pending_chunk_records
+        return stamp_search_results(source_cards, search_round=round_no, default_dimension="页级整理稿"), pending_chunk_records
 
     def search_results_as_evidence(self, search_results: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         evidence: list[dict[str, Any]] = []
@@ -400,6 +410,8 @@ class ResearchService:
                 raw.get("content_excerpt_md") or raw.get("snippet") or raw.get("bocha_summary") or ""
             ).strip()
             url = str(raw.get("url") or "").strip()
+            if not url.startswith("http://") and not url.startswith("https://"):
+                continue
             if not title and not snippet and not url:
                 continue
             evidence.append(
@@ -446,6 +458,9 @@ class ResearchService:
                 "read_status": "pending",
                 "chunk_status": "pending",
                 "source_document_id": None,
+                "image_url": item.get("image_url") or "",
+                "extra_images": item.get("extra_images") or [],
+                **copy_plan_fields(item),
             }
             cached_result = self._get_cached_read_result(normalized_url)
             if cached_result is not None:
@@ -496,6 +511,11 @@ class ResearchService:
             .join(SourceDocument, SourceDocument.id == SourceChunk.source_document_id)
             .where(SourceDocument.collection_id == collection_id)
         ) or 0
+        content_chars = self.session.scalar(
+            select(func.coalesce(func.sum(func.length(SourceChunk.content_md)), 0))
+            .join(SourceDocument, SourceDocument.id == SourceChunk.source_document_id)
+            .where(SourceDocument.collection_id == collection_id)
+        ) or 0
         latest_document = self.session.scalars(
             select(SourceDocument)
             .where(SourceDocument.collection_id == collection_id)
@@ -506,6 +526,7 @@ class ResearchService:
             "collection_id": collection_id,
             "document_count": document_count,
             "chunk_count": chunk_count,
+            "content_chars": int(content_chars),
             "latest_document_title": latest_document.title if latest_document else "",
             "updated_at": latest_document.created_at.isoformat() if latest_document else None,
         }
@@ -682,6 +703,8 @@ class ResearchService:
                     url=str(item.get("url") or ""),
                     snippet=str(item.get("snippet") or item.get("bocha_summary") or ""),
                     provider=str(item.get("provider") or "bocha-mcp"),
+                    image_url=str(item.get("image_url") or ""),
+                    extra_images=tuple(item.get("extra_images") or []) if isinstance(item.get("extra_images"), list) else (),
                 )
                 for item in items
                 if item.get("url")
@@ -1044,17 +1067,7 @@ class ResearchService:
         }
 
     def _normalize_query_items(self, payload: Any) -> list[dict[str, str]]:
-        if not isinstance(payload, list):
-            return []
-        items: list[dict[str, str]] = []
-        for raw_item in payload:
-            if not isinstance(raw_item, dict):
-                continue
-            query_text = str(raw_item.get("query_text") or raw_item.get("query") or "").strip()
-            query_purpose = str(raw_item.get("query_purpose") or raw_item.get("intent") or "").strip()
-            if query_text:
-                items.append({"query_text": query_text, "query_purpose": query_purpose})
-        return items
+        return normalize_query_plan(payload)
 
     def _build_citation_label(self, title: str, url: str) -> str:
         return (title or url)[:60]

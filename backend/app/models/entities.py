@@ -22,6 +22,8 @@ class Project(Base):
     style_preset: Mapped[str | None] = mapped_column(nullable=True)
     background_asset_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     workflow_constraints_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    style_candidates_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    style_card_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
 
@@ -299,6 +301,7 @@ class ProjectPage(Base):
     design_status: Mapped[str] = mapped_column(default="pending")
     page_search_queries_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     page_search_results_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    page_images_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     page_corpus_digest_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     page_summary_md: Mapped[str] = mapped_column(Text, default="")
     page_summary_citations_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
@@ -343,6 +346,7 @@ class DraftVersion(Base):
     page_brief_version_id: Mapped[str | None] = mapped_column(nullable=True)
     research_session_id: Mapped[str | None] = mapped_column(nullable=True)
     draft_svg_markup: Mapped[str] = mapped_column(Text, default="")
+    content_plan_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
 
@@ -374,6 +378,7 @@ class ExportJob(Base):
     export_format: Mapped[str] = mapped_column(default="pptx")
     status: Mapped[str] = mapped_column(default="completed")
     file_path: Mapped[str] = mapped_column(Text)
+    font_report_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
 
@@ -432,6 +437,15 @@ class ModelBinding(Base):
     provider: Mapped[ModelProvider] = relationship(back_populates="bindings")
 
 
+class ModelStageSettings(Base):
+    __tablename__ = "model_stage_settings"
+
+    id: Mapped[str] = mapped_column(primary_key=True, default="default")
+    expert_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    expert_bindings_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+
 class SearchSettings(Base):
     __tablename__ = "search_settings"
 
@@ -452,4 +466,16 @@ class ReaderSettings(Base):
     tavily_api_url: Mapped[str] = mapped_column(Text, default="")
     firecrawl_api_key: Mapped[str] = mapped_column(Text, default="")
     firecrawl_api_url: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+
+class StyleLibraryEntry(Base):
+    __tablename__ = "style_library"
+
+    style_id: Mapped[str] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(Text)
+    name_en: Mapped[str] = mapped_column(Text, default="")
+    builtin: Mapped[bool] = mapped_column(Boolean, default=False)
+    card_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)

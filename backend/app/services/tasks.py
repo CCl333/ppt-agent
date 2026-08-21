@@ -15,6 +15,7 @@ from app.core.db import session_scope
 from app.models.base import new_id, now_utc
 from app.models.entities import AgentTask, ProjectPage
 from app.services.events import append_event
+from app.services.search_quality import MIN_DIGEST_CHARS
 
 STATUS_PENDING = 1
 STATUS_PROCESSING = 2
@@ -308,6 +309,10 @@ def _batch_page_eligible(page: ProjectPage, action_type: str) -> bool:
         return not (page.search_status == "ready" and bool(digest.get("document_count")))
     if action_type == "project_batch_summary":
         if page.page_role != "content" or not digest.get("document_count"):
+            return False
+        # content_chars 是后加字段：老资料池没有该键时不在这里拦，交给
+        # _run_page_summary 惰性补算后再判，避免误伤资料池完好的历史页面。
+        if "content_chars" in digest and int(digest.get("content_chars") or 0) < MIN_DIGEST_CHARS:
             return False
         return page.summary_status != "ready"
     if action_type == "project_batch_draft":

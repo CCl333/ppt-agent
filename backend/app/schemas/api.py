@@ -99,6 +99,15 @@ class ExportCreateRequest(BaseModel):
     export_format: str = "pptx"
 
 
+class StyleCardConfirmRequest(BaseModel):
+    style_id: str = Field(min_length=1)
+    source: str = "any"
+
+
+class StyleCardSaveRequest(BaseModel):
+    style_id: str | None = None
+
+
 class CancelTasksRequest(BaseModel):
     page_id: str | None = None
 
@@ -121,10 +130,24 @@ class ModelProviderPatchRequest(BaseModel):
     timeout_seconds: int | None = Field(default=None, ge=5, le=600)
 
 
+class ExpertBindingsPayload(BaseModel):
+    search: str | None = None
+    content: str | None = None
+    draft: str | None = None
+    design: str | None = None
+    context: str | None = None
+    svg: str | None = None
+
+
 class ModelBindingsPutRequest(BaseModel):
     context: str | None = None
     svg: str | None = None
     search: str | None = None
+    content: str | None = None
+    draft: str | None = None
+    design: str | None = None
+    expert_enabled: bool | None = None
+    expert: ExpertBindingsPayload | None = None
 
 
 class SearchSettingsPutRequest(BaseModel):

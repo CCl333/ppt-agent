@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -8,9 +8,9 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings, get_settings
+from app.services.search_quality import assert_digest_usable, require_reachable_sources
 
-LLM_DIGEST_SNIPPET_LIMIT = 2400
-_EMPTY_DIGEST_ANSWERS = {"", "没有检索结果"}
+logger = logging.getLogger("ppt_agent.search")
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,8 @@ class SearchResult:
     url: str
     snippet: str
     provider: str = "bocha-mcp"
+    image_url: str = ""
+    extra_images: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,7 @@ class McpGateway:
                     "search_depth": "basic",
                     "include_raw_content": False,
                     "include_answer": False,
+                    "include_images": True,
                 },
                 timeout=45,
             )
@@ -84,29 +87,31 @@ class McpGateway:
     def search_web_digest(self, query: str, limit: int = 8):
         from app.services.model_gateway import LiveSearchDigest, ModelGateway
 
-        digest = ModelGateway(self.settings).search_live(query, limit=limit)
-        if not isinstance(digest, LiveSearchDigest):
-            raise RuntimeError("搜索模型没有返回整理稿")
-        return digest
+        gateway = ModelGateway(self.settings)
+
+        def once() -> LiveSearchDigest:
+            digest = gateway.search_live(query, limit=limit)
+            if not isinstance(digest, LiveSearchDigest):
+                raise RuntimeError("搜索模型没有返回整理稿")
+            return digest
+
+        digest = once()
+        try:
+            answer = assert_digest_usable(digest.answer)
+        except RuntimeError as exc:
+            # _call_with_retry 对 RuntimeError 不重试，退化输出只能在这一层重来一次。
+            logger.warning("整理稿不合格，重试一次: %s", str(exc)[:300])
+            digest = once()
+            answer = assert_digest_usable(digest.answer)
+        return LiveSearchDigest(answer=answer, items=digest.items)
 
     def _search_with_llm(self, query: str, limit: int) -> list[SearchResult]:
+        # search_web_digest 已完成质量校验（含 detect_degeneration）与一次重试。
         digest = self.search_web_digest(query, limit)
+        live_items = require_reachable_sources(digest.items, raw_excerpt=digest.answer or "")
         results: list[SearchResult] = []
-        answer = (digest.answer or "").strip()
-        if answer not in _EMPTY_DIGEST_ANSWERS:
-            digest_key = hashlib.sha256(query.strip().encode("utf-8")).hexdigest()[:16]
-            results.append(
-                SearchResult(
-                    title="整理稿",
-                    url=f"llm-search://digest/{digest_key}",
-                    snippet=answer[:LLM_DIGEST_SNIPPET_LIMIT],
-                    provider="llm-search",
-                )
-            )
-        for row in digest.items:
+        for row in live_items[:limit]:
             url = str(row.get("url") or "").strip()
-            if not url:
-                continue
             results.append(
                 SearchResult(
                     title=str(row.get("title") or url),
@@ -140,6 +145,7 @@ class McpGateway:
                 title=item.get("name") or item.get("title") or f"来源 {index}",
                 url=item.get("url") or item.get("link") or "",
                 snippet=item.get("snippet") or item.get("summary") or item.get("description") or "",
+                image_url=_first_image_url(item),
             )
             for index, item in enumerate(items[:limit], start=1)
             if item.get("url") or item.get("link")
@@ -149,6 +155,7 @@ class McpGateway:
         items = payload.get("results") or payload.get("data") or []
         if not isinstance(items, list):
             items = []
+        extra_images = _image_url_list(payload.get("images"))
         results: list[SearchResult] = []
         for index, item in enumerate(items[:limit], start=1):
             if not isinstance(item, dict):
@@ -156,13 +163,27 @@ class McpGateway:
             url = str(item.get("url") or item.get("link") or "").strip()
             if not url.startswith("http://") and not url.startswith("https://"):
                 continue
+            image_url = _first_image_url(item)
+            if not image_url and extra_images:
+                image_url = extra_images.pop(0)
             results.append(
                 SearchResult(
                     title=str(item.get("title") or item.get("name") or f"来源 {index}"),
                     url=url,
                     snippet=str(item.get("content") or item.get("snippet") or item.get("description") or ""),
                     provider="tavily",
+                    image_url=image_url,
                 )
+            )
+        if results and extra_images:
+            last = results[-1]
+            results[-1] = SearchResult(
+                title=last.title,
+                url=last.url,
+                snippet=last.snippet,
+                provider=last.provider,
+                image_url=last.image_url,
+                extra_images=tuple(extra_images),
             )
         return results
 
@@ -265,3 +286,27 @@ class McpGateway:
             if cleaned:
                 return cleaned[:180]
         return url
+
+
+def _first_image_url(item: dict[str, Any]) -> str:
+    for key in ("image_url", "imageUrl", "thumbnailUrl", "thumbnail_url", "image", "thumbnail"):
+        value = str(item.get(key) or "").strip()
+        if value.startswith("http://") or value.startswith("https://"):
+            return value
+    return ""
+
+
+def _image_url_list(payload: Any) -> list[str]:
+    if isinstance(payload, str):
+        payload = [payload]
+    if not isinstance(payload, list):
+        return []
+    urls: list[str] = []
+    for item in payload:
+        if isinstance(item, dict):
+            value = _first_image_url(item) or str(item.get("url") or "").strip()
+        else:
+            value = str(item or "").strip()
+        if value.startswith("http://") or value.startswith("https://"):
+            urls.append(value)
+    return urls

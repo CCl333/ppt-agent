@@ -65,10 +65,12 @@ POST   /projects/{project_id}/assets/backgrounds
 
 ```text
 GET    /projects/{project_id}/outline
+POST   /projects/{project_id}/outline:retry
 PATCH  /projects/{project_id}/outline/storyboard
+POST   /projects/{project_id}/outline/confirm
 ```
 
-大纲阶段无聊天框；生成完成后进入搜索工作台。没有单独的 `outline/confirm` 接口。
+`POST /outline:retry` 仅在 `current_stage=outline` 且尚未落库大纲时允许，用于生成失败后重新入队。
 
 ### 页面、批量与导出
 

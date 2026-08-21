@@ -26,6 +26,27 @@ export interface StyleOption {
   palette: Record<string, string>;
 }
 
+export interface StyleCard {
+  style_id: string;
+  name: string;
+  name_en: string;
+  rationale: string;
+  tags: string[];
+  palette: Record<string, string>;
+  colors: string[];
+  source: string;
+  texture?: string;
+  fixed_chrome?: string[];
+}
+
+export interface StyleCardState {
+  project_id: string;
+  frozen: StyleCard | null;
+  candidates: StyleCard[];
+  library: StyleCard[];
+  saved?: StyleCard;
+}
+
 export interface ProjectSummary {
   project_id: string;
   title: string;
@@ -33,6 +54,7 @@ export interface ProjectSummary {
   current_stage: ProjectStage;
   page_count_target: number | null;
   style_preset: string | null;
+  style_card?: StyleCard | null;
   background_asset_path: string | null;
   workflow_constraints: WorkflowConstraint[];
   page_count: number;
@@ -71,6 +93,8 @@ export interface RequirementQuestion {
 export interface InitSearchQuery {
   query_text: string;
   query_purpose: string;
+  dimension?: string;
+  dimension_id?: string;
 }
 
 export interface InitSearchResult {
@@ -78,6 +102,9 @@ export interface InitSearchResult {
   query_text: string;
   query_purpose: string;
   search_rank: number;
+  round?: number;
+  dimension?: string;
+  dimension_id?: string;
   title: string;
   url: string;
   bocha_summary: string;
@@ -87,12 +114,14 @@ export interface InitSearchResult {
   chunk_status?: string;
   source_document_id?: string | null;
   source_kind?: string;
+  image_url?: string;
 }
 
 export interface CorpusDigest {
   collection_id?: string;
   document_count: number;
   chunk_count: number;
+  content_chars?: number;
   latest_document_title?: string;
   updated_at?: string | null;
 }
@@ -137,6 +166,8 @@ export interface RequirementFormResponse {
 export interface PageSearchQuery {
   query_text: string;
   query_purpose: string;
+  dimension?: string;
+  dimension_id?: string;
 }
 
 export interface Citation {
@@ -157,6 +188,9 @@ export interface PageSearchResult {
   query_text: string;
   query_purpose?: string;
   search_rank: number;
+  round?: number;
+  dimension?: string;
+  dimension_id?: string;
   title: string;
   url: string;
   snippet?: string;
@@ -165,6 +199,32 @@ export interface PageSearchResult {
   chunk_status?: string;
   source_document_id?: string | null;
   source_kind?: string;
+  image_url?: string;
+}
+
+export interface SearchCoverageDimension {
+  dimension_id: string;
+  name: string;
+  query_count: number;
+  hit_count?: number;
+}
+
+export interface SearchCoverage {
+  dimension_count: number;
+  query_count: number;
+  result_count: number;
+  rounds: number[];
+  latest_round: number;
+  latest_round_hits: number;
+  dimensions: SearchCoverageDimension[];
+}
+
+export interface PageImage {
+  image_id: string;
+  caption: string;
+  source_title: string;
+  source_url: string;
+  available: string;
 }
 
 export interface PageSummary {
@@ -183,6 +243,8 @@ export interface PageSummary {
   design_status: string;
   page_search_queries: PageSearchQuery[];
   page_search_results: PageSearchResult[];
+  page_images?: PageImage[];
+  search_coverage?: SearchCoverage;
   page_corpus_digest: CorpusDigest;
   page_summary_md: string;
   page_summary_citations: Citation[];
@@ -262,6 +324,7 @@ export interface DraftVersion {
   page_brief_version_id: string | null;
   research_session_id: string | null;
   draft_svg_markup: string;
+  content_plan_json?: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 }
@@ -281,12 +344,26 @@ export interface DesignVersion {
   updated_at: string;
 }
 
+export interface FontReport {
+  fonts: Array<{
+    name: string;
+    license_id: string;
+    action: string;
+    embed: boolean;
+    notice?: string | null;
+    note?: string;
+  }>;
+  notices: string[];
+  install_required: boolean;
+}
+
 export interface ExportJob {
   export_id: string;
   project_id: string;
   export_format: string;
   status: string;
   file_path: string;
+  font_report?: FontReport;
   created_at: string;
   updated_at: string;
 }
@@ -312,7 +389,7 @@ export interface ActionJobResponse {
   agent_run_id: string;
 }
 
-export type ModelRole = 'context' | 'svg' | 'search';
+export type ModelRole = 'search' | 'content' | 'draft' | 'design';
 export type SearchMode = 'bocha' | 'llm' | 'tavily';
 export type ReaderMode = 'tavily' | 'firecrawl' | 'web_fetch';
 
@@ -331,6 +408,7 @@ export interface ModelProvider {
 export interface ModelBindingItem {
   role: ModelRole;
   label: string;
+  hint?: string;
   provider_id: string | null;
   provider: ModelProvider | null;
 }
@@ -338,6 +416,8 @@ export interface ModelBindingItem {
 export interface ModelBindingsResponse {
   items: ModelBindingItem[];
   needs_setup: boolean;
+  expert_enabled: boolean;
+  expert_items: ModelBindingItem[];
 }
 
 export interface SearchSettings {
@@ -398,6 +478,10 @@ export interface ProjectEvent {
   agent_run_id: string | null;
   payload: Record<string, unknown>;
   created_at: string;
+}
+
+export interface EventListResponse {
+  items: ProjectEvent[];
 }
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? '/api/v1').replace(/\/$/, '');
@@ -475,6 +559,21 @@ export async function listMessages(projectId: string): Promise<MessageListRespon
   return request<MessageListResponse>(`/projects/${projectId}/messages`);
 }
 
+export async function listProjectEvents(
+  projectId: string,
+  options?: {afterId?: number; limit?: number},
+): Promise<EventListResponse> {
+  const params = new URLSearchParams();
+  if (options?.afterId) {
+    params.set('after_id', String(options.afterId));
+  }
+  if (options?.limit) {
+    params.set('limit', String(options.limit));
+  }
+  const query = params.toString();
+  return request<EventListResponse>(`/projects/${projectId}/events${query ? `?${query}` : ''}`);
+}
+
 export async function createMessage(
   projectId: string,
   payload: {
@@ -536,6 +635,12 @@ export async function confirmOutline(projectId: string): Promise<ProjectSummary>
   });
 }
 
+export async function retryOutline(projectId: string): Promise<ProjectSummary> {
+  return request<ProjectSummary>(`/projects/${projectId}/outline:retry`, {
+    method: 'POST',
+  });
+}
+
 export async function getOutline(projectId: string): Promise<OutlineResponse> {
   return request<OutlineResponse>(`/projects/${projectId}/outline`);
 }
@@ -586,13 +691,13 @@ export async function runPageSearch(
   projectId: string,
   pageId: string,
   actionType: 'page_search_run' | 'page_search_refresh',
-  replaceExisting = true,
+  replaceExisting?: boolean,
 ): Promise<ActionJobResponse> {
   return request<ActionJobResponse>(`/projects/${projectId}/pages/${pageId}/search:run`, {
     method: 'POST',
     body: JSON.stringify({
       action_type: actionType,
-      replace_existing: replaceExisting,
+      replace_existing: replaceExisting ?? actionType === 'page_search_refresh',
     }),
   });
 }
@@ -698,7 +803,14 @@ export async function getModelBindings(): Promise<ModelBindingsResponse> {
   return request<ModelBindingsResponse>('/settings/model-bindings');
 }
 
-export async function putModelBindings(payload: Partial<Record<ModelRole, string | null>>): Promise<ModelBindingsResponse> {
+export async function putModelBindings(payload: {
+  search?: string | null;
+  content?: string | null;
+  draft?: string | null;
+  design?: string | null;
+  expert_enabled?: boolean;
+  expert?: Partial<Record<ModelRole, string | null>>;
+}): Promise<ModelBindingsResponse> {
   return request<ModelBindingsResponse>('/settings/model-bindings', {
     method: 'PUT',
     body: JSON.stringify(payload),
@@ -735,6 +847,34 @@ export async function putReaderSettings(payload: {
   return request<ReaderSettings>('/settings/reader', {
     method: 'PUT',
     body: JSON.stringify(payload),
+  });
+}
+
+export async function getStyleCards(projectId: string): Promise<StyleCardState> {
+  return request<StyleCardState>(`/projects/${projectId}/style-cards`);
+}
+
+export async function generateStyleCards(projectId: string): Promise<StyleCardState> {
+  return request<StyleCardState>(`/projects/${projectId}/style-cards:generate`, {
+    method: 'POST',
+  });
+}
+
+export async function confirmStyleCard(
+  projectId: string,
+  styleId: string,
+  source = 'any',
+): Promise<StyleCardState> {
+  return request<StyleCardState>(`/projects/${projectId}/style-cards:confirm`, {
+    method: 'POST',
+    body: JSON.stringify({style_id: styleId, source}),
+  });
+}
+
+export async function saveStyleCardToLibrary(projectId: string, styleId?: string): Promise<StyleCardState> {
+  return request<StyleCardState>(`/projects/${projectId}/style-cards:save`, {
+    method: 'POST',
+    body: JSON.stringify({style_id: styleId ?? null}),
   });
 }
 

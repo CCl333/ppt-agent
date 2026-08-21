@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.db import get_session_factory
-from app.models.entities import ModelBinding, SearchSettings
+from app.models.entities import ModelBinding, ModelStageSettings, SearchSettings
 from app.services.model_settings import mask_api_key
 from app.services.reader_settings import DEFAULT_TAVILY_API_URL, env_tavily_key, env_tavily_url, normalize_endpoint
 
@@ -97,6 +97,10 @@ def search_is_ready(session: Session) -> bool:
     row = ensure_search_settings(session)
     mode = row.mode if row.mode in SEARCH_MODES else "bocha"
     if mode == "llm":
+        stage = session.get(ModelStageSettings, "default")
+        if stage and stage.expert_enabled:
+            expert_search = str((stage.expert_bindings_json or {}).get("search") or "").strip()
+            return bool(expert_search)
         binding = session.get(ModelBinding, "search")
         return binding is not None and bool(binding.provider_id)
     if mode == "tavily":

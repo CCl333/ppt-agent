@@ -16,6 +16,8 @@ _SESSION_FACTORY: sessionmaker[Session] | None = None
 _SCHEMA_UPGRADES: dict[str, list[tuple[str, str]]] = {
     "projects": [
         ("workflow_constraints_json", "JSON"),
+        ("style_candidates_json", "JSON"),
+        ("style_card_json", "JSON"),
     ],
     "requirement_forms": [
         ("init_search_queries_json", "JSON"),
@@ -32,6 +34,7 @@ _SCHEMA_UPGRADES: dict[str, list[tuple[str, str]]] = {
         ("summary_status", "TEXT"),
         ("page_search_queries_json", "JSON"),
         ("page_search_results_json", "JSON"),
+        ("page_images_json", "JSON"),
         ("page_corpus_digest_json", "JSON"),
         ("page_summary_md", "TEXT"),
         ("page_summary_citations_json", "JSON"),
@@ -40,8 +43,14 @@ _SCHEMA_UPGRADES: dict[str, list[tuple[str, str]]] = {
     "page_brief_versions": [
         ("section_title", "TEXT"),
     ],
+    "draft_versions": [
+        ("content_plan_json", "JSON"),
+    ],
     "source_chunks": [
         ("content_for_match", "TEXT"),
+    ],
+    "export_jobs": [
+        ("font_report_json", "JSON"),
     ],
     "search_settings": [
         ("tavily_api_key", "TEXT"),
@@ -125,8 +134,11 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _apply_schema_upgrades(engine)
     from app.services.model_settings import seed_models_from_env
+    from app.services.style_cards import seed_style_library
 
     seed_models_from_env()
+    with session_scope() as session:
+        seed_style_library(session)
 
 
 def reset_db_state() -> None:

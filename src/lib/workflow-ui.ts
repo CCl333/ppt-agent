@@ -45,6 +45,8 @@ export function shouldRefreshFromEvent(event: ProjectEvent): boolean {
     'workspace.data.updated',
     'requirements.answers_updated',
     'project.created',
+    'outline.queued',
+    'task.failed',
   ].includes(event.event_type);
 }
 
@@ -72,4 +74,23 @@ export function summarizeSourcePipeline(
     },
     {total: 0, readReady: 0, chunkReady: 0, failed: 0},
   );
+}
+
+export function groupQueriesByDimension<T extends {dimension?: string; dimension_id?: string; query_purpose?: string}>(
+  queries: T[],
+): Array<{dimension_id: string; name: string; items: T[]}> {
+  const groups: Array<{dimension_id: string; name: string; items: T[]}> = [];
+  const indexById = new Map<string, number>();
+  queries.forEach((query) => {
+    const name = query.dimension || query.query_purpose || '综合';
+    const dimensionId = query.dimension_id || name;
+    const existing = indexById.get(dimensionId);
+    if (existing === undefined) {
+      indexById.set(dimensionId, groups.length);
+      groups.push({dimension_id: dimensionId, name, items: [query]});
+      return;
+    }
+    groups[existing].items.push(query);
+  });
+  return groups;
 }

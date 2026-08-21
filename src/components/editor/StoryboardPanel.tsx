@@ -8,6 +8,9 @@ type StoryboardContentPage = {
   page_id: string | null;
   title: string;
   content_outline: string[];
+  search_status?: string;
+  draft_status?: string;
+  design_status?: string;
 };
 
 type StoryboardSection = {
@@ -119,6 +122,9 @@ function createContentPage(page: PageSummary): StoryboardContentPage {
     page_id: page.page_id,
     title: page.title,
     content_outline: page.content_outline,
+    search_status: page.search_status,
+    draft_status: page.draft_status,
+    design_status: page.design_status,
   };
 }
 
@@ -307,17 +313,44 @@ function InsertionIndicator({ position }: { position: 'before' | 'after' }) {
   );
 }
 
+function jumpStatusClass(status?: string): string {
+  if (status === 'ready' || status === 'confirmed') {
+    return 'text-emerald-600';
+  }
+  if (status === 'running') {
+    return 'text-blue-600';
+  }
+  if (status === 'stale') {
+    return 'text-amber-600';
+  }
+  if (status === 'failed') {
+    return 'text-rose-600';
+  }
+  return 'text-slate-400';
+}
+
+function jumpStatusLabel(status?: string): string {
+  if (status === 'ready') return '已就绪';
+  if (status === 'confirmed') return '已确认';
+  if (status === 'running') return '生成中';
+  if (status === 'stale') return '需更新';
+  if (status === 'failed') return '失败';
+  return '未开始';
+}
+
 function JumpButton({
   active,
   disabled,
   icon,
   label,
+  status,
   onClick,
 }: {
   active: boolean;
   disabled?: boolean;
   icon: ReactNode;
   label: string;
+  status?: string;
   onClick: () => void;
 }) {
   return (
@@ -333,9 +366,12 @@ function JumpButton({
           : 'bg-slate-50 text-slate-400 hover:bg-blue-50 hover:text-blue-600'
       }`}
     >
-      <span className="flex flex-col items-center justify-center gap-1.5">
+      <span className="flex flex-col items-center justify-center gap-1">
         {icon}
         {label}
+        <span className={`text-[9px] font-semibold ${disabled ? 'text-slate-300' : jumpStatusClass(status)}`}>
+          {jumpStatusLabel(status)}
+        </span>
       </span>
     </button>
   );
@@ -354,6 +390,9 @@ function StoryboardPageCard({
   saving = false,
   unsaved = false,
   dropPosition = null,
+  searchStatus,
+  draftStatus,
+  designStatus,
   onTitleChange,
   onTitleBlur,
   onDelete,
@@ -375,6 +414,9 @@ function StoryboardPageCard({
   saving?: boolean;
   unsaved?: boolean;
   dropPosition?: 'before' | 'after' | null;
+  searchStatus?: string;
+  draftStatus?: string;
+  designStatus?: string;
   onTitleChange?: (value: string) => void;
   onTitleBlur?: () => void;
   onDelete?: () => void;
@@ -467,14 +509,16 @@ function StoryboardPageCard({
           active={active && surface === 'search'}
           disabled={jumpDisabled}
           icon={<Search size={18} />}
-          label="搜索"
+          label="搜索结果"
+          status={searchStatus}
           onClick={() => pageId && onJump(pageId, 'search')}
         />
         <JumpButton
           active={active && surface === 'draft'}
           disabled={jumpDisabled}
           icon={<FileText size={18} />}
-          label="策划稿"
+          label="初稿"
+          status={draftStatus}
           onClick={() => pageId && onJump(pageId, 'draft')}
         />
         <JumpButton
@@ -482,6 +526,7 @@ function StoryboardPageCard({
           disabled={jumpDisabled}
           icon={<Palette size={18} />}
           label="设计稿"
+          status={designStatus}
           onClick={() => pageId && onJump(pageId, 'design')}
         />
       </div>
@@ -806,6 +851,9 @@ export default function StoryboardPanel({
             page_id: null,
             title: `新内容页 ${section.pages.length + 1}`,
             content_outline: ['补充当前页要点'],
+            search_status: 'empty',
+            draft_status: 'empty',
+            design_status: 'empty',
           },
         ],
       };
@@ -867,7 +915,7 @@ export default function StoryboardPanel({
 
   return (
     <div
-      className="flex-1 overflow-auto bg-[#f4f5f7] p-12"
+      className="h-full min-h-0 flex-1 overflow-auto bg-[#f4f5f7] p-12"
       style={{ backgroundImage: 'radial-gradient(#cbd5e1 1.5px, transparent 1.5px)', backgroundSize: '24px 24px' }}
     >
       <div className="mx-auto max-w-[2200px]">
@@ -913,6 +961,9 @@ export default function StoryboardPanel({
                     surface={surface}
                     active={page.page_id === activePageId}
                     saving={isSaving}
+                    searchStatus={page.search_status}
+                    draftStatus={page.draft_status}
+                    designStatus={page.design_status}
                     onJump={onJump}
                   />
                 </div>
@@ -963,6 +1014,9 @@ export default function StoryboardPanel({
                           draggable
                           saving={isSaving}
                           unsaved={!page.page_id}
+                          searchStatus={page.search_status}
+                          draftStatus={page.draft_status}
+                          designStatus={page.design_status}
                           dropPosition={
                             dropTarget?.type === 'page' &&
                             dropTarget.sectionIndex === sectionIndex &&
@@ -1025,6 +1079,9 @@ export default function StoryboardPanel({
                     surface={surface}
                     active={page.page_id === activePageId}
                     saving={isSaving}
+                    searchStatus={page.search_status}
+                    draftStatus={page.draft_status}
+                    designStatus={page.design_status}
                     onJump={onJump}
                   />
                 </div>

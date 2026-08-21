@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FC } from 'react';
 import { FileText, X } from 'lucide-react';
-import type { PageSummary } from '../../lib/ppt-api';
+import type { PageSummary, StyleCard } from '../../lib/ppt-api';
+import { groupQueriesByDimension } from '../../lib/workflow-ui';
 
 export type EditorSurface = 'outline' | 'search' | 'draft' | 'design';
 
@@ -284,15 +285,16 @@ export const SearchResultCard: FC<{
             {item.title}
           </a>
           <div className="text-xs text-emerald-600 break-all">{item.url}</div>
+          {item.image_url ? <div className="text-[11px] font-medium text-slate-400">含配图候选</div> : null}
         </div>
-        {item.query_purpose ? (
+        {item.dimension || item.query_purpose ? (
           <span className="shrink-0 rounded-full px-2.5 py-1 text-[11px] font-medium bg-slate-100 text-slate-600 border border-slate-200">
-            {item.query_purpose}
+            {item.dimension || item.query_purpose}
           </span>
         ) : null}
       </div>
       <div className="flex flex-wrap gap-2">
-        {renderStatusPill('搜索', `R${item.search_rank}`, 'slate')}
+        {renderStatusPill('轮次', `R${item.round ?? 1}`, 'slate')}
         {renderStatusPill(isLlmAnswer ? '模型已读' : '全文', isLlmAnswer ? 'ready' : (item.read_status ?? 'pending'), isLlmAnswer ? 'emerald' : readTone)}
         {renderStatusPill('入库', item.chunk_status ?? 'pending', chunkTone)}
       </div>
@@ -387,14 +389,7 @@ export const DataModal: FC<{
               当前页搜索词
             </div>
             {page.page_search_queries.length ? (
-              <div className="space-y-3">
-                {page.page_search_queries.map((item) => (
-                  <div key={`${item.query_text}-${item.query_purpose}`} className="rounded-xl border border-slate-100 bg-slate-50 px-3 py-3">
-                    <div className="text-sm font-medium text-slate-700">{item.query_text}</div>
-                    <div className="mt-1 text-xs text-slate-500">{item.query_purpose}</div>
-                  </div>
-                ))}
-              </div>
+              <QueryDimensionList queries={page.page_search_queries} />
             ) : (
               <div className="text-sm text-slate-400">当前页还没有搜索词。</div>
             )}
@@ -413,6 +408,15 @@ export const DataModal: FC<{
           </div>
           {surface === 'draft' ? (
             <div className="rounded-2xl border border-slate-200 bg-white p-5 space-y-4">
+              {page.draft?.content_plan_json && Object.keys(page.draft.content_plan_json).length ? (
+                <div>
+                  <div className="font-semibold text-slate-800">内容策划</div>
+                  <div className="mt-1 text-xs text-slate-500">这一页的可见文案以这份 JSON 为准，SVG 只负责排版。</div>
+                  <pre className="mt-3 max-h-56 overflow-auto rounded-2xl border border-slate-100 bg-slate-50 px-4 py-3 text-xs text-slate-700 whitespace-pre-wrap">
+                    {JSON.stringify(page.draft.content_plan_json, null, 2)}
+                  </pre>
+                </div>
+              ) : null}
               <div>
                 <div className="font-semibold text-slate-800">策划稿 SVG</div>
                 <div className="mt-1 text-xs text-slate-500">在这一步定稿内容，确认后再生成设计稿。</div>
@@ -425,6 +429,124 @@ export const DataModal: FC<{
               </div>
             </div>
           ) : null}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export function QueryDimensionList({
+  queries,
+}: {
+  queries: Array<{query_text: string; query_purpose?: string; dimension?: string; dimension_id?: string}>;
+}) {
+  const groups = groupQueriesByDimension(queries);
+  return (
+    <div className="space-y-3">
+      <div className="text-xs text-slate-500">调研关键词已生成 · {groups.length} 组维度</div>
+      {groups.map((group) => (
+        <div key={group.dimension_id} className="rounded-2xl border border-slate-100 bg-slate-50 px-3 py-3 space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-sm font-semibold text-slate-800">{group.name}</div>
+            <div className="text-[11px] text-slate-400">{group.items.length} 条</div>
+          </div>
+          {group.items.map((item) => (
+            <div key={`${group.dimension_id}-${item.query_text}`} className="text-sm text-slate-700">
+              {item.query_text}
+              {item.query_purpose && item.query_purpose !== group.name ? (
+                <span className="ml-2 text-xs text-slate-400">{item.query_purpose}</span>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ColorDots({ colors }: { colors: string[] }) {
+  return (
+    <div className="flex items-center gap-1">
+      {colors.slice(0, 6).map((color, index) => (
+        <span key={`${color}-${index}`} className="h-3.5 w-3.5 rounded-full border border-black/10" style={{ backgroundColor: color }} />
+      ))}
+    </div>
+  );
+}
+
+export const StyleCardPanel: FC<{
+  frozen: StyleCard | null;
+  candidates: StyleCard[];
+  library: StyleCard[];
+  busy: boolean;
+  onGenerate: () => void;
+  onConfirm: (styleId: string, source: string) => void;
+  onSave: () => void;
+}> = ({ frozen, candidates, library, busy, onGenerate, onConfirm, onSave }) => {
+  return (
+    <div className="rounded-[2rem] border border-slate-200 bg-white px-6 py-4 shadow-sm space-y-4">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <div className="text-lg font-semibold text-slate-800">风格卡</div>
+          <div className="text-sm text-slate-500 mt-1">确认后全稿冻结这套色板；设计稿只能引用，不能再改写。</div>
+        </div>
+        <div className="flex flex-wrap gap-2 justify-end">
+          <button disabled={busy} onClick={onGenerate} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40">
+            {busy ? '处理中...' : '按选题生成'}
+          </button>
+          <button disabled={busy || !frozen} onClick={onSave} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40">
+            保存到风格库
+          </button>
+        </div>
+      </div>
+      {frozen ? (
+        <div className="rounded-2xl border border-emerald-100 bg-emerald-50/60 px-4 py-3">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-xs uppercase tracking-wide text-emerald-700">已冻结</div>
+              <div className="mt-1 font-semibold text-slate-800">{frozen.name}</div>
+              <div className="mt-1 text-xs text-slate-500">{frozen.rationale}</div>
+            </div>
+            <ColorDots colors={frozen.colors.length ? frozen.colors : Object.values(frozen.palette)} />
+          </div>
+        </div>
+      ) : (
+        <div className="text-sm text-slate-400">还没有冻结风格卡。可以从候选或风格库里选一张确认。</div>
+      )}
+      {candidates.length ? (
+        <div className="space-y-2">
+          <div className="text-xs uppercase tracking-wide text-slate-400">候选</div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {candidates.map((card) => (
+              <button
+                key={`cand-${card.style_id}`}
+                disabled={busy}
+                onClick={() => onConfirm(card.style_id, 'candidates')}
+                className={`rounded-2xl border px-4 py-3 text-left transition-all ${frozen?.style_id === card.style_id ? 'border-emerald-300 bg-emerald-50' : 'border-slate-200 hover:border-slate-400'}`}
+              >
+                <div className="font-semibold text-slate-800">{card.name}</div>
+                <div className="mt-1 text-xs text-slate-500 line-clamp-2">{card.rationale}</div>
+                <div className="mt-3">
+                  <ColorDots colors={card.colors.length ? card.colors : Object.values(card.palette)} />
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+      <div className="space-y-2">
+        <div className="text-xs uppercase tracking-wide text-slate-400">风格库</div>
+        <div className="flex flex-wrap gap-2">
+          {library.map((card) => (
+            <button
+              key={`lib-${card.style_id}`}
+              disabled={busy}
+              onClick={() => onConfirm(card.style_id, 'library')}
+              className={`rounded-full border px-3 py-1.5 text-xs font-medium ${frozen?.style_id === card.style_id ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : 'border-slate-200 text-slate-600 hover:border-slate-400'}`}
+            >
+              {card.name}
+            </button>
+          ))}
         </div>
       </div>
     </div>

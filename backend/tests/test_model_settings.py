@@ -61,9 +61,11 @@ def test_seed_from_env_creates_shared_provider_and_bindings(db_session, monkeypa
     assert len(providers) == 1
     assert providers[0].api_key == "sk-seed-key-123"
     bindings = {item.role: item.provider_id for item in db_session.scalars(select(ModelBinding))}
-    assert bindings["context"] == providers[0].provider_id
-    assert bindings["svg"] == providers[0].provider_id
+    assert bindings["content"] == providers[0].provider_id
+    assert bindings["draft"] == providers[0].provider_id
+    assert bindings["design"] == providers[0].provider_id
     assert "embedding" not in bindings
+    assert "svg" not in bindings
 
     seed_models_from_env(db_session)
     db_session.commit()
@@ -95,9 +97,9 @@ def test_unconfigured_gateway_raises_setup_message(monkeypatch):
     invalidate_model_cache()
     monkeypatch.setattr("app.services.model_gateway.snapshot_bound_provider", lambda _role: None)
     gateway = ModelGateway(empty)
-    with pytest.raises(RuntimeError, match="未配置文本模型"):
+    with pytest.raises(RuntimeError, match="未配置内容策划模型"):
         gateway.context_text("sys", "user")
-    with pytest.raises(RuntimeError, match="未配置 SVG 模型"):
+    with pytest.raises(RuntimeError, match="未配置初稿布局模型"):
         gateway.svg_text("sys", "user")
 
 
@@ -124,10 +126,10 @@ def test_settings_api_masks_key_and_binds(client):
     bound = client.get("/api/v1/settings/model-bindings").json()
     assert bound["needs_setup"] is False
     roles = {item["role"] for item in bound["items"]}
-    assert roles == {"context", "svg", "search"}
-    context = next(item for item in bound["items"] if item["role"] == "context")
-    assert context["provider_id"] == created["provider_id"]
-    assert context["provider"]["api_key_masked"] == "sk-***aaa"
+    assert roles == {"search", "content", "draft", "design"}
+    content = next(item for item in bound["items"] if item["role"] == "content")
+    assert content["provider_id"] == created["provider_id"]
+    assert content["provider"]["api_key_masked"] == "sk-***aaa"
 
 
 def test_patch_keeps_key_when_omitted(client, db_session):
@@ -147,7 +149,7 @@ def test_gateway_cache_follows_binding_and_patch(db_session, monkeypatch):
     _clear_models(db_session)
     first = create_provider(db_session, _provider_payload(name="first", model="model-a"))
     second = create_provider(db_session, _provider_payload(name="second", model="model-b", api_key="sk-live-secret-bbb"))
-    upsert_bindings(db_session, {"context": first["provider_id"]})
+    upsert_bindings(db_session, {"content": first["provider_id"]})
     db_session.commit()
     invalidate_model_cache()
 
@@ -159,16 +161,16 @@ def test_gateway_cache_follows_binding_and_patch(db_session, monkeypatch):
 
     monkeypatch.setattr("app.services.model_gateway._OpenAICompatibleClient.chat_text", fake_chat)
     gateway = ModelGateway()
-    first_client = gateway._client("context")
-    same_client = gateway._client("context")
+    first_client = gateway._client("content")
+    same_client = gateway._client("content")
     assert first_client is same_client
     gateway.context_json("sys", {"q": 1})
     assert seen[-1] == "model-a"
 
-    upsert_bindings(db_session, {"context": second["provider_id"]})
+    upsert_bindings(db_session, {"content": second["provider_id"]})
     db_session.commit()
     invalidate_model_cache()
-    switched = gateway._client("context")
+    switched = gateway._client("content")
     assert switched is not first_client
     gateway.context_json("sys", {"q": 1})
     assert seen[-1] == "model-b"
@@ -176,10 +178,10 @@ def test_gateway_cache_follows_binding_and_patch(db_session, monkeypatch):
     update_provider(db_session, second["provider_id"], {"model": "model-b2"})
     db_session.commit()
     invalidate_model_cache()
-    patched_client = gateway._client("context")
+    patched_client = gateway._client("content")
     assert patched_client is not switched
     assert patched_client.config.model == "model-b2"
-    assert snapshot_bound_provider("context").model == "model-b2"
+    assert snapshot_bound_provider("content").model == "model-b2"
 
 
 def test_test_endpoint_uses_gateway_helper(client, monkeypatch):
@@ -276,3 +278,70 @@ def test_parse_and_extract_model_payloads():
         "https://www.mckinsey.com/featured-insights/ai",
     ]
     assert markdown_items[0]["title"] == "Gartner 2025"
+
+
+def test_legacy_context_svg_bindings_migrate_to_stages(client):
+    created = client.post("/api/v1/settings/models", json=_provider_payload(name="legacy")).json()
+    client.put(
+        "/api/v1/settings/model-bindings",
+        json={"context": created["provider_id"], "svg": created["provider_id"]},
+    )
+    bound = client.get("/api/v1/settings/model-bindings").json()
+    by_role = {item["role"]: item["provider_id"] for item in bound["items"]}
+    assert by_role["content"] == created["provider_id"]
+    assert by_role["draft"] == created["provider_id"]
+    assert by_role["design"] == created["provider_id"]
+    assert "context" not in by_role
+    assert "svg" not in by_role
+
+
+def test_expert_preset_uses_expert_binding_not_live(db_session, monkeypatch):
+    _clear_models(db_session)
+    live = create_provider(db_session, _provider_payload(name="live", model="live-model"))
+    expert = create_provider(db_session, _provider_payload(name="expert", model="expert-model", api_key="sk-live-secret-exp"))
+    upsert_bindings(
+        db_session,
+        {
+            "content": live["provider_id"],
+            "draft": live["provider_id"],
+            "design": live["provider_id"],
+            "expert_enabled": True,
+            "expert": {
+                "content": expert["provider_id"],
+                "draft": expert["provider_id"],
+                "design": expert["provider_id"],
+            },
+        },
+    )
+    db_session.commit()
+    invalidate_model_cache()
+    seen: list[str] = []
+
+    def fake_chat(self, *_args, **_kwargs):
+        seen.append(self.config.model)
+        return '{"ok": true}'
+
+    monkeypatch.setattr("app.services.model_gateway._OpenAICompatibleClient.chat_text", fake_chat)
+    gateway = ModelGateway()
+    gateway.context_json("sys", {"q": 1})
+    assert seen[-1] == "expert-model"
+    assert snapshot_bound_provider("content").model == "expert-model"
+
+
+def test_expert_missing_slot_does_not_use_env_fallback(db_session, monkeypatch):
+    _clear_models(db_session)
+    live = create_provider(db_session, _provider_payload(name="live", model="live-model"))
+    upsert_bindings(
+        db_session,
+        {
+            "content": live["provider_id"],
+            "draft": live["provider_id"],
+            "design": live["provider_id"],
+            "expert_enabled": True,
+        },
+    )
+    db_session.commit()
+    invalidate_model_cache()
+    gateway = ModelGateway()
+    with pytest.raises(RuntimeError, match="专家档未绑定内容策划"):
+        gateway.context_text("sys", "user")

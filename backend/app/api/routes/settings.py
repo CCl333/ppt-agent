@@ -102,7 +102,10 @@ def get_model_bindings(db: Session = Depends(get_db)) -> dict:
 
 @router.put("/model-bindings")
 def put_model_bindings(payload: ModelBindingsPutRequest, db: Session = Depends(get_db)) -> dict:
-    result = upsert_bindings(db, payload.model_dump(exclude_unset=True))
+    data = payload.model_dump(exclude_unset=True)
+    if payload.expert is not None:
+        data["expert"] = payload.expert.model_dump(exclude_unset=True)
+    result = upsert_bindings(db, data)
     db.commit()
     invalidate_model_cache()
     return result

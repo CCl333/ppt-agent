@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import time
 import zipfile
 from dataclasses import dataclass, field
@@ -23,12 +24,26 @@ from app.models.entities import (
     OutlineVersion,
     PageBriefVersion,
     Project,
+    ProjectEvent,
     ProjectMessage,
     ProjectPage,
     RequirementForm,
     ResearchSession,
 )
-from app.services.events import append_event
+from app.services.clarification import CLARIFICATION_CODES, project_title_from_answers
+from app.services.content_plan import assert_svg_matches_plan, has_content_plan
+from app.services.events import append_event, serialize_event
+from app.services.export_name import cover_title_from_outline, resolve_export_stem
+from app.services.font_policy import build_font_report
+from app.services.page_images import public_catalog
+from app.services.search_plan import search_coverage
+from app.services.style_cards import (
+    get_library_card,
+    list_library_cards,
+    pack_from_card,
+    save_card_to_library,
+    serialize_card,
+)
 from app.services.tasks import (
     cancel_tasks as request_task_cancel,
     enqueue_batch_action,
@@ -43,7 +58,6 @@ from app.services.flows.batch_flow import BatchFlowMixin
 from app.services.flows.init_flow import InitFlowMixin
 from app.services.flows.outline_flow import OutlineFlowMixin
 from app.services.flows.page_flow import PageFlowMixin
-from app.services.export import build_pptx
 from app.services.flows.router_flow import RouterFlowMixin
 
 PAGE_STATUS_VALUES = {"empty", "ready", "running", "confirmed", "stale", "failed"}
@@ -410,6 +424,17 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         )
         return [self.serialize_message(item) for item in self.session.scalars(stmt)]
 
+    def list_events(self, project_id: str, *, after_id: int = 0, limit: int = 500) -> dict[str, Any]:
+        project = self._require_project(project_id)
+        stmt = (
+            select(ProjectEvent)
+            .where(ProjectEvent.project_id == project.id, ProjectEvent.stream_id > after_id)
+            .order_by(ProjectEvent.stream_id.asc())
+            .limit(min(max(limit, 1), 500))
+        )
+        events = list(self.session.scalars(stmt))
+        return {"items": [serialize_event(item) for item in events]}
+
     def create_message(
         self,
         *,
@@ -459,6 +484,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         project.page_count_target = self._coerce_page_count(merged.get("page_count_target"), project.page_count_target)
         if merged.get("style_preset"):
             project.style_preset = str(merged["style_preset"])
+        self._apply_working_title(project, merged)
         append_event(
             self.session,
             project_id=project.id,
@@ -492,9 +518,12 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
                 {
                     "query_text": query_text,
                     "query_purpose": str(source.get("query_purpose") or ""),
+                    "dimension": str(source.get("dimension") or source.get("query_purpose") or ""),
+                    "dimension_id": str(source.get("dimension_id") or ""),
                 }
             ],
             limit_per_query=3,
+            search_round=int(source.get("round") or 1),
         )
         refreshed_cards = self.research.build_search_result_cards(refreshed_items)
         kept = [
@@ -598,6 +627,8 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         return self.serialize_requirement_form(requirement_form)
 
     def delete_requirement_question(self, project_id: str, question_code: str) -> dict[str, Any]:
+        if question_code in CLARIFICATION_CODES:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="不能删除需求澄清问题")
         requirement_form = self._require_requirement_form(self._require_project(project_id))
         requirement_form.ai_questions_json = [
             item for item in requirement_form.ai_questions_json if item.get("question_code") != question_code
@@ -617,6 +648,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             )
         requirement_form = self._require_requirement_form(project)
         self._validate_requirement_form(project, requirement_form)
+        self._apply_working_title(project, requirement_form.answers_json or {})
         if note_md:
             requirement_form.latest_instruction = note_md
         cas = self.session.execute(
@@ -637,6 +669,27 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             stage="outline",
             scope_type="project",
             payload={"project_id": project.id},
+        )
+        enqueue_project_task(self.session, project_id=project.id, task_type="outline")
+        self.session.commit()
+        wake_scheduler()
+        return self.serialize_project(project)
+
+    def retry_outline(self, project_id: str) -> dict[str, Any]:
+        project = self._require_project(project_id)
+        if project.current_stage != "outline":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="当前不在大纲阶段，不能重试生成大纲")
+        if self._get_current_outline(project.id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="大纲已生成，不能从失败态重试")
+        requirement_form = self._require_requirement_form(project)
+        self._validate_requirement_form(project, requirement_form)
+        append_event(
+            self.session,
+            project_id=project.id,
+            event_type="outline.queued",
+            stage="outline",
+            scope_type="project",
+            payload={"project_id": project.id, "retry": True},
         )
         enqueue_project_task(self.session, project_id=project.id, task_type="outline")
         self.session.commit()
@@ -679,6 +732,133 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             raise HTTPException(status_code=status_code, detail=detail) from exc
         self.session.commit()
         return self.serialize_project(project)
+
+    def get_style_cards(self, project_id: str) -> dict[str, Any]:
+        project = self._require_project(project_id)
+        return self._serialize_style_cards(project)
+
+    def generate_style_cards(self, project_id: str) -> dict[str, Any]:
+        project = self._require_project(project_id)
+        if PROJECT_STAGE_ORDER.get(project.current_stage, 0) < PROJECT_STAGE_ORDER["search"]:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="请先确认大纲后再生成风格卡")
+        outline = self._get_current_outline(project.id)
+        cover_title = cover_title_from_outline(outline.outline_json if outline else None) or ""
+        page_titles: list[str] = []
+        pages = list(
+            self.session.scalars(
+                select(ProjectPage).where(ProjectPage.project_id == project.id).order_by(ProjectPage.sort_order.asc())
+            )
+        )
+        for page in pages:
+            brief = self._get_current_brief(page)
+            if brief and brief.title.strip():
+                page_titles.append(brief.title.strip())
+        cards = self.generator.generate_style_cards(
+            title=project.title,
+            request_text=project.request_text,
+            style_hint=str(project.style_preset or ""),
+            outline_cover_title=cover_title,
+            page_titles=page_titles[:20],
+        )
+        project.style_candidates_json = cards
+        self.session.commit()
+        return self._serialize_style_cards(project)
+
+    def confirm_style_card(self, project_id: str, style_id: str, *, source: str = "candidates") -> dict[str, Any]:
+        project = self._require_project(project_id)
+        card = self._find_style_card(project, style_id, source=source)
+        if not card:
+            raise HTTPException(status_code=404, detail="风格卡不存在")
+        project.style_card_json = card
+        project.style_preset = card["style_id"]
+        self._mark_project_designs_stale(project)
+        self.session.commit()
+        return self._serialize_style_cards(project)
+
+    def save_style_card_to_library(self, project_id: str, style_id: str | None = None) -> dict[str, Any]:
+        project = self._require_project(project_id)
+        card = None
+        if style_id:
+            card = self._find_style_card(project, style_id, source="any")
+        elif isinstance(project.style_card_json, dict) and project.style_card_json.get("style_id"):
+            card = dict(project.style_card_json)
+        if not card:
+            raise HTTPException(status_code=404, detail="没有可入库的风格卡")
+        saved = save_card_to_library(self.session, card)
+        self.session.commit()
+        payload = self._serialize_style_cards(project)
+        payload["saved"] = saved
+        return payload
+
+    def _serialize_style_cards(self, project: Project) -> dict[str, Any]:
+        frozen = serialize_card(project.style_card_json if isinstance(project.style_card_json, dict) else None)
+        candidates = [
+            serialize_card(item)
+            for item in (project.style_candidates_json or [])
+            if isinstance(item, dict)
+        ]
+        return {
+            "project_id": project.id,
+            "frozen": frozen,
+            "candidates": [item for item in candidates if item],
+            "library": list_library_cards(self.session),
+        }
+
+    def _find_style_card(self, project: Project, style_id: str, *, source: str) -> dict[str, Any] | None:
+        wanted = str(style_id or "").strip()
+        if not wanted:
+            return None
+        if source in {"candidates", "any"}:
+            for item in project.style_candidates_json or []:
+                if isinstance(item, dict) and item.get("style_id") == wanted:
+                    return dict(item)
+        if source in {"frozen", "any"}:
+            frozen = project.style_card_json if isinstance(project.style_card_json, dict) else {}
+            if frozen.get("style_id") == wanted:
+                return dict(frozen)
+        if source in {"library", "any"}:
+            library = get_library_card(self.session, wanted)
+            if library:
+                return dict(library)
+        return None
+
+    def _frozen_style_card(self, project: Project) -> dict[str, Any] | None:
+        card = project.style_card_json if isinstance(project.style_card_json, dict) else None
+        if card and card.get("style_id"):
+            return card
+        return None
+
+    def _resolve_style_pack(self, project: Project, style_id: str | None) -> dict[str, Any]:
+        frozen = self._frozen_style_card(project)
+        if frozen:
+            return pack_from_card(frozen)
+        if style_id:
+            library = get_library_card(self.session, style_id)
+            if library:
+                return pack_from_card(library)
+        return self.generator.get_style_pack(style_id)
+
+    def _style_library_options(self) -> list[dict[str, Any]]:
+        options: list[dict[str, Any]] = []
+        for card in list_library_cards(self.session):
+            if not card:
+                continue
+            options.append(
+                {
+                    "style_id": card["style_id"],
+                    "style_name": card["name"],
+                    "description": card.get("rationale") or "",
+                    "palette": card.get("palette") or {},
+                }
+            )
+        return options or self.generator.list_style_options()
+
+    def _mark_project_designs_stale(self, project: Project) -> None:
+        pages = list(self.session.scalars(select(ProjectPage).where(ProjectPage.project_id == project.id)))
+        for page in pages:
+            if page.current_design_version_id:
+                page.design_status = "stale"
+                self._update_artifact_staleness(page)
 
     def upload_background(self, project_id: str, file: UploadFile) -> dict[str, Any]:
         project = self._require_project(project_id)
@@ -895,6 +1075,12 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         except RuntimeError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         current = self._get_current_draft(page)
+        plan = dict(current.content_plan_json) if current and isinstance(current.content_plan_json, dict) else {}
+        if has_content_plan(plan):
+            try:
+                assert_svg_matches_plan(markup, plan)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         version_no = (
             (self.session.scalar(select(func.count(DraftVersion.id)).where(DraftVersion.page_id == page.id)) or 0) + 1
         )
@@ -906,6 +1092,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             page_brief_version_id=current.page_brief_version_id if current else page.current_brief_version_id,
             research_session_id=current.research_session_id if current else page.current_research_session_id,
             draft_svg_markup=markup,
+            content_plan_json=plan,
         )
         self.session.add(draft)
         self.session.flush()
@@ -986,12 +1173,21 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
     def create_export(self, project_id: str, export_format: str) -> dict[str, Any]:
         project = self._require_project(project_id)
         if export_format == "zip":
-            export_path = self._build_export_archive(project.id)
+            export_path = self._build_export_archive(project)
         elif export_format == "pptx":
-            export_path = self._build_export_pptx(project)
+            export_path = self._build_export_pptx(project, mode="shapes")
+        elif export_format == "pptx-image":
+            export_path = self._build_export_pptx(project, mode="image")
         else:
-            raise HTTPException(status_code=400, detail="当前仅支持 zip 或 pptx 导出")
-        export_job = ExportJob(project_id=project_id, export_format=export_format, status="completed", file_path=str(export_path))
+            raise HTTPException(status_code=400, detail="当前仅支持 zip、pptx 或 pptx-image 导出")
+        stored_format = "pptx" if export_format.startswith("pptx") else export_format
+        export_job = ExportJob(
+            project_id=project_id,
+            export_format=stored_format,
+            status="completed",
+            file_path=str(export_path),
+            font_report_json=build_font_report(self._design_svgs_for_export(project)),
+        )
         self.session.add(export_job)
         self.session.flush()
         self.session.commit()
@@ -1013,9 +1209,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         export = self.session.get(ExportJob, export_id)
         if not export or export.project_id != project_id:
             raise HTTPException(status_code=404, detail="导出任务不存在")
-        project = self._require_project(project_id)
-        suffix = ".pptx" if export.export_format == "pptx" else ".zip"
-        return f"{self._slugify_filename(project.title) or 'ppt-agent-export'}{suffix}"
+        return Path(export.file_path).name
 
     def _serialize_page_preview(self, page: ProjectPage) -> dict[str, Any]:
         design = self._get_current_design(page)
@@ -1067,6 +1261,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             "current_stage": project.current_stage,
             "page_count_target": project.page_count_target,
             "style_preset": project.style_preset,
+            "style_card": serialize_card(project.style_card_json if isinstance(project.style_card_json, dict) else None),
             "background_asset_path": project.background_asset_path,
             "workflow_constraints": project.workflow_constraints_json.get("items", []),
             "page_count": page_count,
@@ -1139,6 +1334,8 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             "design_status": page.design_status,
             "page_search_queries": page.page_search_queries_json,
             "page_search_results": page_search_results,
+            "page_images": public_catalog(page.page_images_json),
+            "search_coverage": search_coverage(page.page_search_queries_json or [], page_search_results),
             "page_corpus_digest": page.page_corpus_digest_json,
             "page_summary_md": page.page_summary_md,
             "page_summary_citations": page.page_summary_citations_json,
@@ -1167,11 +1364,13 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             "page_brief_version_id": draft.page_brief_version_id,
             "research_session_id": draft.research_session_id,
             "draft_svg_markup": draft.draft_svg_markup,
+            "content_plan_json": draft.content_plan_json or {},
             "created_at": draft.created_at.isoformat(),
             "updated_at": draft.updated_at.isoformat(),
         }
 
     def serialize_design(self, design: DesignVersion) -> dict[str, Any]:
+        project = self._require_project(design.project_id)
         return {
             "design_version_id": design.id,
             "project_id": design.project_id,
@@ -1182,7 +1381,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             "style_pack_id": design.style_pack_id,
             "background_asset_path": design.background_asset_path,
             "design_svg_markup": design.design_svg_markup,
-            "style_pack": self.generator.get_style_pack(design.style_pack_id),
+            "style_pack": self._resolve_style_pack(project, design.style_pack_id),
             "created_at": design.created_at.isoformat(),
             "updated_at": design.updated_at.isoformat(),
         }
@@ -1194,6 +1393,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             "export_format": export_job.export_format,
             "status": export_job.status,
             "file_path": export_job.file_path,
+            "font_report": export_job.font_report_json or {},
             "created_at": export_job.created_at.isoformat(),
             "updated_at": export_job.updated_at.isoformat(),
         }
@@ -1213,6 +1413,9 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             if not directory.exists():
                 continue
             candidates.extend(directory.glob(f"{asset_id}.*"))
+        export_dir = self.settings.export_path / project.id
+        if export_dir.is_dir():
+            shutil.rmtree(export_dir, ignore_errors=True)
         seen: set[Path] = set()
         for path in candidates:
             resolved = path.resolve()
@@ -1264,7 +1467,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             },
             "style_preset": {
                 "question_code": "style_preset",
-                "options": self.generator.list_style_options(),
+                "options": self._style_library_options(),
                 "allow_custom": True,
             },
             "background_asset": {
@@ -1449,9 +1652,10 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             "outline_full_snapshot": self._build_outline_snapshot(page.project_id),
         }
 
-    def _build_export_archive(self, project_id: str) -> Path:
-        pages = list(self.session.scalars(select(ProjectPage).where(ProjectPage.project_id == project_id).order_by(ProjectPage.sort_order.asc())))
-        export_path = self.settings.export_path / f"{project_id}.zip"
+    def _build_export_archive(self, project: Project) -> Path:
+        pages = list(self.session.scalars(select(ProjectPage).where(ProjectPage.project_id == project.id).order_by(ProjectPage.sort_order.asc())))
+        stem = self._resolve_export_stem(project)
+        export_path = self.settings.export_path / project.id / f"{stem}.zip"
         export_path.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(export_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             manifest: list[dict[str, Any]] = []
@@ -1465,11 +1669,45 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         return export_path
 
-    def _build_export_pptx(self, project: Project) -> Path:
+    def _design_svgs_for_export(self, project: Project) -> list[str]:
+        pages = list(
+            self.session.scalars(
+                select(ProjectPage).where(ProjectPage.project_id == project.id).order_by(ProjectPage.sort_order.asc())
+            )
+        )
+        markups: list[str] = []
+        for page in pages:
+            design = self._get_current_design(page)
+            if design and design.design_svg_markup:
+                markups.append(design.design_svg_markup)
+        return markups
+
+    def _build_export_pptx(self, project: Project, *, mode: str = "shapes") -> Path:
         exportables = self._collect_exportable_designs(project.id)
         slides = [(page.page_code, design.design_svg_markup) for page, design in exportables]
-        export_path = self.settings.export_path / f"{project.id}.pptx"
-        return build_pptx(slides, export_path)
+        stem = self._resolve_export_stem(project)
+        export_path = self.settings.export_path / project.id / f"{stem}.pptx"
+        from app.services.export import build_pptx
+
+        return build_pptx(slides, export_path, mode=mode)
+
+    def _resolve_export_stem(self, project: Project) -> str:
+        outline = self._get_current_outline(project.id)
+        first_page = self.session.scalars(
+            select(ProjectPage)
+            .where(ProjectPage.project_id == project.id)
+            .order_by(ProjectPage.sort_order.asc())
+            .limit(1)
+        ).first()
+        first_title = None
+        if first_page:
+            brief = self._get_current_brief(first_page)
+            first_title = brief.title if brief else None
+        return resolve_export_stem(
+            outline_json=outline.outline_json if outline else None,
+            first_page_title=first_title,
+            project_title=project.title,
+        )
 
     def _collect_exportable_designs(self, project_id: str) -> list[tuple[ProjectPage, DesignVersion]]:
         pages = list(
@@ -1501,10 +1739,10 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         brief = self._get_current_brief(page)
         return brief.title if brief and brief.title.strip() else page.page_code
 
-    def _slugify_filename(self, raw_value: str) -> str:
-        cleaned = re.sub(r"[^\w\u4e00-\u9fff-]+", "-", raw_value.strip(), flags=re.UNICODE)
-        cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-")
-        return cleaned or "ppt-agent-export"
+    def _apply_working_title(self, project: Project, answers: dict[str, Any]) -> None:
+        title = project_title_from_answers(answers)
+        if title:
+            project.title = title
 
     def _build_fixed_field_values(self, project: Project, requirement_form: RequirementForm) -> dict[str, Any]:
         answers = requirement_form.answers_json or {}
@@ -1703,6 +1941,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             project.page_count_target = self._coerce_page_count(value, project.page_count_target)
         if question_code == "style_preset" and value:
             project.style_preset = str(value)
+        self._apply_working_title(project, answers)
         return {"question_code": question_code, "value": value}
 
     def _apply_init_question_patch(self, requirement_form: RequirementForm, question_patch: dict[str, Any]) -> dict[str, Any]:
@@ -1712,6 +1951,8 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             question_code = str(question_patch.get("question_code") or "").strip()
             if not question_code:
                 raise RuntimeError("question_patch 缺少 question_code")
+            if question_code in CLARIFICATION_CODES:
+                raise RuntimeError("不能删除需求澄清问题")
             requirement_form.ai_questions_json = [item for item in questions if item.get("question_code") != question_code]
             answers = dict(requirement_form.answers_json or {})
             answers.pop(question_code, None)

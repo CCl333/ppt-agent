@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import pytest
+
 from app.services.mcp_gateway import McpGateway
 from app.services.model_gateway import LiveSearchDigest
 from app.services.search_settings import SearchRuntime, normalize_bocha_auth_header
+from tests.helpers import SAMPLE_DIGEST_MD
 
 
 def _provider_payload(**overrides) -> dict:
@@ -110,7 +113,8 @@ def test_bindings_put_keeps_omitted_roles(client):
         item["role"]: item["provider_id"]
         for item in client.get("/api/v1/settings/model-bindings").json()["items"]
     }
-    assert items["svg"] == created["provider_id"]
+    assert items["draft"] == created["provider_id"]
+    assert items["design"] == created["provider_id"]
     assert items["search"] == created["provider_id"]
 
 
@@ -210,19 +214,19 @@ def test_search_web_llm_uses_bound_model(monkeypatch):
     monkeypatch.setattr(
         "app.services.model_gateway.ModelGateway.search_live",
         lambda self, query, limit=5: LiveSearchDigest(
-            answer="整理稿",
+            answer=SAMPLE_DIGEST_MD,
             items=[{"title": "T", "url": "https://example.com/a", "snippet": "s"}],
         ),
     )
     results = McpGateway().search_web("q", limit=5)
-    assert results[0].title == "整理稿"
-    assert results[0].snippet == "整理稿"
-    assert results[0].url.startswith("llm-search://digest/")
-    assert results[1].provider == "llm-search"
-    assert results[1].url == "https://example.com/a"
+    assert len(results) == 1
+    assert results[0].title == "T"
+    assert results[0].provider == "llm-search"
+    assert results[0].url == "https://example.com/a"
+    assert not any(item.url.startswith("llm-search://") for item in results)
 
 
-def test_search_web_llm_keeps_digest_when_items_empty(monkeypatch):
+def test_search_web_llm_fails_when_items_empty(monkeypatch):
     monkeypatch.setattr(
         "app.services.search_settings.snapshot_search_runtime",
         lambda: SearchRuntime(mode="llm", bocha_auth_header=""),
@@ -230,14 +234,15 @@ def test_search_web_llm_keeps_digest_when_items_empty(monkeypatch):
     monkeypatch.setattr(
         "app.services.model_gateway.ModelGateway.search_live",
         lambda self, query, limit=5: LiveSearchDigest(
-            answer="只有整理稿，没有信源列表。",
+            answer=SAMPLE_DIGEST_MD,
             items=[],
         ),
     )
-    results = McpGateway().search_web("q", limit=5)
-    assert len(results) == 1
-    assert results[0].title == "整理稿"
-    assert "只有整理稿" in results[0].snippet
+    try:
+        McpGateway().search_web("q", limit=5)
+        raise AssertionError("should have failed")
+    except RuntimeError as exc:
+        assert "未获得任何可达来源" in str(exc)
 
 
 def test_is_cache_fresh_accepts_naive_datetime():
@@ -319,13 +324,70 @@ def test_live_search_retries_disconnect(monkeypatch):
             base_url="https://rightapi.ai/grok/v1",
             api_key="sk-test",
             model="grok-4.6",
-            path="/responses",
+            path="/chat/completions",
             timeout_seconds=30,
         )
     )
     payload = client.live_search("q", system_prompt="sys", limit=3)
     assert calls["n"] == 2
     assert "https://example.com/a" in str(payload)
+
+
+def test_connection_retry_uses_long_backoff(monkeypatch):
+    import httpx
+
+    from app.services.model_gateway import _CONNECTION_RETRY_BACKOFF, _call_with_retry
+
+    delays: list[float] = []
+    monkeypatch.setattr("app.services.model_gateway.time.sleep", delays.append)
+    monkeypatch.setattr("app.services.model_gateway.random.uniform", lambda _a, _b: 0)
+    calls = {"n": 0}
+
+    def operation():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return "ok"
+
+    assert _call_with_retry(operation) == "ok"
+    assert calls["n"] == 3
+    assert delays == list(_CONNECTION_RETRY_BACKOFF)
+
+
+def test_connect_timeout_retry_uses_long_backoff(monkeypatch):
+    import httpx
+
+    from app.services.model_gateway import _CONNECTION_RETRY_BACKOFF, _call_with_retry
+
+    delays: list[float] = []
+    monkeypatch.setattr("app.services.model_gateway.time.sleep", delays.append)
+    monkeypatch.setattr("app.services.model_gateway.random.uniform", lambda _a, _b: 0)
+
+    def operation():
+        raise httpx.ConnectTimeout("The handshake operation timed out")
+
+    with pytest.raises(httpx.ConnectTimeout):
+        _call_with_retry(operation, max_retries=2)
+    assert delays == list(_CONNECTION_RETRY_BACKOFF)
+
+
+def test_http_retry_keeps_short_backoff(monkeypatch):
+    import httpx
+
+    from app.services.model_gateway import _call_with_retry
+
+    delays: list[float] = []
+    monkeypatch.setattr("app.services.model_gateway.time.sleep", delays.append)
+    monkeypatch.setattr("app.services.model_gateway.random.uniform", lambda _a, _b: 0)
+    request = httpx.Request("POST", "https://example.com/v1/responses")
+
+    def operation():
+        response = httpx.Response(500, request=request)
+        raise httpx.HTTPStatusError("server error", request=request, response=response)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        _call_with_retry(operation, max_retries=2)
+    assert delays == [1.0, 2.0]
 
 
 def test_grok_live_search_uses_streaming_chat_completions(monkeypatch):
@@ -361,7 +423,7 @@ def test_grok_live_search_uses_streaming_chat_completions(monkeypatch):
             base_url="https://rightapi.ai/grok/v1",
             api_key="sk-test",
             model="grok-4.6",
-            path="/responses",
+            path="/chat/completions",
             timeout_seconds=30,
         )
     )
@@ -376,6 +438,49 @@ def test_grok_live_search_uses_streaming_chat_completions(monkeypatch):
     assert items.items[0]["url"] == "https://example.com/a"
     assert items.items[0]["title"] == "A"
     assert "[A](https://example.com/a)" in items.answer
+
+
+def test_grok_live_search_respects_responses_api_path(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["json"] = kwargs.get("json")
+
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "output_text": "- [A](https://example.com/a) snippet",
+                    "output": [{"type": "web_search_call"}],
+                }
+
+        return FakeResponse()
+
+    monkeypatch.setattr("app.services.model_gateway.httpx.post", fake_post)
+    monkeypatch.setattr(
+        "app.services.model_gateway.httpx.stream",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should use responses")),
+    )
+    from app.services.model_gateway import _ModelConfig, _OpenAICompatibleClient
+
+    client = _OpenAICompatibleClient(
+        _ModelConfig(
+            base_url="https://rightapi.ai/grok/v1",
+            api_key="sk-test",
+            model="grok-4.6",
+            path="/responses",
+            timeout_seconds=30,
+        )
+    )
+    payload = client.live_search("q", system_prompt="sys", limit=3)
+    assert captured["url"] == "https://rightapi.ai/grok/v1/responses"
+    assert captured["json"]["tools"][0]["type"] == "web_search"
+    assert payload["output"][0]["type"] == "web_search_call"
 
 
 def test_search_live_empty_payload_returns_empty_list(monkeypatch):
@@ -393,7 +498,7 @@ def test_search_live_empty_payload_returns_empty_list(monkeypatch):
                 base_url="https://rightapi.ai/grok/v1",
                 api_key="sk-test",
                 model="grok-4.6",
-                path="/responses",
+                path="/chat/completions",
                 timeout_seconds=30,
             )
         ),

@@ -65,6 +65,14 @@ def client(fresh_db):
         yield test_client
 
 
+@pytest.fixture(autouse=True)
+def _stub_url_probe(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.search_quality.probe_http_url",
+        lambda url, **kwargs: str(url).startswith("http"),
+    )
+
+
 @pytest.fixture
 def service(db_session):
     return PptAgentService(db_session)

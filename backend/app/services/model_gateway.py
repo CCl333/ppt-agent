@@ -18,6 +18,8 @@ from app.services.model_settings import (
     API_PATH_ANTHROPIC,
     ProviderSnapshot,
     canonicalize_api_path,
+    canonicalize_role,
+    expert_mode_enabled,
     snapshot_bound_provider,
 )
 from app.services.svg import extract_and_validate_svg
@@ -28,20 +30,41 @@ _CHAT_PATHS = {"/chat/completions", "chat/completions", "/v1/chat/completions", 
 _RESPONSES_PATHS = {"/responses", "responses", "/v1/responses", "v1/responses"}
 _ANTHROPIC_PATHS = {"/messages", "messages", "/v1/messages", "v1/messages"}
 _NON_RETRYABLE_STATUS = {400, 401, 403, 404, 409, 422}
-_ROLE_MISSING_MESSAGES = {
-    "context": "未配置文本模型，请在设置页导入并绑定",
-    "svg": "未配置 SVG 模型，请在设置页导入并绑定",
-    "search": "未配置搜索模型，请在设置页导入并绑定，或改用博查 Key 搜索",
-}
-_SEARCH_SYSTEM = (
-    "你必须使用实时网页搜索，只根据检索到的公开网页作答。"
-    "按给定标题整理这一页需要的资料，输出 JSON 对象："
-    "{\"digest_md\":\"整理稿正文（Markdown）\",\"items\":[{\"title\":\"...\",\"url\":\"https://...\",\"snippet\":\"...\"}]}。"
-    "url 必须是检索返回的真实链接。禁止编造来源。若没有检索结果，返回 {\"digest_md\":\"\",\"items\":[]}。"
+# 中转突发断连时，1s/2s 短窗口会 3 连败；实测约 45 秒后单次即可成功（见 docs 整理稿根因 11.5）。
+_CONNECTION_RETRY_BACKOFF = (20.0, 40.0)
+_CONNECTION_ERRORS = (
+    httpx.RemoteProtocolError,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.WriteError,
+    httpx.PoolTimeout,
 )
-_GROK_SEARCH_SYSTEM = (
+_ROLE_MISSING_MESSAGES = {
+    "search": "未配置资料检索模型，请在设置页导入并绑定，或改用博查 / Tavily 搜索",
+    "content": "未配置内容策划模型，请在设置页导入并绑定",
+    "draft": "未配置初稿布局模型，请在设置页导入并绑定",
+    "design": "未配置最终设计模型，请在设置页导入并绑定",
+    "context": "未配置内容策划模型，请在设置页导入并绑定",
+    "svg": "未配置初稿布局模型，请在设置页导入并绑定",
+}
+
+
+def _expert_missing_message(role: str) -> str:
+    label = {
+        "search": "资料检索",
+        "content": "内容策划",
+        "draft": "初稿布局",
+        "design": "最终设计",
+    }.get(role, role)
+    return f"专家档未绑定{label}模型，请在设置页补全或关闭专家档"
+# 联网检索统一使用 Markdown 契约：任何 transport 都不得再强制 json_object。
+# 实测（grok-4.20-multi-agent）同一请求仅切换 text.format=json_object，正文从 2658 字符退化到 3 字符。
+_LIVE_SEARCH_SYSTEM = (
     "你必须使用实时网页搜索，只根据检索到的公开网页作答。"
     "按给定标题整理这一页需要的资料：先输出整理稿正文（Markdown），再在回答末尾用 Markdown 链接列出信源，每条一行：- [标题](https://...) 一句话摘要。"
+    "整理稿正文必须是完整可引用的事实内容，不得只给引用标记或只给结构骨架。"
     "url 必须是检索返回的真实链接。禁止编造来源。若没有检索结果，写「没有检索结果」。"
 )
 _MD_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
@@ -171,6 +194,21 @@ def _config_from_snapshot(snapshot: ProviderSnapshot) -> "_ModelConfig":
     )
 
 
+def _retry_sleep(attempt: int, exc: Exception) -> None:
+    if isinstance(exc, _CONNECTION_ERRORS):
+        base = _CONNECTION_RETRY_BACKOFF[min(attempt, len(_CONNECTION_RETRY_BACKOFF) - 1)]
+        delay = base + random.uniform(0, 1.0)
+        logger.warning(
+            "模型连接中断，%.0fs 后重试 retry=%s error=%s",
+            delay,
+            attempt + 1,
+            type(exc).__name__,
+        )
+    else:
+        delay = (2 ** attempt) + random.uniform(0, 0.4)
+    time.sleep(delay)
+
+
 def _call_with_retry(operation: Callable[[], Any], *, max_retries: int = 2) -> Any:
     last_error: Exception | None = None
     for attempt in range(max_retries + 1):
@@ -188,7 +226,8 @@ def _call_with_retry(operation: Callable[[], Any], *, max_retries: int = 2) -> A
             status_code = getattr(exc, "status_code", None)
             if status_code in _NON_RETRYABLE_STATUS or attempt >= max_retries:
                 raise
-        time.sleep((2 ** attempt) + random.uniform(0, 0.4))
+        assert last_error is not None
+        _retry_sleep(attempt, last_error)
     assert last_error is not None
     raise last_error
 
@@ -289,6 +328,16 @@ class _OpenAICompatibleClient:
                     "messages": [{"role": "user", "content": query}],
                 }
             )
+        if path in _RESPONSES_PATHS:
+            return self._post_json(
+                {
+                    "model": self.config.model,
+                    "temperature": 0,
+                    "instructions": system_prompt,
+                    "input": query,
+                    "tools": [{"type": "web_search", "search_context_size": "medium"}],
+                }
+            )
         if _looks_like_grok(self.config):
             return self._stream_chat_search(query, system_prompt=system_prompt)
         grok_body = {
@@ -298,24 +347,12 @@ class _OpenAICompatibleClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": query},
             ],
-            "response_format": {"type": "json_object"},
             "search_parameters": {
                 "mode": "on",
                 "return_citations": True,
                 "max_search_results": max(limit, 8),
             },
         }
-        if path in _RESPONSES_PATHS:
-            return self._post_json(
-                {
-                    "model": self.config.model,
-                    "temperature": 0,
-                    "instructions": system_prompt,
-                    "input": query,
-                    "tools": [{"type": "web_search", "search_context_size": "medium"}],
-                    "text": {"format": {"type": "json_object"}},
-                }
-            )
         return self._post_json(grok_body)
 
     def _stream_chat_search(self, query: str, *, system_prompt: str) -> dict[str, Any]:
@@ -505,14 +542,85 @@ def _loads_json_object(text: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def parse_search_live_answer(payload: dict[str, Any]) -> str:
+_WRAP_TAG_PATTERN = re.compile(
+    r"\[(?P<tag>[A-Za-z_]+)\]\s*(?P<body>\{[\s\S]*\})\s*\[/(?P=tag)\]",
+    re.IGNORECASE,
+)
+_FENCE_PATTERN = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
+
+
+def extract_wrapped_json(text: str) -> str | None:
+    matched = _WRAP_TAG_PATTERN.search(text or "")
+    if matched is None:
+        return None
+    return matched.group("body")
+
+
+def extract_fenced_json(text: str) -> str | None:
+    matched = _FENCE_PATTERN.search(text or "")
+    if matched is None:
+        return None
+    body = matched.group(1).strip()
+    return body or None
+
+
+def parse_context_json(text: str) -> dict[str, Any]:
+    if not isinstance(text, str) or not text.strip():
+        raise RuntimeError("上下文模型返回的不是有效 JSON")
+    candidates: list[str] = []
+    wrapped = extract_wrapped_json(text)
+    if wrapped:
+        candidates.append(wrapped)
+    fenced = extract_fenced_json(text)
+    if fenced and fenced not in candidates:
+        candidates.append(fenced)
+    stripped = text.strip()
+    if stripped not in candidates:
+        candidates.append(stripped)
+    for candidate in candidates:
+        parsed = _loads_json_object(candidate)
+        if parsed is not None:
+            return parsed
+    raise RuntimeError("上下文模型返回的不是有效 JSON")
+
+
+def parse_search_live_answer(payload: dict[str, Any], *, model: str = "") -> str:
     text = _payload_message_text(payload).strip()
     if not text:
         return ""
-    parsed = _loads_json_object(text)
-    if isinstance(parsed, dict) and "digest_md" in parsed:
+    # 只有「整段就是一个 JSON 对象」才算信封。不能用 _loads_json_object 的贪婪正则，
+    # 也不能用 extract_fenced_json 抓正文中任意位置的代码块——正常 Markdown 整理稿里
+    # 若含 JSON 片段/示例会被误判，正文反被截走。
+    body = text
+    if body.startswith("```") and body.endswith("```"):
+        fenced = extract_fenced_json(body)
+        if fenced:
+            body = fenced.strip()
+    if not body.startswith("{"):
+        return text
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return text
+    if not isinstance(parsed, dict):
+        return text
+    if "digest_md" in parsed:
         return str(parsed.get("digest_md") or "").strip()
-    return text
+    # 契约已统一为 Markdown，模型仍返回 JSON 属于不守约。实测出现过 draft /
+    # content / ppt_page_content / query 四种自创键名，白名单追不上，取最长字符串值降级，
+    # 但必须留痕——静默原样返回整段 JSON 正是坏数据入库的旧路径。
+    longest = max(
+        (value for value in parsed.values() if isinstance(value, str)),
+        key=len,
+        default="",
+    ).strip()
+    logger.warning(
+        "live search 返回了 JSON 信封而非 Markdown: model=%s keys=%s picked_len=%d",
+        model or "unknown",
+        sorted(parsed.keys())[:8],
+        len(longest),
+    )
+    return longest or text
 
 
 def parse_search_live_payload(payload: dict[str, Any], *, limit: int) -> list[dict[str, str]]:
@@ -616,29 +724,33 @@ class ModelGateway:
         self.settings = settings or get_settings()
 
     def context_json(self, system_prompt: str, user_payload: str | dict[str, Any], *, temperature: float = 0.2) -> dict[str, Any]:
-        text = self._client("context").chat_text(
+        text = self._client("content").chat_text(
             system_prompt,
             self._serialize_user_payload(user_payload),
             temperature=temperature,
             json_mode=True,
         )
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            wrapped_json = self._extract_wrapped_json(text)
-            if wrapped_json is None:
-                raise RuntimeError("上下文模型返回的不是有效 JSON")
-            return json.loads(wrapped_json)
+        return parse_context_json(text)
 
     def context_text(self, system_prompt: str, user_payload: str | dict[str, Any], *, temperature: float = 0.2) -> str:
-        return self._client("context").chat_text(
+        return self._client("content").chat_text(
             system_prompt,
             self._serialize_user_payload(user_payload),
             temperature=temperature,
         )
 
-    def svg_text(self, system_prompt: str, user_payload: str | dict[str, Any], *, temperature: float = 0.2) -> str:
-        text = self._client("svg").chat_text(
+    def svg_text(
+        self,
+        system_prompt: str,
+        user_payload: str | dict[str, Any],
+        *,
+        temperature: float = 0.2,
+        role: str = "draft",
+    ) -> str:
+        canonical = canonicalize_role(role)
+        if canonical not in {"draft", "design"}:
+            raise RuntimeError("SVG 生成只能使用初稿布局或最终设计模型")
+        text = self._client(canonical).chat_text(
             system_prompt,
             self._serialize_user_payload(user_payload),
             temperature=temperature,
@@ -647,9 +759,8 @@ class ModelGateway:
 
     def search_live(self, query: str, *, limit: int = 5) -> LiveSearchDigest:
         client = self._client("search")
-        system_prompt = _GROK_SEARCH_SYSTEM if _looks_like_grok(client.config) else _SEARCH_SYSTEM
         try:
-            payload = client.live_search(query, system_prompt=system_prompt, limit=limit)
+            payload = client.live_search(query, system_prompt=_LIVE_SEARCH_SYSTEM, limit=limit)
         except RuntimeError as exc:
             if _is_live_search_unsupported(exc):
                 raise RuntimeError(
@@ -659,28 +770,33 @@ class ModelGateway:
         except httpx.RemoteProtocolError as exc:
             raise RuntimeError("搜索模型连接中断，请稍后重试") from exc
         return LiveSearchDigest(
-            answer=parse_search_live_answer(payload),
+            answer=parse_search_live_answer(payload, model=client.config.model),
             items=parse_search_live_payload(payload, limit=limit),
         )
 
     def _client(self, role: str, *, required: bool = True) -> _OpenAICompatibleClient | None:
-        snapshot = snapshot_bound_provider(role)
+        canonical = canonicalize_role(role)
+        snapshot = snapshot_bound_provider(canonical)
         if snapshot is None:
-            fallback = self._env_fallback(role)
+            if expert_mode_enabled():
+                if required:
+                    raise RuntimeError(_expert_missing_message(canonical))
+                return None
+            fallback = self._env_fallback(canonical)
             if fallback.config.enabled:
                 return self._cached_client(
-                    role,
-                    cache_key=f"env:{role}:{fallback.config.model}:{fallback.config.base_url}",
+                    canonical,
+                    cache_key=f"env:{canonical}:{fallback.config.model}:{fallback.config.base_url}",
                     name="env",
                     factory=lambda: fallback,
                     model=fallback.config.model,
                     base_url=fallback.config.base_url,
                 )
             if required:
-                raise RuntimeError(_ROLE_MISSING_MESSAGES[role])
+                raise RuntimeError(_ROLE_MISSING_MESSAGES.get(canonical, f"未知模型角色: {canonical}"))
             return fallback
         client = self._cached_client(
-            role,
+            canonical,
             cache_key=f"{snapshot.provider_id}:{snapshot.updated_at}",
             name=snapshot.name,
             factory=lambda: _OpenAICompatibleClient(_config_from_snapshot(snapshot)),
@@ -689,7 +805,7 @@ class ModelGateway:
         )
         if not client.config.enabled:
             if required:
-                raise RuntimeError(_ROLE_MISSING_MESSAGES[role])
+                raise RuntimeError(_ROLE_MISSING_MESSAGES.get(canonical, f"未知模型角色: {canonical}"))
             return client
         return client
 
@@ -714,7 +830,8 @@ class ModelGateway:
 
     def _env_fallback(self, role: str) -> _OpenAICompatibleClient:
         settings = self.settings
-        if role == "context":
+        canonical = canonicalize_role(role)
+        if canonical in {"content", "context"}:
             config = _ModelConfig(
                 base_url=settings.context_llm_base_url,
                 api_key=settings.context_llm_api_key.get_secret_value() if settings.context_llm_api_key else None,
@@ -722,7 +839,7 @@ class ModelGateway:
                 path=settings.context_llm_path,
                 timeout_seconds=settings.context_llm_timeout_seconds,
             )
-        elif role == "svg":
+        elif canonical in {"draft", "design", "svg"}:
             config = _ModelConfig(
                 base_url=settings.svg_llm_base_url,
                 api_key=settings.svg_llm_api_key.get_secret_value() if settings.svg_llm_api_key else None,
@@ -731,7 +848,7 @@ class ModelGateway:
                 timeout_seconds=settings.svg_llm_timeout_seconds,
             )
         else:
-            raise RuntimeError(_ROLE_MISSING_MESSAGES.get(role, f"未知模型角色: {role}"))
+            raise RuntimeError(_ROLE_MISSING_MESSAGES.get(canonical, f"未知模型角色: {canonical}"))
         return _OpenAICompatibleClient(config)
 
     def _serialize_user_payload(self, user_payload: str | dict[str, Any]) -> str:
@@ -740,10 +857,7 @@ class ModelGateway:
         return json.dumps(user_payload, ensure_ascii=False)
 
     def _extract_wrapped_json(self, text: str) -> str | None:
-        matched = re.search(r"\[(?P<tag>[A-Z_]+)\]\s*(?P<body>\{[\s\S]*\})\s*\[/\1\]", text)
-        if matched is None:
-            return None
-        return matched.group("body")
+        return extract_wrapped_json(text)
 
     @property
     def has_search_model(self) -> bool:
@@ -751,11 +865,11 @@ class ModelGateway:
 
     @property
     def has_context_model(self) -> bool:
-        return self._is_role_enabled("context")
+        return self._is_role_enabled("content")
 
     @property
     def has_svg_model(self) -> bool:
-        return self._is_role_enabled("svg")
+        return self._is_role_enabled("draft") and self._is_role_enabled("design")
 
     def _is_role_enabled(self, role: str) -> bool:
         try:

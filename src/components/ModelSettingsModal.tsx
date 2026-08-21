@@ -52,6 +52,8 @@ export default function ModelSettingsModal({
 }) {
   const [providers, setProviders] = useState<ModelProvider[]>([]);
   const [bindings, setBindings] = useState<ModelBindingItem[]>([]);
+  const [expertItems, setExpertItems] = useState<ModelBindingItem[]>([]);
+  const [expertEnabled, setExpertEnabled] = useState(false);
   const [searchSettings, setSearchSettings] = useState<SearchSettings | null>(null);
   const [readerSettings, setReaderSettings] = useState<ReaderSettings | null>(null);
   const [bochaKey, setBochaKey] = useState('');
@@ -75,7 +77,7 @@ export default function ModelSettingsModal({
 
   const editing = Boolean(form.provider_id);
   const searchBinding = bindings.find((item) => item.role === 'search');
-  const roleBindings = bindings.filter((item) => item.role !== 'search');
+  const stageBindings = bindings;
 
   useEffect(() => {
     if (!open) {
@@ -97,6 +99,8 @@ export default function ModelSettingsModal({
         }
         setProviders(providerResponse.items);
         setBindings(bindingResponse.items);
+        setExpertItems(bindingResponse.expert_items ?? []);
+        setExpertEnabled(Boolean(bindingResponse.expert_enabled));
         setSearchSettings(searchResponse);
         setReaderSettings(readerResponse);
         setSearchTavilyUrl(searchResponse.tavily_api_url || 'https://api.tavily.com');
@@ -141,6 +145,14 @@ export default function ModelSettingsModal({
   if (!open) {
     return null;
   }
+
+  const applyBindingState = (next: {items: ModelBindingItem[]; needs_setup: boolean; expert_enabled?: boolean; expert_items?: ModelBindingItem[]}) => {
+    setBindings(next.items);
+    setExpertItems(next.expert_items ?? []);
+    setExpertEnabled(Boolean(next.expert_enabled));
+    setNeedsSetup(next.needs_setup);
+    onBindingsChange?.(next.needs_setup);
+  };
 
   const resetForm = () => {
     setForm(EMPTY_FORM);
@@ -201,9 +213,7 @@ export default function ModelSettingsModal({
       await deleteModelProvider(provider.provider_id);
       const [providerResponse, bindingResponse] = await Promise.all([listModelProviders(), getModelBindings()]);
       setProviders(providerResponse.items);
-      setBindings(bindingResponse.items);
-      setNeedsSetup(bindingResponse.needs_setup);
-      onBindingsChange?.(bindingResponse.needs_setup);
+      applyBindingState(bindingResponse);
       if (form.provider_id === provider.provider_id) {
         resetForm();
       }
@@ -268,19 +278,47 @@ export default function ModelSettingsModal({
     setError(null);
     try {
       const next = await putModelBindings({[role]: providerId || null});
-      setBindings(next.items);
-      setNeedsSetup(next.needs_setup);
-      onBindingsChange?.(next.needs_setup);
+      applyBindingState(next);
     } catch (caughtError) {
       setError(caughtError instanceof ApiError ? caughtError.message : '角色绑定失败');
     }
   };
 
+  const handleExpertBind = async (role: ModelRole, providerId: string) => {
+    setError(null);
+    try {
+      const next = await putModelBindings({expert: {[role]: providerId || null}});
+      applyBindingState(next);
+    } catch (caughtError) {
+      setError(caughtError instanceof ApiError ? caughtError.message : '专家档绑定失败');
+    }
+  };
+
+  const handleExpertToggle = async (enabled: boolean) => {
+    setError(null);
+    try {
+      const next = await putModelBindings({expert_enabled: enabled});
+      applyBindingState(next);
+    } catch (caughtError) {
+      setError(caughtError instanceof ApiError ? caughtError.message : '专家档切换失败');
+    }
+  };
+
+  const handleCopyToExpert = async () => {
+    setError(null);
+    try {
+      const expert = Object.fromEntries(bindings.map((item) => [item.role, item.provider_id])) as Partial<Record<ModelRole, string | null>>;
+      const next = await putModelBindings({expert_enabled: true, expert});
+      applyBindingState(next);
+      setNotice('已用当前常规绑定填充专家档');
+    } catch (caughtError) {
+      setError(caughtError instanceof ApiError ? caughtError.message : '填充专家档失败');
+    }
+  };
+
   const refreshSetup = async () => {
     const next = await getModelBindings();
-    setBindings(next.items);
-    setNeedsSetup(next.needs_setup);
-    onBindingsChange?.(next.needs_setup);
+    applyBindingState(next);
   };
 
   const handleSearchMode = async (mode: SearchMode) => {
@@ -429,7 +467,7 @@ export default function ModelSettingsModal({
         <div className="min-h-0 flex-1 overflow-y-auto p-6 space-y-6 bg-slate-50/50">
           {needsSetup ? (
             <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-              尚未完成文本、SVG、搜索或解析配置。请先导入模型，再完成角色绑定、搜索和网页解析配置。
+              尚未完成内容策划 / 初稿 / 设计{expertEnabled ? '（含专家档）' : ''}、搜索或解析配置。请先导入模型，再完成角色绑定。
             </div>
           ) : null}
           {error ? <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div> : null}
@@ -439,7 +477,7 @@ export default function ModelSettingsModal({
             <div className="flex items-center justify-between gap-3">
               <div>
                 <h3 className="text-lg font-semibold text-slate-800">模型库</h3>
-                <p className="text-sm text-slate-400 mt-1">导入后才能绑定到文本 / SVG / 搜索角色。API Key 只显示掩码。</p>
+                <p className="text-sm text-slate-400 mt-1">导入后才能绑定到资料检索 / 内容策划 / 初稿布局 / 最终设计。API Key 只显示掩码。</p>
               </div>
               {editing ? (
                 <button onClick={resetForm} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
@@ -580,11 +618,11 @@ export default function ModelSettingsModal({
 
           <section className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm space-y-4">
             <div>
-              <h3 className="text-lg font-semibold text-slate-800">角色绑定</h3>
-              <p className="text-sm text-slate-400 mt-1">切换后立即生效，无需重启后端。Key 跟随所选模型。</p>
+              <h3 className="text-lg font-semibold text-slate-800">分阶段模型</h3>
+              <p className="text-sm text-slate-400 mt-1">检索可用便宜模型，最终设计用最强模型。切换后立即生效，无需重启后端。</p>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              {roleBindings.map((item) => (
+              {stageBindings.map((item) => (
                 <div key={item.role}>
                   <Field label={item.label}>
                     <select
@@ -601,10 +639,68 @@ export default function ModelSettingsModal({
                         </option>
                       ))}
                     </select>
+                    {item.hint ? <p className="text-[11px] text-slate-400">{item.hint}</p> : null}
                   </Field>
                 </div>
               ))}
             </div>
+          </section>
+
+          <section className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-lg font-semibold text-slate-800">专家档</h3>
+                <p className="text-sm text-slate-400 mt-1">启用后生成改走这套绑定，不再用上面的常规档。适合最终设计上最强模型，部分步骤约 x3 消耗。</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  void handleExpertToggle(!expertEnabled);
+                }}
+                className={`shrink-0 rounded-full border px-3 py-1.5 text-xs font-semibold ${
+                  expertEnabled ? 'border-amber-300 bg-amber-50 text-amber-800' : 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                }`}
+              >
+                {expertEnabled ? '已启用' : '未启用'}
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  void handleCopyToExpert();
+                }}
+                className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+              >
+                用当前常规绑定填充
+              </button>
+            </div>
+            {expertEnabled ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {expertItems.map((item) => (
+                  <div key={`expert-${item.role}`}>
+                    <Field label={`专家 · ${item.label}`}>
+                      <select
+                        value={item.provider_id ?? ''}
+                        onChange={(event) => {
+                          void handleExpertBind(item.role, event.target.value);
+                        }}
+                        className={inputClass}
+                      >
+                        <option value="">未绑定</option>
+                        {providers.map((provider) => (
+                          <option key={provider.provider_id} value={provider.provider_id}>
+                            {provider.name}
+                          </option>
+                        ))}
+                      </select>
+                    </Field>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-sm text-slate-400">启用后才会使用专家档；未启用时上面的常规绑定继续生效。</div>
+            )}
           </section>
 
           <section className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm space-y-4">

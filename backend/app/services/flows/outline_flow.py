@@ -16,6 +16,7 @@ from app.models.entities import (
     RequirementForm,
     ResearchSession,
 )
+from app.services.clarification import apply_working_title_to_outline, project_title_from_answers
 from app.services.tasks import enqueue_batch_action, wake_scheduler
 
 
@@ -66,15 +67,21 @@ class OutlineFlowMixin:
             current_step_code = "O3"
             current_step_name = "生成大纲"
             run.step_started("O3", "生成大纲", "根据需求、固定项和背景调研摘要生成章节与页面。")
-            outline_payload = self.generator.generate_outline(
-                project_title=project.title,
-                request_text=project.request_text,
-                page_count_target=page_count_target,
-                style_preset=project.style_preset or "",
-                background_asset_path=project.background_asset_path,
-                answers=requirement_form.answers_json or {},
-                context_digest=evidence,
+            outline_payload = apply_working_title_to_outline(
+                self.generator.generate_outline(
+                    project_title=project.title,
+                    request_text=project.request_text,
+                    page_count_target=page_count_target,
+                    style_preset=project.style_preset or "",
+                    background_asset_path=project.background_asset_path,
+                    answers=requirement_form.answers_json or {},
+                    context_digest=evidence,
+                ),
+                requirement_form.answers_json or {},
             )
+            working_title = project_title_from_answers(requirement_form.answers_json)
+            if working_title:
+                project.title = working_title
             run.step_completed("O3", "生成大纲", {"part_count": len(outline_payload["ppt_outline"].get("parts", []))})
 
             current_step_code = "O4"

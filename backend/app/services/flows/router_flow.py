@@ -16,6 +16,7 @@ from app.models.entities import (
     RequirementForm,
     ResearchSession,
 )
+from app.services.clarification import merge_clarification_questions
 from app.services.tasks import enqueue_batch_action, wake_scheduler
 
 
@@ -215,7 +216,11 @@ class RouterFlowMixin:
                             if isinstance(decision["data_updates"].get("question_patch"), dict)
                             else None,
                         )
-                        requirement_form.ai_questions_json = package["ai_questions"]
+                        requirement_form.ai_questions_json = merge_clarification_questions(
+                            package["ai_questions"],
+                            request_text=project.request_text,
+                            existing=list(requirement_form.ai_questions_json or []) + list(package.get("ai_questions") or []),
+                        )
                         if package.get("page_count_options"):
                             requirement_form.page_count_options_json = package["page_count_options"]
                         result_snapshot = {

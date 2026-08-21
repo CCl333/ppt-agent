@@ -25,16 +25,21 @@ import {
   generatePageDraft,
   generatePageSearchQueries,
   generatePageSummary,
+  generateStyleCards,
   getExportDownloadUrl,
   getOutline,
   getPage,
   getProject,
+  getStyleCards,
+  confirmStyleCard,
+  saveStyleCardToLibrary,
   listMessages,
   listPages,
   patchPageOutline,
   patchStoryboard,
   patchPageSummary,
   patchPageDraft,
+  retryOutline,
   retryPageSearchResult,
   runBatchAction,
   runPageSearch,
@@ -42,12 +47,14 @@ import {
   type PageSummary,
   type ProjectMessage,
   type ProjectSummary,
+  type StyleCardState,
   type UiSurface,
 } from '../lib/ppt-api';
 import { createSingleFlightRunner } from '../lib/single-flight';
 import { mergeMessageList, summarizeSourcePipeline, shouldRefreshFromEvent } from '../lib/workflow-ui';
 import { AgentActivityCard, agentRunFromMessage, reduceAgentRunMap, type AgentRunView } from './AgentActivity';
-import { DataModal, PageThumbnail, renderStageBadge, renderStatusPill, SearchResultCard, SvgCanvas, type EditorSurface } from './editor/EditorBits';
+import { ReplayBar, useProjectReplay } from './ReplayBar';
+import { DataModal, PageThumbnail, QueryDimensionList, renderStageBadge, renderStatusPill, SearchResultCard, StyleCardPanel, SvgCanvas, type EditorSurface } from './editor/EditorBits';
 import PresentationPlayer, { type PresentationSlide, type PresentationSurface } from './editor/PresentationPlayer';
 import StoryboardPanel from './editor/StoryboardPanel';
 
@@ -69,6 +76,11 @@ function replacePageSummary(items: PageSummary[], updatedPage: PageSummary): Pag
   return items.map((item) => (item.page_id === updatedPage.page_id ? {...item, ...updatedPage} : item));
 }
 
+function isOutlineGenerateRun(run: AgentRunView): boolean {
+  const actionType = typeof run.router_decision?.action_type === 'string' ? run.router_decision.action_type : '';
+  return run.title === '生成大纲并等待确认' || actionType === 'outline_generate';
+}
+
 export default function Editor({
   project,
   onBack,
@@ -84,6 +96,9 @@ export default function Editor({
   const [activePage, setActivePage] = useState<PageSummary | null>(null);
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [liveRuns, setLiveRuns] = useState<Record<string, AgentRunView>>({});
+  const replay = useProjectReplay(project.project_id, messages);
+  const sourceMessages = replay.active ? replay.visibleMessages : messages;
+  const sourceRuns = replay.active ? replay.runs : liveRuns;
   const [chatInput, setChatInput] = useState('');
   const [titleDraft, setTitleDraft] = useState('');
   const [bulletDraft, setBulletDraft] = useState('');
@@ -104,12 +119,16 @@ export default function Editor({
   const [presentationSlides, setPresentationSlides] = useState<PresentationSlide[]>([]);
   const [presentationIndex, setPresentationIndex] = useState(0);
   const [retryingSearchSourceIds, setRetryingSearchSourceIds] = useState<Record<string, boolean>>({});
+  const [isRetryingOutline, setIsRetryingOutline] = useState(false);
+  const [styleCards, setStyleCards] = useState<StyleCardState | null>(null);
+  const [isStyleBusy, setIsStyleBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
   const activePageIdRef = useRef<string | null>(null);
 
   const visibleMessages = useMemo(
-    () => messages.filter((message) => message.scope_type === 'project' || message.target_page_id === activePage?.page_id),
-    [activePage?.page_id, messages],
+    () => sourceMessages.filter((message) => message.scope_type === 'project' || message.target_page_id === activePage?.page_id),
+    [activePage?.page_id, sourceMessages],
   );
   const visibleMessageAgentRunIds = useMemo(
     () =>
@@ -122,10 +141,10 @@ export default function Editor({
   );
   const liveRunList = useMemo(
     () =>
-      (Object.values(liveRuns) as AgentRunView[])
-        .filter((item) => item.live && (!item.target_page_id || item.target_page_id === activePage?.page_id))
+      (Object.values(sourceRuns) as AgentRunView[])
+        .filter((item) => (replay.active || item.live) && (!item.target_page_id || item.target_page_id === activePage?.page_id))
         .filter((item) => !visibleMessageAgentRunIds.has(item.agent_run_id)),
-    [activePage?.page_id, liveRuns, visibleMessageAgentRunIds],
+    [activePage?.page_id, replay.active, sourceRuns, visibleMessageAgentRunIds],
   );
   const searchStats = useMemo(() => summarizeSourcePipeline(activePage?.page_search_results ?? []), [activePage?.page_search_results]);
   const timelineItems = useMemo(() => {
@@ -158,6 +177,23 @@ export default function Editor({
     });
     return items;
   }, [liveRunList, visibleMessages]);
+  const isOutlineGenerating = useMemo(
+    () => (Object.values(sourceRuns) as AgentRunView[]).some((run) => Boolean(run.live) && isOutlineGenerateRun(run)),
+    [sourceRuns],
+  );
+  const isOutlineFailed = useMemo(() => {
+    if (outline || isOutlineGenerating || isRetryingOutline) {
+      return false;
+    }
+    const fromMessages = messages.some((message) => {
+      const run = agentRunFromMessage(message);
+      return Boolean(run && run.run_status === 'failed' && isOutlineGenerateRun(run));
+    });
+    const fromRuns = (Object.values(sourceRuns) as AgentRunView[]).some(
+      (run) => run.run_status === 'failed' && isOutlineGenerateRun(run),
+    );
+    return fromMessages || fromRuns;
+  }, [isOutlineGenerating, isRetryingOutline, messages, outline, sourceRuns]);
   const isPageSearchRunning = useMemo(
     () =>
       (Object.values(liveRuns) as AgentRunView[]).some((item) => {
@@ -178,17 +214,19 @@ export default function Editor({
     let cancelled = false;
     const load = async () => {
       try {
-        const [projectResponse, messageResponse, pagesResponse, outlineResponse] = await Promise.all([
+        const [projectResponse, messageResponse, pagesResponse, outlineResponse, styleResponse] = await Promise.all([
           getProject(project.project_id),
           listMessages(project.project_id),
           listPages(project.project_id),
           getOutline(project.project_id).catch(() => null),
+          getStyleCards(project.project_id).catch(() => null),
         ]);
         if (cancelled) return;
         onProjectUpdated(projectResponse);
         setMessages((current) => mergeMessageList(current, messageResponse.items));
         setPages(pagesResponse.items);
         setOutline(outlineResponse);
+        setStyleCards(styleResponse);
         const nextId = activePageIdRef.current && pagesResponse.items.some((item) => item.page_id === activePageIdRef.current)
           ? activePageIdRef.current
           : pagesResponse.items[0]?.page_id ?? null;
@@ -322,6 +360,20 @@ export default function Editor({
       setError(null);
     } catch (caughtError) {
       setError(getErrorMessage(caughtError, '动作执行失败'));
+    }
+  };
+
+  const refreshStyleCards = async (runner: () => Promise<StyleCardState>) => {
+    setIsStyleBusy(true);
+    try {
+      const next = await runner();
+      setStyleCards(next);
+      onProjectUpdated(await getProject(project.project_id));
+      setError(null);
+    } catch (caughtError) {
+      setError(getErrorMessage(caughtError, '风格卡操作失败'));
+    } finally {
+      setIsStyleBusy(false);
     }
   };
 
@@ -468,29 +520,94 @@ export default function Editor({
     setSurface('search');
   };
 
+  const handleRetryOutline = async () => {
+    if (isRetryingOutline || isOutlineGenerating) {
+      return;
+    }
+    setIsRetryingOutline(true);
+    try {
+      const nextProject = await retryOutline(project.project_id);
+      onProjectUpdated(nextProject);
+      setError(null);
+    } catch (caughtError) {
+      setError(getErrorMessage(caughtError, '重新生成大纲失败'));
+    } finally {
+      setIsRetryingOutline(false);
+    }
+  };
+
   const previewMarkup = surface === 'design' ? activePage?.design?.design_svg_markup ?? null : surface === 'draft' ? activePage?.draft?.draft_svg_markup ?? null : null;
   const searchDisabled = activePage?.page_role !== 'content' || project.current_stage !== 'search';
   const canPresent = surface !== 'search' && surface !== 'outline' && pages.length > 0;
 
   if (project.current_stage === 'outline' && !outline) {
+    const retryBusy = isRetryingOutline || isOutlineGenerating;
     return (
       <div className="h-screen flex flex-col bg-[#f8f9fa]">
         <header className="h-14 bg-white border-b border-slate-200 flex items-center px-6 justify-between shrink-0">
           <button onClick={onBack} className="flex items-center gap-2 text-slate-500 hover:text-slate-800 text-sm font-medium"><ArrowLeft size={18} />返回</button>
-          <div className="font-semibold text-slate-800">大纲生成中</div>
-          <div className="text-sm text-slate-400">正在处理</div>
+          <div className="font-semibold text-slate-800">{isOutlineFailed ? '大纲生成失败' : '大纲生成中'}</div>
+          {isOutlineFailed ? (
+            <button
+              type="button"
+              onClick={() => void handleRetryOutline()}
+              disabled={retryBusy}
+              className="flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl disabled:opacity-40"
+            >
+              <RefreshCw size={16} />
+              {retryBusy ? '正在重新入队...' : '重新生成大纲'}
+            </button>
+          ) : (
+            <div className="text-sm text-slate-400">正在处理</div>
+          )}
         </header>
+        <ReplayBar replay={replay} />
         <div className="flex-1 flex overflow-hidden p-6 gap-6">
           <div className="flex-1 rounded-[2rem] border border-slate-200 bg-white shadow-sm p-8 space-y-4">
-            <div className="text-2xl font-semibold text-slate-800">正在生成大纲</div>
-            <div className="text-sm text-slate-500 leading-relaxed">右侧卡片会实时显示当前步骤和异常。生成完成后可以修改章节，再确认进入资料阶段。</div>
+            <div className="text-2xl font-semibold text-slate-800">{isOutlineFailed ? '大纲生成失败' : '正在生成大纲'}</div>
+            <div className="text-sm text-slate-500 leading-relaxed">
+              {isOutlineFailed
+                ? '生成大纲时出错。可以查看右侧失败卡片，确认后重新生成。'
+                : '右侧卡片会实时显示当前步骤和异常。生成完成后可以修改章节，再确认进入资料阶段。'}
+            </div>
+            {error ? <div className="text-sm text-rose-600">{error}</div> : null}
+            {isOutlineFailed ? (
+              <button
+                type="button"
+                onClick={() => void handleRetryOutline()}
+                disabled={retryBusy}
+                className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl disabled:opacity-40"
+              >
+                <RefreshCw size={16} />
+                {retryBusy ? '正在重新入队...' : '重新生成大纲'}
+              </button>
+            ) : null}
           </div>
           <div className="w-[440px] bg-white border border-slate-200 rounded-[2rem] flex flex-col overflow-hidden shadow-sm">
             <div className="flex-1 overflow-y-auto p-5 space-y-6 bg-slate-50/50">
-              {liveRunList.map((run) => <div key={run.agent_run_id} className="flex justify-start"><AgentActivityCard run={run} /></div>)}
+              {liveRunList.map((run) => (
+                <div key={run.agent_run_id} className="flex justify-start">
+                  <AgentActivityCard
+                    run={run}
+                    onFailedRetry={() => { void handleRetryOutline(); }}
+                    failedRetrying={retryBusy}
+                    failedRetryLabel="重新生成大纲"
+                  />
+                </div>
+              ))}
               {messages.map((message) => message.role === 'assistant' ? (
                 <div key={message.id} className="flex justify-start">
-                  {agentRunFromMessage(message) ? <AgentActivityCard run={{...agentRunFromMessage(message)!, content_md: message.content_md}} accent="emerald" /> : <div className="bg-white border border-slate-200 shadow-sm px-5 py-4 rounded-2xl rounded-tl-sm max-w-[95%] w-full"><p className="text-sm text-slate-600 whitespace-pre-wrap">{message.content_md}</p></div>}
+                  {agentRunFromMessage(message) ? (
+                    <AgentActivityCard
+                      run={{...agentRunFromMessage(message)!, content_md: message.content_md}}
+                      accent="emerald"
+                      onFailedRetry={() => { void handleRetryOutline(); }}
+                      failedRetrying={retryBusy}
+                      failedRetryLabel="重新生成大纲"
+                    />
+                  ) : (
+                    <div className="bg-white border border-slate-200 shadow-sm px-5 py-4 rounded-2xl rounded-tl-sm max-w-[95%] w-full"><p className="text-sm text-slate-600 whitespace-pre-wrap">{message.content_md}</p></div>
+                  )}
                 </div>
               ) : null)}
             </div>
@@ -506,10 +623,11 @@ export default function Editor({
         <header className="h-16 bg-white border-b border-slate-200 flex items-center justify-between shrink-0 shadow-sm px-6">
           <button onClick={onBack} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200"><ArrowLeft size={18} />返回</button>
           <div className="font-semibold text-slate-800">确认大纲</div>
-          <button onClick={() => void runAction(handleConfirmOutline)} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl">确认大纲，开始按页找资料</button>
+          <button onClick={() => void runAction(handleConfirmOutline)} disabled={replay.active} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl disabled:opacity-40">确认大纲，开始按页找资料</button>
         </header>
-        <div className="flex-1 flex overflow-hidden">
-          <div className="flex-1 overflow-hidden">
+        <ReplayBar replay={replay} />
+        <div className="flex-1 min-h-0 flex overflow-hidden">
+          <div className="relative min-h-0 flex-1 overflow-hidden">
             <StoryboardPanel
               outline={outline}
               pages={pages}
@@ -538,8 +656,8 @@ export default function Editor({
             <div className="p-5 bg-white border-t border-slate-100 space-y-3">
               {error ? <div className="text-sm text-red-600">{error}</div> : null}
               <div className="bg-slate-50 rounded-2xl flex items-end p-2.5 border border-slate-200">
-                <textarea value={chatInput} placeholder="例如：把第三章改成风险与对策，或增加一页案例" className="flex-1 bg-transparent border-none outline-none resize-none max-h-32 min-h-[44px] py-2.5 px-3 text-sm text-slate-700" rows={1} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void handleSendMessage(); } }} />
-                <button disabled={isSendingMessage || !chatInput.trim()} onClick={() => void handleSendMessage()} className="p-2.5 text-blue-600 hover:text-blue-700 disabled:text-slate-300">{isSendingMessage ? <LoaderCircle size={20} className="animate-spin" /> : <Send size={20} />}</button>
+                <textarea value={chatInput} placeholder={replay.active ? '回放模式已禁用输入' : '例如：把第三章改成风险与对策，或增加一页案例'} className="flex-1 bg-transparent border-none outline-none resize-none max-h-32 min-h-[44px] py-2.5 px-3 text-sm text-slate-700" rows={1} readOnly={replay.active} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (replay.active) return; if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void handleSendMessage(); } }} />
+                <button disabled={replay.active || isSendingMessage || !chatInput.trim()} onClick={() => void handleSendMessage()} className="p-2.5 text-blue-600 hover:text-blue-700 disabled:text-slate-300">{isSendingMessage ? <LoaderCircle size={20} className="animate-spin" /> : <Send size={20} />}</button>
               </div>
             </div>
           </div>
@@ -574,9 +692,11 @@ export default function Editor({
           <button onClick={() => void runAction(() => surface === 'search' ? runBatchAction(project.project_id, 'project_batch_search') : surface === 'draft' ? runBatchAction(project.project_id, 'project_batch_draft') : runBatchAction(project.project_id, 'project_batch_design'))} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200"><Sparkles size={18} />{surface === 'search' ? '批量搜索' : surface === 'draft' ? '批量策划稿' : '批量设计'}</button>
           {surface === 'search' ? <button onClick={() => void runAction(() => runBatchAction(project.project_id, 'project_batch_summary'))} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200"><Wand2 size={18} />批量 summary</button> : null}
           <button disabled={!hasRunningTask} onClick={() => void runAction(() => cancelProjectTasks(project.project_id))} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-rose-700 hover:bg-rose-50 rounded-xl border border-rose-200 disabled:opacity-40"><Square size={16} />取消</button>
-          <button onClick={async () => { setIsExporting(true); try { const job = await createExport(project.project_id); window.open(getExportDownloadUrl(project.project_id, job.export_id), '_blank', 'noopener,noreferrer'); setError(null); } catch (caughtError) { setError(getErrorMessage(caughtError, '导出失败')); } finally { setIsExporting(false); } }} disabled={isExporting} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl disabled:bg-blue-300">{isExporting ? <LoaderCircle size={18} className="animate-spin" /> : <Download size={18} />}导出</button>
+          <button onClick={async () => { setIsExporting(true); try { const job = await createExport(project.project_id); window.open(getExportDownloadUrl(project.project_id, job.export_id), '_blank', 'noopener,noreferrer'); setError(null); setExportNotice((job.font_report?.notices ?? []).join('\n') || null); } catch (caughtError) { setError(getErrorMessage(caughtError, '导出失败')); } finally { setIsExporting(false); } }} disabled={isExporting || replay.active} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl disabled:bg-blue-300">{isExporting ? <LoaderCircle size={18} className="animate-spin" /> : <Download size={18} />}导出</button>
         </div>
       </header>
+      <ReplayBar replay={replay} />
+      {exportNotice ? <div className="px-6 py-2 text-sm text-amber-800 bg-amber-50 border-b border-amber-100">{exportNotice}</div> : null}
 
       {isStoryboardOpen ? (
         <StoryboardPanel
@@ -603,13 +723,33 @@ export default function Editor({
         <div className="flex-1 flex flex-col overflow-hidden bg-[#f3f4f6]">
           <div className="border-b border-slate-200 bg-white px-8 py-5 flex items-center justify-between gap-6">
             <div><div className="text-xs uppercase tracking-wide text-slate-400">{activePage?.page_role} / {activePage?.part_title || '未分组'}</div><div className="text-2xl font-semibold text-slate-800">{activePage?.title || '未选择页面'}</div></div>
-            {surface === 'search' ? <div className="flex flex-wrap gap-2 justify-end">{renderStatusPill('搜索结果', `${searchStats.total} 条`, 'slate')}{renderStatusPill('全文完成', `${searchStats.readReady}/${searchStats.total}`, searchStats.readReady ? 'emerald' : 'amber')}{renderStatusPill('入库完成', `${searchStats.chunkReady}/${searchStats.total}`, searchStats.chunkReady ? 'blue' : 'amber')}</div> : null}
+            {surface === 'search' ? <div className="flex flex-wrap gap-2 justify-end">{renderStatusPill('搜索结果', `${searchStats.total} 条`, 'slate')}{activePage?.search_coverage?.latest_round ? renderStatusPill('最新轮次', `R${activePage.search_coverage.latest_round} · ${activePage.search_coverage.latest_round_hits} 条`, 'blue') : null}{renderStatusPill('全文完成', `${searchStats.readReady}/${searchStats.total}`, searchStats.readReady ? 'emerald' : 'amber')}{renderStatusPill('入库完成', `${searchStats.chunkReady}/${searchStats.total}`, searchStats.chunkReady ? 'blue' : 'amber')}</div> : null}
           </div>
           <div className="flex-1 overflow-auto p-8">
             {surface === 'search' ? (
               <div className="space-y-6">
                 <div className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm space-y-4">
-                  <div className="flex items-center justify-between"><div><div className="text-lg font-semibold text-slate-800">当前页资料池</div><div className="text-sm text-slate-500 mt-1">搜索摘要、整理稿和全文抓取状态会持续写回这里。</div></div><div className="text-sm text-slate-500">文档 {activePage?.page_corpus_digest.document_count ?? 0} / chunk {activePage?.page_corpus_digest.chunk_count ?? 0}</div></div>
+                  <div className="flex items-center justify-between"><div><div className="text-lg font-semibold text-slate-800">当前页资料池</div><div className="text-sm text-slate-500 mt-1">搜索摘要、整理稿和全文抓取状态会持续写回这里。补充检索会保留上一轮并打上新的轮次标签。</div></div><div className="text-sm text-slate-500">文档 {activePage?.page_corpus_digest.document_count ?? 0} / chunk {activePage?.page_corpus_digest.chunk_count ?? 0} / 正文 {activePage?.page_corpus_digest.content_chars ?? 0} 字</div></div>
+                  {activePage?.page_search_queries.length ? <QueryDimensionList queries={activePage.page_search_queries} /> : null}
+                  {activePage?.page_images?.length ? (
+                    <div className="space-y-2">
+                      <div className="text-sm font-semibold text-slate-700">本页配图 {activePage.page_images.length} 张</div>
+                      <div className="flex flex-wrap gap-3">
+                        {activePage.page_images.map((image) => (
+                          <a
+                            key={image.image_id}
+                            href={image.source_url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 hover:border-blue-200 hover:text-blue-700"
+                          >
+                            <div className="font-semibold">{image.image_id}</div>
+                            <div className="mt-1 line-clamp-2">{image.caption || image.source_title || '检索配图'}</div>
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
                   {searchDisabled ? <div className="text-sm text-slate-500">固定页不参与页级搜索，直接使用大纲结构进入 draft/design。</div> : activePage?.page_search_results.length ? <div className="space-y-4">{activePage.page_search_results.map((item) => <SearchResultCard key={item.id} item={item} onRetry={(sourceId) => { void handleRetrySearchResult(sourceId); }} retrying={Boolean(retryingSearchSourceIds[item.id])} allowRetry={!isPageSearchRunning} />)}</div> : <div className="text-sm text-slate-400">当前页还没有资料池结果。右侧聊天栏会实时显示 agent 进度。</div>}
                 </div>
                 <div className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm space-y-4">
@@ -628,6 +768,17 @@ export default function Editor({
                     <button onClick={() => setIsDataModalOpen(true)} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"><FileText size={14} className="inline mr-1" />编辑策划稿</button>
                   </div>
                 ) : null}
+                {surface === 'design' ? (
+                  <StyleCardPanel
+                    frozen={styleCards?.frozen ?? project.style_card ?? null}
+                    candidates={styleCards?.candidates ?? []}
+                    library={styleCards?.library ?? []}
+                    busy={isStyleBusy}
+                    onGenerate={() => void refreshStyleCards(() => generateStyleCards(project.project_id))}
+                    onConfirm={(styleId, source) => void refreshStyleCards(() => confirmStyleCard(project.project_id, styleId, source))}
+                    onSave={() => void refreshStyleCards(() => saveStyleCardToLibrary(project.project_id))}
+                  />
+                ) : null}
                 <SvgCanvas markup={previewMarkup} placeholder={surface === 'draft' ? '当前页策划稿尚未生成' : '当前页设计稿尚未生成'} />
               </div>
             )}
@@ -641,7 +792,7 @@ export default function Editor({
               {surface === 'search' ? (
                 <>
                   <button disabled={!activePage || searchDisabled} onClick={() => activePage && void runAction(() => generatePageSearchQueries(project.project_id, activePage.page_id))} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40">生成搜索词</button>
-                  <button disabled={!activePage || searchDisabled} onClick={() => activePage && void runAction(() => runPageSearch(project.project_id, activePage.page_id, 'page_search_run'))} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40">搜索</button>
+                  <button disabled={!activePage || searchDisabled} onClick={() => activePage && void runAction(() => runPageSearch(project.project_id, activePage.page_id, 'page_search_run'))} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40">{activePage?.page_search_results.length ? '补充检索' : '搜索'}</button>
                   <button disabled={!activePage || searchDisabled} onClick={() => activePage && void runAction(() => runPageSearch(project.project_id, activePage.page_id, 'page_search_refresh'))} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-40"><RefreshCw size={14} className="inline mr-1" />覆盖重搜</button>
                   <button disabled={!activePage || searchDisabled} onClick={() => activePage && void runAction(() => generatePageSummary(project.project_id, activePage.page_id))} className="rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-40">生成 summary</button>
                 </>
@@ -662,7 +813,7 @@ export default function Editor({
                     onRecommendationClick={(recommendation) => {
                       void sendMessage(recommendation.label);
                     }}
-                    recommendationsDisabled={isSendingMessage || !activePage}
+                    recommendationsDisabled={replay.active || isSendingMessage || !activePage}
                   />
                 </div>
               ) : item.message.role === 'user' ? (
@@ -671,7 +822,7 @@ export default function Editor({
                 </div>
               ) : (
                 <div key={item.key} className="flex justify-start">
-                  {agentRunFromMessage(item.message) ? <AgentActivityCard run={{...agentRunFromMessage(item.message)!, content_md: item.message.content_md}} accent="emerald" onRecommendationClick={(recommendation) => { void sendMessage(recommendation.label); }} recommendationsDisabled={isSendingMessage || !activePage} /> : <div className="bg-white border border-slate-200 shadow-sm px-5 py-4 rounded-2xl rounded-tl-sm max-w-[95%] w-full"><p className="text-sm text-slate-600 leading-relaxed whitespace-pre-wrap">{item.message.content_md}</p></div>}
+                  {agentRunFromMessage(item.message) ? <AgentActivityCard run={{...agentRunFromMessage(item.message)!, content_md: item.message.content_md}} accent="emerald" onRecommendationClick={(recommendation) => { void sendMessage(recommendation.label); }} recommendationsDisabled={replay.active || isSendingMessage || !activePage} /> : <div className="bg-white border border-slate-200 shadow-sm px-5 py-4 rounded-2xl rounded-tl-sm max-w-[95%] w-full"><p className="text-sm text-slate-600 leading-relaxed whitespace-pre-wrap">{item.message.content_md}</p></div>}
                 </div>
               ),
             )}
@@ -680,8 +831,8 @@ export default function Editor({
           <div className="p-5 bg-white border-t border-slate-100 space-y-3">
             {error ? <div className="text-sm text-red-600">{error}</div> : null}
             <div className="bg-slate-50 rounded-2xl flex items-end p-2.5 border border-slate-200 focus-within:border-blue-500 focus-within:ring-2 focus-within:ring-blue-100 transition-all">
-              <textarea value={chatInput} placeholder={surface === 'search' ? '例如：把标题改成...，或者先只生成搜索词' : surface === 'draft' ? '例如：重生成这一页策划稿，强调数据对比' : '例如：重生成设计稿，保留结构但增强层次'} className="flex-1 bg-transparent border-none outline-none resize-none max-h-32 min-h-[44px] py-2.5 px-3 text-sm text-slate-700" rows={1} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void handleSendMessage(); } }} />
-              <button disabled={isSendingMessage || !chatInput.trim() || !activePage} onClick={() => void handleSendMessage()} className="p-2.5 text-blue-600 hover:text-blue-700 disabled:text-slate-300 disabled:cursor-not-allowed">{isSendingMessage ? <LoaderCircle size={20} className="animate-spin" /> : <Send size={20} />}</button>
+              <textarea value={chatInput} placeholder={replay.active ? '回放模式已禁用输入' : surface === 'search' ? '例如：把标题改成...，或者先只生成搜索词' : surface === 'draft' ? '例如：重生成这一页策划稿，强调数据对比' : '例如：重生成设计稿，保留结构但增强层次'} className="flex-1 bg-transparent border-none outline-none resize-none max-h-32 min-h-[44px] py-2.5 px-3 text-sm text-slate-700" rows={1} readOnly={replay.active} onChange={(event) => setChatInput(event.target.value)} onKeyDown={(event) => { if (replay.active) return; if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void handleSendMessage(); } }} />
+              <button disabled={replay.active || isSendingMessage || !chatInput.trim() || !activePage} onClick={() => void handleSendMessage()} className="p-2.5 text-blue-600 hover:text-blue-700 disabled:text-slate-300 disabled:cursor-not-allowed">{isSendingMessage ? <LoaderCircle size={20} className="animate-spin" /> : <Send size={20} />}</button>
             </div>
             <div className="flex items-center justify-between text-[11px] text-slate-400"><div className="flex items-center gap-1"><Database size={12} />页面上下文已绑定</div><div className="flex items-center gap-1"><Search size={12} />按 Enter 发送，Shift + Enter 换行</div></div>
           </div>

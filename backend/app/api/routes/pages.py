@@ -5,7 +5,17 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.schemas.api import BatchActionRequest, CancelTasksRequest, DraftPatchRequest, ExportCreateRequest, PageActionRequest, PageOutlinePatchRequest, SummaryPatchRequest
+from app.schemas.api import (
+    BatchActionRequest,
+    CancelTasksRequest,
+    DraftPatchRequest,
+    ExportCreateRequest,
+    PageActionRequest,
+    PageOutlinePatchRequest,
+    StyleCardConfirmRequest,
+    StyleCardSaveRequest,
+    SummaryPatchRequest,
+)
 from app.services.orchestrator import PptAgentService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["pages"])
@@ -157,6 +167,40 @@ def cancel_project_tasks(
     service: PptAgentService = Depends(get_service),
 ) -> dict:
     return service.cancel_tasks(project_id, page_id=payload.page_id)
+
+
+@router.get("/style-cards")
+def get_style_cards(
+    project_id: str,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.get_style_cards(project_id)
+
+
+@router.post("/style-cards:generate")
+def generate_style_cards(
+    project_id: str,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.generate_style_cards(project_id)
+
+
+@router.post("/style-cards:confirm")
+def confirm_style_card(
+    project_id: str,
+    payload: StyleCardConfirmRequest,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.confirm_style_card(project_id, payload.style_id, source=payload.source)
+
+
+@router.post("/style-cards:save")
+def save_style_card(
+    project_id: str,
+    payload: StyleCardSaveRequest,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.save_style_card_to_library(project_id, payload.style_id)
 
 
 @router.post("/exports")

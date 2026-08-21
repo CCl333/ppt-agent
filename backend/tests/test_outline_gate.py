@@ -86,6 +86,36 @@ def test_question_refine_without_corpus_uses_search_results(service, db_session,
     assert captured["context_digest"][0]["excerpt_md"] == "背景调研摘要"
 
 
+def test_retry_outline_enqueues_when_generation_failed(service, db_session):
+    from sqlalchemy import select
+
+    from app.models.entities import AgentTask
+    from app.services.tasks import STATUS_PENDING
+
+    project = make_project(db_session, stage="outline")
+    result = service.retry_outline(project.id)
+    assert result["current_stage"] == "outline"
+    tasks = list(db_session.scalars(select(AgentTask).where(AgentTask.project_id == project.id, AgentTask.task_type == "outline")))
+    assert len(tasks) == 1
+    assert tasks[0].status == STATUS_PENDING
+
+
+def test_retry_outline_rejects_when_outline_exists(service, db_session):
+    project = make_project(db_session, stage="outline")
+    db_session.add(OutlineVersion(project_id=project.id, version_no=1, status="ready", outline_json={"ppt_outline": {}}))
+    db_session.commit()
+    with pytest.raises(HTTPException) as exc:
+        service.retry_outline(project.id)
+    assert exc.value.status_code == 409
+
+
+def test_retry_outline_rejects_outside_outline(service, db_session):
+    project = make_project(db_session, stage="init")
+    with pytest.raises(HTTPException) as exc:
+        service.retry_outline(project.id)
+    assert exc.value.status_code == 409
+
+
 def test_outline_confirm_advances_stage(service, db_session):
     project = make_project(db_session, stage="outline")
     db_session.add(
@@ -224,7 +254,7 @@ def test_retry_requirement_source_researches_snippets_not_corpus(service, db_ses
     monkeypatch.setattr(
         service.research,
         "search_query_summaries",
-        lambda query_plan, limit_per_query=3, on_query_completed=None: [
+        lambda query_plan, limit_per_query=3, on_query_completed=None, **_kwargs: [
             {
                 "id": "src-digest",
                 "query_text": "q1",

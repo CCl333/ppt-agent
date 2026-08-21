@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-import re
-from textwrap import shorten
 from typing import Any
 
+from app.services.clarification import apply_working_title_to_outline, merge_clarification_questions, placeholder_project_title
+from app.services.page_images import assert_svg_uses_images, prompt_catalog
+from app.services.content_plan import assert_svg_matches_plan, normalize_content_plan
 from app.services.model_gateway import ModelGateway
 from app.services.prompt_contracts import get_prompt_text, render_prompt
+from app.services.search_plan import normalize_query_plan
+from app.services.style_cards import normalize_style_cards, pack_from_card
+from app.services.style_tokens import style_pack_for_prompt
 from app.services.svg import prepare_page_svg
 
 STYLE_PACKS: dict[str, dict[str, Any]] = {
@@ -83,6 +87,30 @@ _EMPTY_DATA_UPDATES = {
     "page_patch": None,
     "summary_patch": None,
 }
+_OUTLINE_BODY_KEYS = ("cover", "table_of_contents", "parts", "end_page")
+
+
+def _looks_like_outline_body(payload: dict[str, Any]) -> bool:
+    return any(key in payload for key in _OUTLINE_BODY_KEYS)
+
+
+def normalize_outline_payload(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        raise RuntimeError("outline.generate 缺少 ppt_outline")
+    nested = result.get("ppt_outline")
+    if isinstance(nested, dict):
+        return result
+    for key in ("PPT_OUTLINE", "outline"):
+        alt = result.get(key)
+        if not isinstance(alt, dict):
+            continue
+        if isinstance(alt.get("ppt_outline"), dict):
+            return {"ppt_outline": alt["ppt_outline"]}
+        if _looks_like_outline_body(alt):
+            return {"ppt_outline": alt}
+    if _looks_like_outline_body(result):
+        return {"ppt_outline": result}
+    raise RuntimeError("outline.generate 缺少 ppt_outline")
 
 
 class GenerationService:
@@ -140,10 +168,7 @@ class GenerationService:
         return decision
 
     def generate_project_title(self, request_text: str) -> str:
-        cleaned = re.sub(r"\s+", " ", request_text).strip()
-        if not cleaned:
-            return "未命名项目"
-        return shorten(cleaned, width=24, placeholder="...")
+        return placeholder_project_title(request_text)
 
     def generate_init_fast_questions(
         self,
@@ -164,12 +189,15 @@ class GenerationService:
             ),
         )
         page_count_options = self._normalize_page_count_options(result.get("page_count_options"))
-        ai_questions = self._normalize_questions(result.get("ai_questions"))
-        if not page_count_options or not ai_questions:
+        if not page_count_options:
             raise RuntimeError("init.fast_question_generate 返回内容不完整")
         return {
             "page_count_options": page_count_options,
-            "ai_questions": ai_questions,
+            "ai_questions": merge_clarification_questions(
+                self._normalize_questions(result.get("ai_questions")),
+                working_title_options=self._coerce_string_list(result.get("working_title_options")),
+                request_text=request_text,
+            ),
         }
 
     def refine_init_questions_with_retrieval(
@@ -200,13 +228,17 @@ class GenerationService:
                 },
             ),
         )
-        ai_questions = self._normalize_questions(result.get("ai_questions"))
-        if not ai_questions:
-            raise RuntimeError("init.question_refine_with_retrieval 返回内容不完整")
         page_count_options = self._normalize_page_count_options(result.get("page_count_options")) or current_page_count_options
+        if not page_count_options:
+            raise RuntimeError("init.question_refine_with_retrieval 返回内容不完整")
         return {
             "page_count_options": page_count_options,
-            "ai_questions": ai_questions,
+            "ai_questions": merge_clarification_questions(
+                self._normalize_questions(result.get("ai_questions")),
+                working_title_options=self._coerce_string_list(result.get("working_title_options")),
+                request_text=request_text,
+                existing=current_questions,
+            ),
         }
 
     def generate_outline(
@@ -235,9 +267,7 @@ class GenerationService:
                 },
             ),
         )
-        if "ppt_outline" not in result:
-            raise RuntimeError("outline.generate 缺少 ppt_outline")
-        return result
+        return apply_working_title_to_outline(normalize_outline_payload(result), answers)
 
     def generate_page_search_queries(
         self,
@@ -267,7 +297,7 @@ class GenerationService:
                 },
             ),
         )
-        queries = self._normalize_search_queries(result.get("page_search_queries"))
+        queries = self._normalize_search_queries(result)
         if not queries:
             raise RuntimeError("page.search_query_expand 未返回有效搜索词")
         return queries
@@ -367,8 +397,63 @@ class GenerationService:
             "open_questions": self._coerce_string_list(result.get("open_questions")),
         }
 
-    def generate_draft_svg(self, *, page_context: dict[str, Any]) -> str:
+    def generate_content_plan(self, *, page_context: dict[str, Any]) -> dict[str, Any]:
+        page = page_context["page"]
         summary = page_context["summary"]
+        page_images = prompt_catalog(page_context.get("page_images"))
+        result = self.models.context_json(
+            get_prompt_text("plan.page_generate.system"),
+            render_prompt(
+                "plan.page_generate.user",
+                {
+                    "page_id": page["page_id"],
+                    "page_code": page["page_code"],
+                    "page_role": page.get("page_role") or "content",
+                    "title": page["title"],
+                    "content_outline_json": page["content_outline"],
+                    "content_summary": page["content_summary"],
+                    "summary_md": summary["summary_md"],
+                    "selected_sources_json": summary["selected_sources"],
+                    "page_images_json": page_images,
+                    "latest_instruction": page_context.get("latest_instruction") or "",
+                },
+            ),
+        )
+        return normalize_content_plan(
+            result,
+            page_code=str(page["page_code"]),
+            title=str(page["title"]),
+            page_role=str(page.get("page_role") or "content"),
+            page_images=page_images,
+        )
+
+    def generate_style_cards(
+        self,
+        *,
+        title: str,
+        request_text: str,
+        style_hint: str,
+        outline_cover_title: str,
+        page_titles: list[str],
+    ) -> list[dict[str, Any]]:
+        result = self.models.context_json(
+            get_prompt_text("style.card_generate.system"),
+            render_prompt(
+                "style.card_generate.user",
+                {
+                    "title": title,
+                    "request_text": request_text,
+                    "style_hint": style_hint,
+                    "outline_cover_title": outline_cover_title,
+                    "page_titles_json": page_titles,
+                },
+            ),
+        )
+        return normalize_style_cards(result, source="generated")
+
+    def generate_draft_svg(self, *, page_context: dict[str, Any], content_plan: dict[str, Any] | None = None) -> str:
+        summary = page_context["summary"]
+        page_images = page_context.get("page_images") or []
         svg = self.models.svg_text(
             get_prompt_text("draft.page_generate.system"),
             render_prompt(
@@ -380,13 +465,19 @@ class GenerationService:
                     "title": page_context["page"]["title"],
                     "content_outline_json": page_context["page"]["content_outline"],
                     "content_summary": page_context["page"]["content_summary"],
+                    "content_plan_json": content_plan or {},
                     "summary_md": summary["summary_md"],
                     "selected_sources_json": summary["selected_sources"],
+                    "page_images_json": prompt_catalog(page_images),
                     "latest_instruction": page_context.get("latest_instruction") or "",
                 },
             ),
+            role="draft",
         )
-        return prepare_page_svg(svg)
+        prepared = prepare_page_svg(svg, stage="draft", page_images=page_images)
+        assert_svg_matches_plan(prepared, content_plan)
+        assert_svg_uses_images(prepared, page_images, (content_plan or {}).get("image_slots"))
+        return prepared
 
     def generate_design_svg(
         self,
@@ -394,26 +485,49 @@ class GenerationService:
         draft_svg: str,
         style_pack_id: str,
         background_asset_path: str | None,
+        chrome: dict[str, Any] | None = None,
+        content_plan: dict[str, Any] | None = None,
+        frozen_card: dict[str, Any] | None = None,
+        page_images: list[dict[str, Any]] | None = None,
     ) -> str:
+        style_pack = self.get_style_pack(style_pack_id, frozen_card=frozen_card)
         svg = self.models.svg_text(
             get_prompt_text("design.svg_generate.system"),
             render_prompt(
                 "design.svg_generate.user",
                 {
                     "draft_svg_markup": draft_svg,
-                    "style_pack_json": self.get_style_pack(style_pack_id),
+                    "content_plan_json": content_plan or {},
+                    "page_images_json": prompt_catalog(page_images),
+                    "style_pack_json": style_pack_for_prompt(style_pack),
                     "background_asset_json": {
                         "composited_by_system": True,
-                        "note": "系统会在 SVG 底层嵌入背景图。不要引用本地文件路径，不要再画一层全幅背景图，并保证正文不透明、可读。",
+                        "note": "系统会在 SVG 底层嵌入底色、纹理、标题栏和页码。不要引用本地文件路径，不要再画一层全幅背景，并保证正文不透明、可读。",
                     }
                     if background_asset_path
-                    else None,
+                    else {
+                        "composited_by_system": True,
+                        "note": "系统会在 SVG 底层嵌入底色、标题栏和页码。不要再画一层全幅背景。",
+                    },
                 },
             ),
+            role="design",
         )
-        return prepare_page_svg(svg, background_path=background_asset_path)
+        prepared = prepare_page_svg(
+            svg,
+            background_path=background_asset_path,
+            stage="design",
+            style_pack=style_pack,
+            chrome=chrome,
+            page_images=page_images,
+        )
+        assert_svg_matches_plan(prepared, content_plan)
+        assert_svg_uses_images(prepared, page_images, (content_plan or {}).get("image_slots"))
+        return prepared
 
-    def get_style_pack(self, style_id: str | None) -> dict[str, Any]:
+    def get_style_pack(self, style_id: str | None, *, frozen_card: dict[str, Any] | None = None) -> dict[str, Any]:
+        if frozen_card:
+            return pack_from_card(frozen_card)
         if not style_id:
             raise RuntimeError("style_pack_id 不能为空")
         style_pack = STYLE_PACKS.get(style_id)
@@ -438,17 +552,7 @@ class GenerationService:
         return [STYLE_PACKS[key] for key in STYLE_PACKS]
 
     def _normalize_search_queries(self, payload: Any) -> list[dict[str, str]]:
-        if not isinstance(payload, list):
-            return []
-        items: list[dict[str, str]] = []
-        for raw_item in payload:
-            if not isinstance(raw_item, dict):
-                continue
-            query_text = str(raw_item.get("query_text") or raw_item.get("query") or "").strip()
-            query_purpose = str(raw_item.get("query_purpose") or raw_item.get("query_intent") or raw_item.get("intent") or "").strip()
-            if query_text:
-                items.append({"query_text": query_text, "query_purpose": query_purpose})
-        return items
+        return normalize_query_plan(payload)
 
     def _normalize_page_count_options(self, payload: Any) -> list[dict[str, Any]]:
         if not isinstance(payload, list):

@@ -33,6 +33,8 @@ import {
 import { createSingleFlightRunner } from '../lib/single-flight';
 import { mergeMessageList, shouldRefreshFromEvent } from '../lib/workflow-ui';
 import { AgentActivityCard, agentRunFromMessage, reduceAgentRunMap, type AgentRunView } from './AgentActivity';
+import { ReplayBar, useProjectReplay } from './ReplayBar';
+import { QueryDimensionList } from './editor/EditorBits';
 
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof ApiError) {
@@ -47,6 +49,8 @@ function getErrorMessage(error: unknown, fallback: string): string {
 function hasValue(value: string | number | undefined): boolean {
   return value !== undefined && value !== null && String(value).trim() !== '';
 }
+
+const CLARIFICATION_QUESTION_CODES = ['audience', 'occasion', 'duration', 'working_title'];
 
 function toTimestamp(value?: string): number {
   if (!value) {
@@ -95,11 +99,11 @@ function renderSearchResult(
           {isHttp ? <div className="text-xs text-emerald-600 break-all">{source.url}</div> : null}
         </div>
         <span className="shrink-0 rounded-full px-2.5 py-1 text-[11px] font-medium bg-slate-100 text-slate-600 border border-slate-200">
-          {source.query_purpose}
+          {source.dimension || source.query_purpose}
         </span>
       </div>
       <div className="flex flex-wrap gap-2">
-        {renderStatusPill('搜索', `R${source.search_rank}`, 'slate')}
+        {renderStatusPill('轮次', `R${source.round ?? 1}`, 'slate')}
         {source.source_kind === 'llm_answer' ? renderStatusPill('整理稿', 'ready', 'emerald') : null}
       </div>
       <p className="text-sm text-slate-600 leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
@@ -159,6 +163,9 @@ export default function ProjectStart({
   const [form, setForm] = useState<RequirementFormData | null>(null);
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [liveRuns, setLiveRuns] = useState<Record<string, AgentRunView>>({});
+  const replay = useProjectReplay(project.project_id, messages);
+  const sourceMessages = replay.active ? replay.visibleMessages : messages;
+  const sourceRuns = replay.active ? replay.runs : liveRuns;
   const [chatInput, setChatInput] = useState('');
   const [customAnswers, setCustomAnswers] = useState<Record<string, string>>({});
   const [activeRequirementIndex, setActiveRequirementIndex] = useState(0);
@@ -179,18 +186,18 @@ export default function ProjectStart({
   const messageAgentRunIds = useMemo(
     () =>
       new Set(
-        messages
+        sourceMessages
           .map((message) => agentRunFromMessage(message)?.agent_run_id)
           .filter((value): value is string => Boolean(value)),
       ),
-    [messages],
+    [sourceMessages],
   );
   const liveRunList = useMemo(
     () =>
-      (Object.values(liveRuns) as AgentRunView[])
-        .filter((item) => item.live)
+      (Object.values(sourceRuns) as AgentRunView[])
+        .filter((item) => replay.active || item.live)
         .filter((item) => !messageAgentRunIds.has(item.agent_run_id)),
-    [liveRuns, messageAgentRunIds],
+    [messageAgentRunIds, replay.active, sourceRuns],
   );
   const pageCountMatchesPreset = useMemo(
     () =>
@@ -205,8 +212,24 @@ export default function ProjectStart({
   );
   const pageCountCustomValue = customAnswers.page_count_target ?? (hasValue(pageCountAnswer) && !pageCountMatchesPreset ? String(pageCountAnswer) : '');
   const styleCustomValue = customAnswers.style_preset ?? (styleAnswer && !styleMatchesPreset ? styleAnswer : '');
+  const clarificationQuestions = useMemo(
+    () => questions.filter((item) => CLARIFICATION_QUESTION_CODES.includes(item.question_code)),
+    [questions],
+  );
+  const extraQuestions = useMemo(
+    () => questions.filter((item) => !CLARIFICATION_QUESTION_CODES.includes(item.question_code)),
+    [questions],
+  );
   const requirementSteps = useMemo<RequirementStep[]>(
     () => [
+      ...clarificationQuestions.map((question) => ({
+        key: question.question_code,
+        title: question.label,
+        description: question.description,
+        answered: hasValue(form?.answers[question.question_code]),
+        kind: 'question' as const,
+        question,
+      })),
       {
         key: 'page_count_target',
         title: '页数目标',
@@ -221,7 +244,7 @@ export default function ProjectStart({
         answered: hasValue(styleAnswer),
         kind: 'style_preset',
       },
-      ...questions.map((question) => ({
+      ...extraQuestions.map((question) => ({
         key: question.question_code,
         title: question.label,
         description: question.description,
@@ -230,12 +253,12 @@ export default function ProjectStart({
         question,
       })),
     ],
-    [form?.answers, pageCountAnswer, questions, styleAnswer],
+    [clarificationQuestions, extraQuestions, form?.answers, pageCountAnswer, styleAnswer],
   );
   const activeRequirementStep = requirementSteps[activeRequirementIndex] ?? null;
   const timelineItems = useMemo(() => {
     const items = [
-      ...messages.map((message, index) => ({
+      ...sourceMessages.map((message, index) => ({
         key: `message-${message.id}`,
         type: 'message' as const,
         sortAt: toTimestamp(message.created_at),
@@ -262,7 +285,7 @@ export default function ProjectStart({
       return left.index - right.index;
     });
     return items;
-  }, [liveRunList, messages]);
+  }, [liveRunList, sourceMessages]);
   const currentRequirementPosition = requirementSteps.length ? activeRequirementIndex + 1 : 0;
   const isBootstrapRunning = useMemo(
     () => (Object.values(liveRuns) as AgentRunView[]).some((item) => item.live && item.title === '初始化资料准备'),
@@ -727,12 +750,13 @@ export default function ProjectStart({
           onClick={() => {
             void handleConfirm();
           }}
-          disabled={!canConfirm || isConfirming}
+          disabled={!canConfirm || isConfirming || replay.active}
           className="rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-blue-300"
         >
           {isConfirming ? '开始生成大纲...' : '生成大纲'}
         </button>
       </header>
+      <ReplayBar replay={replay} />
 
       <div className="flex-1 min-h-0 flex overflow-hidden p-6 gap-6">
         <div className="flex-1 min-h-0 bg-white rounded-[2rem] shadow-sm border border-slate-200 flex flex-col overflow-hidden">
@@ -743,6 +767,7 @@ export default function ProjectStart({
                 <div className="text-xl font-semibold text-slate-800">首轮搜索摘要</div>
               </div>
               <div className="flex flex-wrap gap-2 justify-end">
+                {renderStatusPill('维度', `${new Set((form?.init_search_queries ?? []).map((item) => item.dimension_id || item.dimension || item.query_purpose)).size} 组`, 'slate')}
                 {renderStatusPill('搜索结果', `${form?.init_search_results.length ?? 0} 条`, 'slate')}
               </div>
             </div>
@@ -754,20 +779,29 @@ export default function ProjectStart({
           <div className="min-h-0 flex-1 overflow-y-auto p-6 space-y-4 bg-slate-50/50">
             {isLoading ? (
               <div className="h-full flex items-center justify-center text-sm text-slate-400">正在准备初始化资料...</div>
-            ) : form?.init_search_results.length ? (
-              form.init_search_results.map((source) =>
-                renderSearchResult(source, {
-                  onRetry: (sourceId) => {
-                    void handleRetrySearchResult(sourceId);
-                  },
-                  retrying: Boolean(retryingSourceIds[source.id]),
-                  allowRetry: !isBootstrapRunning,
-                }),
-              )
             ) : (
-              <div className="h-full flex items-center justify-center text-sm text-slate-400">
-                当前还没有搜索结果。右侧会实时显示 agent 的联网进度。
-              </div>
+              <>
+                {form?.init_search_queries.length ? (
+                  <div className="rounded-[1.5rem] border border-slate-200 bg-white p-5">
+                    <QueryDimensionList queries={form.init_search_queries} />
+                  </div>
+                ) : null}
+                {form?.init_search_results.length ? (
+                  form.init_search_results.map((source) =>
+                    renderSearchResult(source, {
+                      onRetry: (sourceId) => {
+                        void handleRetrySearchResult(sourceId);
+                      },
+                      retrying: Boolean(retryingSourceIds[source.id]),
+                      allowRetry: !isBootstrapRunning,
+                    }),
+                  )
+                ) : (
+                  <div className="h-full flex items-center justify-center text-sm text-slate-400">
+                    当前还没有搜索结果。右侧会实时显示 agent 的联网进度。
+                  </div>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -828,7 +862,7 @@ export default function ProjectStart({
                 </div>
                 <div className="flex items-center gap-3">
                   <span className="text-xs text-slate-400">
-                    {answeredAllQuestions && pageCountAnswer && styleAnswer ? '已基本补齐' : '待补充'}
+                    {answeredAllQuestions && pageCountAnswer && styleAnswer ? '已基本补齐' : '先确认受众、场合、时长和标题'}
                   </span>
                   <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-medium text-slate-500">
                     {currentRequirementPosition}/{Math.max(requirementSteps.length, 1)}
@@ -906,7 +940,7 @@ export default function ProjectStart({
                     type="button"
                     key={item.code}
                     title={item.reason}
-                    disabled={isSendingMessage || isRetryingBootstrap || isBootstrapRunning}
+                    disabled={replay.active || isSendingMessage || isRetryingBootstrap || isBootstrapRunning}
                     onClick={() => {
                       if (item.code === 'refresh_init_search') {
                         void handleRetryBootstrap();
@@ -928,11 +962,15 @@ export default function ProjectStart({
               </button>
               <textarea
                 value={chatInput}
-                placeholder="例如：补充受众限制，或者要求重新做项目级搜索"
+                placeholder={replay.active ? '回放模式已禁用输入' : '例如：补充受众限制，或者要求重新做项目级搜索'}
                 className="flex-1 bg-transparent border-none outline-none resize-none max-h-32 min-h-[44px] py-2.5 px-2 text-sm text-slate-700"
                 rows={1}
+                readOnly={replay.active}
                 onChange={(event) => setChatInput(event.target.value)}
                 onKeyDown={(event) => {
+                  if (replay.active) {
+                    return;
+                  }
                   if (event.key === 'Enter' && !event.shiftKey) {
                     event.preventDefault();
                     void handleSendMessage();
@@ -940,7 +978,7 @@ export default function ProjectStart({
                 }}
               />
               <button
-                disabled={isSendingMessage || !chatInput.trim()}
+                disabled={replay.active || isSendingMessage || !chatInput.trim()}
                 onClick={() => {
                   void handleSendMessage();
                 }}

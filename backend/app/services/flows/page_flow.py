@@ -16,6 +16,10 @@ from app.models.entities import (
     RequirementForm,
     ResearchSession,
 )
+from app.services.page_images import materialize_page_images
+from app.services.search_plan import merge_search_results, next_search_round, search_coverage
+from app.services.search_quality import MIN_DIGEST_CHARS
+from app.services.style_cards import get_library_card
 from app.services.tasks import enqueue_batch_action, wake_scheduler
 
 
@@ -85,6 +89,8 @@ class PageFlowMixin:
                     }
                 )
                 run.step_completed("page_search_prepare_queries", "补齐页面搜索词", {"query_count": len(queries)})
+        existing_results = [] if replace_existing else list(page.page_search_results_json or [])
+        search_round = 1 if replace_existing else next_search_round(page.page_search_results_json)
         page.search_status = "running"
         if run is not None:
             run.data_updated(
@@ -105,6 +111,7 @@ class PageFlowMixin:
                 queries=queries,
                 collection=collection,
                 replace_existing=replace_existing,
+                search_round=search_round,
                 run=run,
             )
         else:
@@ -113,8 +120,12 @@ class PageFlowMixin:
                 queries=queries,
                 collection=collection,
                 replace_existing=replace_existing,
+                search_round=search_round,
+                existing_results=existing_results,
                 run=run,
             )
+        if not replace_existing:
+            candidate_sources = merge_search_results(existing_results, candidate_sources)
 
         if run is not None:
             run.step_started("page_search_chunk", "切块入库资料池", "把正文切块，供后续确定性选证据使用。")
@@ -153,6 +164,7 @@ class PageFlowMixin:
         page.current_research_session_id = session.id
         page.page_search_results_json = candidate_sources
         page.page_corpus_digest_json = digest
+        page.page_images_json = self._refresh_page_images(project, page)
         page.search_status = "ready" if digest.get("document_count") else "failed"
         page.summary_status = "stale" if page.page_summary_md else "empty"
         page.draft_status = "stale" if page.current_draft_version_id else "empty"
@@ -178,7 +190,15 @@ class PageFlowMixin:
                 },
             )
         self.session.flush()
-        return {"query_count": len(queries), "result_count": len(candidate_sources), **digest}
+        coverage = search_coverage(queries, candidate_sources)
+        return {
+            "query_count": len(queries),
+            "result_count": len(candidate_sources),
+            "search_round": search_round,
+            "dimension_count": coverage["dimension_count"],
+            "latest_round_hits": coverage["latest_round_hits"],
+            **digest,
+        }
 
     def _build_page_search_intent(
         self,
@@ -206,6 +226,7 @@ class PageFlowMixin:
         queries: list[dict[str, str]],
         collection,
         replace_existing: bool,
+        search_round: int,
         run,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         if run is not None:
@@ -214,20 +235,23 @@ class PageFlowMixin:
                 "让搜索模型整理该页资料",
                 "一次调用搜索模型，把整理稿写入本页资料池，不再重新抓取网页。",
             )
+        from app.services.search_quality import require_reachable_sources
+
         intent = self._build_page_search_intent(page, queries)
+        # search_web_digest 已完成整理稿质量校验与一次重试，这里拿到的必定是合格正文。
         digest = self.research.mcp.search_web_digest(intent, limit=8)
-        answer = (digest.answer or "").strip()
-        if not answer or answer == "没有检索结果":
-            raise RuntimeError("搜索模型没有返回整理稿。请确认该模型已开启实时搜索，或改用博查 Key。")
+        answer = digest.answer
+        live_sources = require_reachable_sources(digest.items, raw_excerpt=answer)
         brief = self._get_current_brief(page)
         candidate_sources, pending_chunk_records = self.research.ingest_llm_answer(
             collection=collection,
             page=page,
             answer=answer,
-            sources=digest.items,
+            sources=live_sources,
             query_text=intent,
             page_title=brief.title if brief else page.page_code,
             replace=replace_existing,
+            search_round=search_round,
         )
         candidate_sources = self.research.refresh_search_result_cards(candidate_sources)
         page.page_search_results_json = candidate_sources
@@ -243,7 +267,7 @@ class PageFlowMixin:
             run.step_completed(
                 "page_search_digest",
                 "让搜索模型整理该页资料",
-                {"result_count": len(candidate_sources), "has_digest": True},
+                {"result_count": len(candidate_sources), "digest_chars": len(answer)},
             )
         return candidate_sources, pending_chunk_records
 
@@ -254,13 +278,15 @@ class PageFlowMixin:
         queries: list[dict[str, str]],
         collection,
         replace_existing: bool,
+        search_round: int,
+        existing_results: list[dict[str, Any]],
         run,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         if run is not None:
             run.step_started("page_search_bocha", "执行 Bocha 搜索", "先获取搜索摘要结果，再决定后续抓取。")
 
         def on_query_completed(payload: dict[str, Any]) -> None:
-            page.page_search_results_json = payload["items"]
+            page.page_search_results_json = merge_search_results(existing_results, payload["items"])
             if run is not None:
                 run.data_updated(
                     {
@@ -270,6 +296,7 @@ class PageFlowMixin:
                         "query_index": payload["query_index"],
                         "query_total": payload["query_total"],
                         "result_count": payload["result_count"],
+                        "search_round": search_round,
                     }
                 )
                 run.step_progress(
@@ -286,6 +313,7 @@ class PageFlowMixin:
         search_results = self.research.search_query_summaries(
             queries,
             limit_per_query=4,
+            search_round=search_round,
             on_query_completed=on_query_completed if run is not None else None,
         )
         if run is not None:
@@ -353,9 +381,25 @@ class PageFlowMixin:
         brief = self._get_current_brief(page)
         if not brief:
             raise RuntimeError("页面结构不存在")
-        if not page.page_corpus_digest_json.get("document_count"):
+        digest = page.page_corpus_digest_json or {}
+        if not digest.get("document_count"):
             raise RuntimeError("当前页资料池为空，不能生成 summary")
+        if "content_chars" not in digest:
+            # 本字段是后加的，老资料池没有。惰性补算而不是一律拦死——
+            # 否则资料池本身完好的历史页面也会被迫全量重搜。
+            collection = self.research.get_or_create_page_collection(project, page)
+            digest = self.research.build_collection_digest(collection.id)
+            page.page_corpus_digest_json = digest
+        corpus_chars = int(digest.get("content_chars") or 0)
+        if corpus_chars < MIN_DIGEST_CHARS:
+            raise RuntimeError(
+                f"当前页资料池正文仅 {corpus_chars} 字（下限 {MIN_DIGEST_CHARS}），"
+                "不足以生成 summary，请先重跑检索"
+            )
         page.summary_status = "running"
+        # 摘要 LLM 调用耗时长，状态位必须先落库：否则 worker 中途死亡会回滚成 empty，
+        # 而 tasks.py 的两条恢复路径都以 == "running" 为触发条件，永远兜不住。
+        self.session.commit()
         query_plan = page.page_search_queries_json or [
             {
                 "query_text": f"{brief.title} {' '.join(brief.content_outline_json)}".strip(),
@@ -413,11 +457,13 @@ class PageFlowMixin:
             summary_source = "outline_brief"
         if not summary_md:
             raise RuntimeError("当前页 summary 为空，不能生成策划稿")
+        self._ensure_page_images(project, page)
         self._set_project_stage_at_least(project, "draft")
         page_context = {
             "page": {
                 "page_id": page.id,
                 "page_code": page.page_code,
+                "page_role": page.page_role,
                 "page_brief_version_id": brief.id,
                 "title": brief.title,
                 "content_outline": brief.content_outline_json,
@@ -427,9 +473,11 @@ class PageFlowMixin:
                 "summary_md": summary_md,
                 "selected_sources": page.page_summary_citations_json,
             },
+            "page_images": page.page_images_json or [],
             "latest_instruction": latest_instruction,
         }
-        svg = self.generator.generate_draft_svg(page_context=page_context)
+        plan = self.generator.generate_content_plan(page_context=page_context)
+        svg = self.generator.generate_draft_svg(page_context=page_context, content_plan=plan)
         version_no = (self.session.scalar(select(func.count(DraftVersion.id)).where(DraftVersion.page_id == page.id)) or 0) + 1
         draft = DraftVersion(
             project_id=project.id,
@@ -439,6 +487,7 @@ class PageFlowMixin:
             page_brief_version_id=brief.id,
             research_session_id=page.current_research_session_id,
             draft_svg_markup=svg,
+            content_plan_json=plan,
         )
         self.session.add(draft)
         self.session.flush()
@@ -460,10 +509,22 @@ class PageFlowMixin:
         if not project.style_preset:
             raise RuntimeError("style_preset 未设置，不能生成设计稿")
         self._set_project_stage_at_least(project, "design")
+        page_count = self.session.scalar(select(func.count(ProjectPage.id)).where(ProjectPage.project_id == project.id)) or 1
+        brief = self._get_current_brief(page)
+        plan = draft.content_plan_json if isinstance(draft.content_plan_json, dict) else {}
         svg = self.generator.generate_design_svg(
             draft_svg=draft.draft_svg_markup,
             style_pack_id=project.style_preset,
             background_asset_path=project.background_asset_path,
+            content_plan=plan,
+            page_images=page.page_images_json or [],
+            frozen_card=self._frozen_style_card(project) or get_library_card(self.session, str(project.style_preset or "")),
+            chrome={
+                "page_title": str(plan.get("title") or (brief.title if brief else page.page_code)),
+                "page_index": page.sort_order,
+                "page_count": int(page_count),
+                "page_role": page.page_role,
+            },
         )
         version_no = (self.session.scalar(select(func.count(DesignVersion.id)).where(DesignVersion.page_id == page.id)) or 0) + 1
         design = DesignVersion(
@@ -533,7 +594,8 @@ class PageFlowMixin:
                     }
                 )
                 run.step_completed(action_type, step_name, {"query_count": len(page.page_search_queries_json)})
-                message = f"已为当前页生成 {len(page.page_search_queries_json)} 条搜索词。下一步可以直接执行正式搜索。"
+                coverage = search_coverage(page.page_search_queries_json or [], [])
+                message = f"已为当前页生成 {len(page.page_search_queries_json)} 条搜索词，{coverage['dimension_count']} 组维度。下一步可以直接执行正式搜索。"
             elif action_type in {"page_search_run", "page_search_refresh"}:
                 step_name = "执行页面搜索"
                 result_snapshot = self._run_page_search(
@@ -543,7 +605,13 @@ class PageFlowMixin:
                     replace_existing=replace_existing or action_type == "page_search_refresh",
                     run=run,
                 )
-                message = "当前页资料池已更新。系统没有自动生成 summary，你可以继续手动生成 summary。"
+                message = (
+                    f"第 {result_snapshot.get('search_round', 1)} 轮检索完成，"
+                    f"本轮 {result_snapshot.get('latest_round_hits', result_snapshot.get('result_count', 0))} 条，"
+                    f"累计 {result_snapshot.get('result_count', 0)} 条，"
+                    f"{result_snapshot.get('dimension_count', 0)} 组维度。"
+                    "系统没有自动生成 summary，你可以继续手动生成 summary。"
+                )
             elif action_type == "page_summary_generate":
                 step_name = "生成页面 summary"
                 run.step_started(action_type, step_name, "只从当前页资料池内召回并生成摘要。")
@@ -605,4 +673,20 @@ class PageFlowMixin:
         run.set_recommendations(self._default_recommendations_for_action(action_type))
         self._persist_agent_message(run=run, content_md=message, result_snapshot=result_snapshot)
         run.complete()
+
+    def _refresh_page_images(self, project: Project, page: ProjectPage) -> list[dict[str, Any]]:
+        extra = []
+        if project.requirement_form:
+            extra = project.requirement_form.init_search_results_json or []
+        return materialize_page_images(
+            project_id=project.id,
+            page_id=page.id,
+            search_results=page.page_search_results_json or [],
+            extra_results=extra,
+        )
+
+    def _ensure_page_images(self, project: Project, page: ProjectPage) -> None:
+        if page.page_images_json:
+            return
+        page.page_images_json = self._refresh_page_images(project, page)
 

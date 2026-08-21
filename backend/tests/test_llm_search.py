@@ -187,9 +187,9 @@ def test_search_results_as_evidence_keeps_digest_excerpt(db_session):
             },
         ]
     )
-    assert evidence[0]["excerpt_md"] == "这是模型整理稿正文，应进入大纲。"
-    assert evidence[1]["title"] == "https://example.com/only-url"
-    assert evidence[1]["excerpt_md"] == "https://example.com/only-url"
+    assert all(not item["url"].startswith("llm-search://") for item in evidence)
+    assert evidence[0]["title"] == "https://example.com/only-url"
+    assert evidence[0]["excerpt_md"] == "https://example.com/only-url"
 
 
 def test_select_evidence_llm_answer_raises_chunk_cap(db_session):

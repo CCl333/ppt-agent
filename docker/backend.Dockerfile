@@ -9,6 +9,7 @@ RUN apt-get update \
     && fc-cache -f
 
 COPY backend /app/backend
+COPY fonts /app/fonts
 
 RUN pip install --no-cache-dir -e /app/backend \
     && python -c "import fitz, pptx; print('pymupdf', fitz.version)"

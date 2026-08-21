@@ -22,6 +22,14 @@ def get_outline(
     return service.get_outline(project_id)
 
 
+@router.post("/outline:retry")
+def retry_outline(
+    project_id: str,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.retry_outline(project_id)
+
+
 @router.patch("/outline/storyboard")
 def patch_storyboard(
     project_id: str,

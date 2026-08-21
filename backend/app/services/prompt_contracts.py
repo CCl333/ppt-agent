@@ -9,22 +9,30 @@ PROMPT_TEXTS: dict[str, str] = {
 你是 AI PPT 工作区的检索词生成器。
 
 任务：
-1. 根据给定作用域与目标，生成 3 到 6 条可直接用于联网搜索的查询。
-2. 每条查询都必须说明用途。
-3. 只输出严格 JSON。
+1. 先列出 3 到 6 个调研维度，覆盖选题的不同侧面（例如空间分布、规则政策、交通接驳、成本预算、历史文化）。
+2. 再为每个维度生成 1 到 3 条可直接用于联网搜索的查询。
+3. 每条查询都必须说明用途。
+4. 只输出严格 JSON。
 
 规则：
 1. 不要输出“检索计划”“后续再判断”这类空话。
 2. 查询必须短、可执行、可直接提交给搜索引擎。
-3. 初始化阶段侧重主题、趋势、案例、证据。
+3. 初始化阶段侧重主题、趋势、案例、证据，维度之间不要重复。
 4. 页面阶段必须只服务当前页，不得把别页职责混进来。
+5. 维度名要短、可展示、互不重叠。
 
 输出格式：
 {
-  "queries": [
+  "dimensions": [
     {
-      "query_text": "字符串",
-      "query_purpose": "说明这条 query 用来补哪类信息"
+      "id": "tickets",
+      "name": "门票预约规则",
+      "queries": [
+        {
+          "query_text": "字符串",
+          "query_purpose": "说明这条 query 用来补哪类信息"
+        }
+      ]
     }
   ]
 }
@@ -52,15 +60,16 @@ PROMPT_TEXTS: dict[str, str] = {
 你是 AI PPT 初始化阶段的快速问题生成器。
 
 任务：
-1. 只基于首轮 Bocha 搜索摘要，快速生成页数推荐和首轮补充问题。
+1. 只基于首轮 Bocha 搜索摘要，快速生成页数推荐、封面标题候选项和少量补充问题。
 2. 不要假装已经读过全文。
 3. 只输出严格 JSON。
 
 规则：
 1. 必须给出 3 个页数候选项，分别适合简洁、标准、展开。
-2. 问题数量 2 到 4 个。
-3. 每个问题必须有恰好 3 个具体候选项，且允许用户自定义。
-4. 不要生成 style_preset 和背景图问题，这些在固定项里单独处理。
+2. 必须给出 3 个封面标题候选项 working_title_options：8 到 24 字，像演示文稿封面，禁止需求口吻（禁止「请」「帮我生成」「约 N 页」）。
+3. 不要生成受众、场合、时长、标题、style_preset、背景图问题，这些由系统固定收集。
+4. 可额外生成 0 到 2 个与主题相关的补充问题。
+5. 每个额外问题必须有恰好 3 个具体候选项，且允许用户自定义。
 
 输出格式：
 {
@@ -72,15 +81,16 @@ PROMPT_TEXTS: dict[str, str] = {
       "reason": "适合什么场景"
     }
   ],
+  "working_title_options": ["封面标题候选项"],
   "ai_questions": [
     {
-      "question_code": "audience_focus",
-      "label": "这份 PPT 更要打动谁",
+      "question_code": "depth_focus",
+      "label": "更想强调哪一类信息",
       "description": "这个问题为什么重要",
       "options": [
-        {"option_code": "A", "label": "管理层"},
-        {"option_code": "B", "label": "业务负责人"},
-        {"option_code": "C", "label": "执行团队"}
+        {"option_code": "A", "label": "候选项 A"},
+        {"option_code": "B", "label": "候选项 B"},
+        {"option_code": "C", "label": "候选项 C"}
       ],
       "allow_custom": true
     }
@@ -106,11 +116,12 @@ PROMPT_TEXTS: dict[str, str] = {
 3. 只输出严格 JSON。
 
 规则：
-1. 问题数量 2 到 4 个。
-2. 每个问题必须有恰好 3 个具体候选项，且允许用户自定义。
-3. 不要生成 style_preset 和背景图问题。
-4. 如果用户要求删除某个问题，结果里不要再保留它。
+1. 不要生成受众、场合、时长、标题、style_preset、背景图问题；系统会补回固定澄清项。
+2. 可额外保留或生成 0 到 2 个与主题相关的补充问题。
+3. 每个额外问题必须有恰好 3 个具体候选项，且允许用户自定义。
+4. 如果用户要求删除某个非固定问题，结果里不要再保留它。
 5. 页数推荐可以沿用现有选项；只有证据明显要求调整时才改。
+6. 可以给出 3 个新的 working_title_options；没有把握时省略，系统会沿用现有标题候选项。
 
 输出格式：
 {
@@ -122,15 +133,16 @@ PROMPT_TEXTS: dict[str, str] = {
       "reason": "适合什么场景"
     }
   ],
+  "working_title_options": ["封面标题候选项"],
   "ai_questions": [
     {
-      "question_code": "audience_focus",
-      "label": "这份 PPT 更要打动谁",
+      "question_code": "depth_focus",
+      "label": "更想强调哪一类信息",
       "description": "这个问题为什么重要",
       "options": [
-        {"option_code": "A", "label": "管理层"},
-        {"option_code": "B", "label": "业务负责人"},
-        {"option_code": "C", "label": "执行团队"}
+        {"option_code": "A", "label": "候选项 A"},
+        {"option_code": "B", "label": "候选项 B"},
+        {"option_code": "C", "label": "候选项 C"}
       ],
       "allow_custom": true
     }
@@ -155,8 +167,12 @@ PROMPT_TEXTS: dict[str, str] = {
 你是 AI PPT 项目的大纲架构师。你的任务是根据项目主题、需求确认结果和当前选定的初始化上下文，生成一份逻辑清晰、适合演示表达的 PPT 大纲。
 
 规则：
-1. 只输出严格 JSON，不要输出解释、Markdown 代码块或额外文本。
-2. 输出必须使用 [PPT_OUTLINE] 和 [/PPT_OUTLINE] 包裹。
+1. 你是极度严格的 JSON 机器，只输出合法 JSON，不要有任何解释、Markdown、代码块、思考过程。
+2. 必须严格遵守下面格式：
+   - 顶层必须是 {"ppt_outline": {...}}，禁止把 cover / table_of_contents / parts / end_page 直接放在顶层。
+   - 禁止用 PPT_OUTLINE、outline 等其它键名替代 ppt_outline。
+   - 可以用 [PPT_OUTLINE] 和 [/PPT_OUTLINE] 包裹整段 JSON，但标签只是外壳，不能代替 ppt_outline 字段。
+   - 绝对禁止输出 ```json、``` 或其它 Markdown 包裹。
 3. 结果必须完全符合固定 JSON 结构，顶层只允许出现 `ppt_outline`。
 4. 大纲必须包含封面、目录、正文章节和收尾页。
 5. 正文章节必须围绕明确的主线展开，章节顺序要有递进关系，不能只是松散罗列信息。
@@ -167,9 +183,10 @@ PROMPT_TEXTS: dict[str, str] = {
 10. 只使用输入中能够支持的信息组织内容，不要编造不存在的数字、案例、结论或来源。
 11. 如果主题复杂但页数有限，优先保证主线清晰和页面分工明确，而不是堆砌章节。
 12. `cover.content` 和 `end_page.content` 可以为空数组；如果填写，也只能保留极少量短词。
+13. `cover.title` 必须使用输入 answers.working_title（若已填写且像标题）；不要把用户原始需求口吻当封面标题。
+14. 受众、场合、时长必须体现在封面副标题或内容组织上，不要忽略这些澄清答案。
 
 输出格式：
-[PPT_OUTLINE]
 {
   "ppt_outline": {
     "cover": {
@@ -198,7 +215,6 @@ PROMPT_TEXTS: dict[str, str] = {
     }
   }
 }
-[/PPT_OUTLINE]
 """.strip(),
     "outline.generate.user": """
 任务：生成 PPT 大纲。
@@ -218,22 +234,30 @@ PROMPT_TEXTS: dict[str, str] = {
 你是 AI PPT 页级搜索词生成器。
 
 任务：
-1. 把当前页结构化需求翻译成 3 到 6 条可直接提交给 Bocha 的搜索词。
-2. 每条 query 必须说明用途。
-3. 只输出严格 JSON。
+1. 先为当前页列出 2 到 5 个调研维度。
+2. 再把当前页结构化需求翻译成每个维度 1 到 3 条可直接提交给搜索引擎的查询。
+3. 每条 query 必须说明用途。
+4. 只输出严格 JSON。
 
 规则：
 1. 这不是联网搜索。
-2. 只允许输出 `page_search_queries`。
+2. 只允许输出 `dimensions`。
 3. 不能写“检索计划”“后续自动判断”这类空话。
 4. 必须参考全量大纲快照，避免和其他页职责冲突。
+5. 维度名要短、可展示、只服务当前页。
 
 输出格式：
 {
-  "page_search_queries": [
+  "dimensions": [
     {
-      "query_text": "字符串",
-      "query_purpose": "定义类 | 数据类 | 时间趋势类 | 对比类 | 案例类 | 证据类"
+      "id": "evidence",
+      "name": "核心证据",
+      "queries": [
+        {
+          "query_text": "字符串",
+          "query_purpose": "定义类 | 数据类 | 时间趋势类 | 对比类 | 案例类 | 证据类"
+        }
+      ]
     }
   ]
 }
@@ -446,14 +470,113 @@ PROMPT_TEXTS: dict[str, str] = {
   "page_context": {{page_context_json}}
 }
 """.strip(),
+    "plan.page_generate.system": """
+你是 AI PPT 的单页内容策划。只输出严格 JSON，不输出 SVG，不定版式。
+
+任务：把这一页观众将读到的全部文案定稿。下游只负责排版，不再发明句子。
+
+规则：
+1. 所有展示给观众的句子必须写进 JSON：title / subtitle / badge / blocks.label / blocks.note / footer。
+2. 优先使用研究摘要与大纲中的证据，不得编造摘要里没有的事实、年份、ROI、时间轴或新章节。
+3. 封面、目录、结尾也必须给出完整文案，不能留空让下游去编。
+4. 演讲人与日期用占位符，例如 `[您的姓名/团队名称]`、`202X年X月X日`。
+5. 内容页 blocks 至少 2 条；每条必须有非空 label。
+6. 不要写布局、颜色、字体或 SVG。
+7. 如果输入 page_images 非空，必须从中选出 1 到 2 张写入 image_slots；image_id 必须来自目录，禁止编造。
+8. 如果 page_images 为空，不要写 image_slots。
+
+输出格式：
+{
+  "page_code": "cover",
+  "title": "页面主标题",
+  "subtitle": "副标题，可空字符串",
+  "badge": "角标，可空字符串",
+  "blocks": [
+    {"role": "value_point", "label": "要点标题", "note": "一句解释"}
+  ],
+  "footer": {"presenter": "[您的姓名/团队名称]", "date": "202X年X月X日"},
+  "image_slots": [
+    {"image_id": "IMG-1", "label": "配图用途", "placement": "hero"}
+  ]
+}
+""".strip(),
+    "plan.page_generate.user": """
+任务：为当前页生成内容策划稿。
+
+输入数据(JSON)：
+{
+  "page": {
+    "page_id": "{{page_id}}",
+    "page_code": "{{page_code}}",
+    "page_role": "{{page_role}}",
+    "title": "{{title}}",
+    "content_outline": {{content_outline_json}},
+    "content_summary": "{{content_summary}}"
+  },
+  "summary": {
+    "summary_md": "{{summary_md}}",
+    "selected_sources": {{selected_sources_json}}
+  },
+  "page_images": {{page_images_json}},
+  "latest_instruction": "{{latest_instruction}}"
+}
+""".strip(),
+    "style.card_generate.system": """
+你是 AI PPT 的风格卡策划。只输出严格 JSON，不输出 SVG。
+
+任务：根据选题生成 1 到 3 张可冻结的风格卡。用户确认后，全稿只能引用这张卡，不能再改色。
+
+规则：
+1. 每张卡必须有独特名字、英文名、理由和 2 到 5 个标签。
+2. 颜色只写在 palette / tokens 里。主色 1 个，中性阶最多 4 个，反白可含 #FFFFFF，点缀最多 2 个；全卡不同 hex 总数不超过 8。
+3. 必须给出 c-bg、c-accent、c-ink-1。c-surface / c-surface-alt / c-ink-2 可省略，系统会推导。
+4. 字体优先 Microsoft YaHei / PingFang SC / Source Han Sans SC / Source Han Serif CN。若用 HarmonyOS Sans SC，必须在 tags 里写「需安装字体」。
+5. 不要写布局，不要发明不在输入里的商业事实。
+6. 固定 chrome 固定为 background、title_bar、page_number。
+
+输出格式：
+{
+  "cards": [
+    {
+      "id": "imperial-heritage",
+      "name": "宫墙红影",
+      "name_en": "Imperial Heritage",
+      "rationale": "一句话说明为什么适合这个选题",
+      "tags": ["故宫红", "极简中式"],
+      "tokens": {
+        "c-bg": "#FDFCFB",
+        "c-accent": "#B0352F",
+        "c-ink-1": "#1A1A1A",
+        "c-ink-2": "#4A4A4A",
+        "t-title": {"size_px": 40, "weight": 700, "family": "Source Han Serif CN"},
+        "t-body": {"size_px": 16, "weight": 400, "family": "Microsoft YaHei"}
+      },
+      "texture": "none",
+      "fixed_chrome": ["background", "title_bar", "page_number"]
+    }
+  ]
+}
+""".strip(),
+    "style.card_generate.user": """
+任务：为当前项目生成风格卡候选。
+
+输入数据(JSON)：
+{
+  "title": "{{title}}",
+  "request_text": "{{request_text}}",
+  "style_hint": "{{style_hint}}",
+  "outline_cover_title": "{{outline_cover_title}}",
+  "page_titles": {{page_titles_json}}
+}
+""".strip(),
     "draft.page_generate.system": """
 内容页使用 Bento Grid 进行信息排布，布局必须由内容本身驱动，而不是先套模板再塞内容。
 
 Bento Grid 规则：
 1. 只输出单个完整 `<svg>...</svg>`。
 2. 画布固定为 `1280x720`。
-3. 必须把输入中的标题、要点和 summary 变成真实内容，不允许占位块、空卡片或“待补充”式假装完成。
-4. 优先使用研究摘要中的证据与结论，不得编造 research 中没有的事实。
+3. 只负责排版。所有可见文案必须逐字来自输入的 content_plan，禁止新增句子、数字、章节或时间轴。
+4. 不得编造 content_plan 与 research 中没有的事实。
 5. 允许基础中性样式，但不允许注入最终风格主题、品牌视觉或复杂装饰。
 6. 卡片数量不固定，可以是 1、2、3、4、5 或更多；布局选择由信息密度、内容类型和主次关系决定，不允许机械套用同一种模板。
 7. 用卡片面积、位置和形状建立层级：最重要的信息必须占据最大或最核心的卡片，次级信息退居侧边、底部或更小卡片。
@@ -473,9 +596,14 @@ Bento Grid 规则：
 15. 避免这些坏味道：所有卡片同尺寸、平均分配主次、卡片过小导致文本挤压、为了对称牺牲信息层级、页面还有大片未利用空间。
 16. 画布必须是 `viewBox="0 0 1280 720"`。
 17. 所有 `<text>` / `<tspan>` 必须设置 `font-family` 为 `"Microsoft YaHei", "PingFang SC", "Noto Sans SC", "Source Han Sans SC", sans-serif`，不要只用 `sans-serif`。
+18. 只允许这些图元：`<rect>`（可含 rx）/ `<circle>` / `<ellipse>` / `<line>` / `<polygon>` / `<path>`（仅 M L H V Z）/ `<text>` + `<tspan>` / `<image>` / `<g>`。
+19. 禁止 `<filter>` 及任何 fe*、`<clipPath>` / `<mask>` / `<pattern>` / `<use>` / `<textPath>` / `<foreignObject>` / 渐变。
+20. `<g>` 只允许 `translate`，禁止 rotate / skew / matrix。
+21. 如果 page_images / content_plan.image_slots 非空，必须用对应 `data-image-id` 放置 `<image>`，禁止编造目录外的图，禁止写 http/file href。
+22. 没有可用配图时不要输出内容 `<image>`。
 """.strip(),
     "draft.page_generate.user": """
-任务：生成目标页初稿。
+任务：按内容策划稿排版，生成目标页 SVG。文案必须逐字使用 content_plan。
 
 输入数据(JSON)：
 {
@@ -491,6 +619,8 @@ Bento Grid 规则：
     "content_outline": {{content_outline_json}},
     "content_summary": "{{content_summary}}"
   },
+  "content_plan": {{content_plan_json}},
+  "page_images": {{page_images_json}},
   "summary": {
     "summary_md": "{{summary_md}}",
     "selected_sources": {{selected_sources_json}}
@@ -505,16 +635,25 @@ Bento Grid 规则：
 1. 在不修改文案、布局主次和阅读顺序的前提下，对 draft SVG 做视觉增强。
 2. 只输出单个完整 `<svg>...</svg>` 文档。
 3. 画布必须保持 `viewBox="0 0 1280 720"`。
-4. 所有 `<text>` / `<tspan>` 必须设置 `font-family` 为 `"Microsoft YaHei", "PingFang SC", "Noto Sans SC", "Source Han Sans SC", sans-serif`。
-5. 背景资源由系统在 SVG 底层合成，不要引用本地文件路径，也不要再画一层全幅背景图；正文必须不透明、可读。
-6. 如果风格表达与内容可读性冲突，优先保留内容可读性。
+4. 颜色只能用输入中给出的 class 令牌，禁止任何字面色值（包括 fill="#..."、stroke="#..."、rgb()、named color、inline style）。
+5. 文本必须带字阶 class：`t-title` / `t-subtitle` / `t-body` / `t-caption` / `t-label`。图形必须带 `c-*` 色板 class。
+6. 不要设置 font-size / font-family / font-weight / fill / stroke 属性，这些由系统按令牌展开。
+7. 背景、标题栏、页码由系统合成。不要画全幅背景矩形，不要引用本地文件路径。内容区从 y=56 到 y=680。
+8. 只允许这些图元：`<rect>`（可含 rx）/ `<circle>` / `<ellipse>` / `<line>` / `<polygon>` / `<path>`（仅 M L H V Z）/ `<text>` + `<tspan>` / `<image>` / `<g>`。
+9. 禁止 `<filter>` 及任何 fe*、渐变、`<clipPath>` / `<mask>` / `<pattern>` / `<use>` / `<textPath>` / `<foreignObject>`。
+10. `<g>` 只允许 `translate`，禁止 rotate / skew / matrix。
+11. 如果风格表达与内容可读性冲突，优先保留内容可读性。
+12. 文案必须与 content_plan 逐字一致，禁止新增或改写任何可见文本。
+13. 必须保留 draft 中的内容 `<image data-image-id>`，不得删除、不得改 data-image-id、不得改成网络地址。
 """.strip(),
     "design.svg_generate.user": """
-任务：生成目标页最终 SVG 设计稿。
+任务：生成目标页最终 SVG 设计稿。文案必须与 content_plan 逐字一致。
 
 输入数据(JSON)：
 {
   "draft_svg": "{{draft_svg_markup}}",
+  "content_plan": {{content_plan_json}},
+  "page_images": {{page_images_json}},
   "canvas_constraints": {
     "width": 1280,
     "height": 720,

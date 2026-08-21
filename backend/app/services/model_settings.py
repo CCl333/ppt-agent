@@ -11,15 +11,27 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.db import get_session_factory
 from app.models.base import new_id, now_utc
-from app.models.entities import ModelBinding, ModelProvider
+from app.models.entities import ModelBinding, ModelProvider, ModelStageSettings
 
 logger = logging.getLogger("ppt_agent.models")
 
-MODEL_ROLES = ("context", "svg", "search")
+MODEL_ROLES = ("search", "content", "draft", "design")
+REQUIRED_STAGE_ROLES = ("content", "draft", "design")
+ROLE_ALIASES = {
+    "context": "content",
+    "svg": "draft",
+}
 ROLE_LABELS = {
-    "context": "文本模型",
-    "svg": "SVG 模型",
-    "search": "搜索模型",
+    "search": "资料检索",
+    "content": "内容策划",
+    "draft": "初稿布局",
+    "design": "最终设计",
+}
+ROLE_HINTS = {
+    "search": "大模型搜索与检索词生成；博查 / Tavily 模式下可留空",
+    "content": "大纲、summary、内容策划、风格卡、路由决策",
+    "draft": "策划稿 SVG",
+    "design": "设计稿 SVG",
 }
 API_PATH_CHAT = "/chat/completions"
 API_PATH_RESPONSES = "/responses"
@@ -38,6 +50,11 @@ def canonicalize_api_path(raw_value: str | None) -> str:
     if value in _ANTHROPIC_PATH_ALIASES:
         return API_PATH_ANTHROPIC
     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"不支持的 API 兼容格式: {value}")
+
+
+def canonicalize_role(role: str) -> str:
+    value = str(role or "").strip()
+    return ROLE_ALIASES.get(value, value)
 
 
 @dataclass(frozen=True)
@@ -89,28 +106,38 @@ def seed_models_from_env(session: Session | None = None) -> None:
         ensure_search_settings(session)
         ensure_reader_settings(session)
         if session.scalar(select(ModelProvider.provider_id).limit(1)):
+            migrate_legacy_bindings(session)
             if owns_session:
                 session.commit()
             return
         settings = get_settings()
         seeds = [
             (
-                "context",
+                "content",
                 settings.context_llm_base_url,
                 settings.context_llm_api_key.get_secret_value() if settings.context_llm_api_key else None,
                 settings.context_llm_model,
                 settings.context_llm_path,
                 settings.context_llm_timeout_seconds,
-                "文本模型（来自 .env）",
+                "内容策划（来自 .env）",
             ),
             (
-                "svg",
+                "draft",
                 settings.svg_llm_base_url,
                 settings.svg_llm_api_key.get_secret_value() if settings.svg_llm_api_key else None,
                 settings.svg_llm_model,
                 settings.svg_llm_path,
                 settings.svg_llm_timeout_seconds,
-                "SVG 模型（来自 .env）",
+                "初稿布局（来自 .env）",
+            ),
+            (
+                "design",
+                settings.svg_llm_base_url,
+                settings.svg_llm_api_key.get_secret_value() if settings.svg_llm_api_key else None,
+                settings.svg_llm_model,
+                settings.svg_llm_path,
+                settings.svg_llm_timeout_seconds,
+                "最终设计（来自 .env）",
             ),
         ]
         created_by_fingerprint: dict[tuple[str, str, str, str], ModelProvider] = {}
@@ -195,6 +222,13 @@ def delete_provider(session: Session, provider_id: str) -> None:
     bindings = list(session.scalars(select(ModelBinding).where(ModelBinding.provider_id == provider_id)))
     for binding in bindings:
         session.delete(binding)
+    stage = session.get(ModelStageSettings, "default")
+    if stage and isinstance(stage.expert_bindings_json, dict):
+        stage.expert_bindings_json = {
+            role: bound_id
+            for role, bound_id in stage.expert_bindings_json.items()
+            if bound_id != provider_id
+        }
     session.delete(provider)
     session.flush()
 
@@ -205,28 +239,40 @@ def list_bindings(session: Session) -> dict[str, Any]:
 
     ensure_search_settings(session)
     ensure_reader_settings(session)
+    migrate_legacy_bindings(session)
+    stage = ensure_stage_settings(session)
     providers = {item.provider_id: item for item in session.scalars(select(ModelProvider))}
     bindings = {item.role: item for item in session.scalars(select(ModelBinding))}
-    items = []
+    items = [_serialize_binding(role, bindings.get(role), providers) for role in MODEL_ROLES]
+    expert_map = dict(stage.expert_bindings_json or {})
+    expert_items = []
     for role in MODEL_ROLES:
-        binding = bindings.get(role)
-        provider = providers.get(binding.provider_id) if binding else None
-        items.append(
+        provider_id = str(expert_map.get(role) or "").strip() or None
+        provider = providers.get(provider_id) if provider_id else None
+        expert_items.append(
             {
                 "role": role,
                 "label": ROLE_LABELS[role],
-                "provider_id": binding.provider_id if binding else None,
+                "hint": ROLE_HINTS[role],
+                "provider_id": provider_id if provider else None,
                 "provider": serialize_provider(provider) if provider else None,
             }
         )
     return {
         "items": items,
-        "needs_setup": _needs_setup(session, items),
+        "needs_setup": _needs_setup(session, items, stage=stage, expert_items=expert_items),
+        "expert_enabled": bool(stage.expert_enabled),
+        "expert_items": expert_items,
     }
 
 
-def upsert_bindings(session: Session, payload: dict[str, str | None]) -> dict[str, Any]:
-    for role, provider_id in payload.items():
+def upsert_bindings(session: Session, payload: dict[str, Any]) -> dict[str, Any]:
+    migrate_legacy_bindings(session)
+    data = dict(payload)
+    expert_enabled = data.pop("expert_enabled", None)
+    expert = data.pop("expert", None)
+    data = _canonicalize_binding_payload(data)
+    for role, provider_id in data.items():
         if role not in MODEL_ROLES:
             raise HTTPException(status_code=422, detail=f"未知角色: {role}")
         if not provider_id:
@@ -236,19 +282,48 @@ def upsert_bindings(session: Session, payload: dict[str, str | None]) -> dict[st
             continue
         _require_provider(session, provider_id)
         session.merge(ModelBinding(role=role, provider_id=provider_id))
+    if expert_enabled is not None or expert is not None:
+        stage = ensure_stage_settings(session)
+        if expert_enabled is not None:
+            stage.expert_enabled = bool(expert_enabled)
+        if expert is not None:
+            if not isinstance(expert, dict):
+                raise HTTPException(status_code=422, detail="专家档绑定必须是对象")
+            current = dict(stage.expert_bindings_json or {})
+            for raw_role, provider_id in _canonicalize_binding_payload(expert).items():
+                if raw_role not in MODEL_ROLES:
+                    raise HTTPException(status_code=422, detail=f"未知角色: {raw_role}")
+                if not provider_id:
+                    current.pop(raw_role, None)
+                    continue
+                _require_provider(session, str(provider_id))
+                current[raw_role] = str(provider_id)
+            stage.expert_bindings_json = current
+        session.flush()
     session.flush()
     return list_bindings(session)
 
 
 def snapshot_bound_provider(role: str) -> ProviderSnapshot | None:
-    if role not in MODEL_ROLES:
+    canonical = canonicalize_role(role)
+    if canonical not in MODEL_ROLES:
         return None
     session = get_session_factory()()
     try:
-        binding = session.get(ModelBinding, role)
-        if binding is None:
+        stage = session.get(ModelStageSettings, "default")
+        provider_id = None
+        if stage and stage.expert_enabled:
+            provider_id = str((stage.expert_bindings_json or {}).get(canonical) or "").strip() or None
+        else:
+            binding = session.get(ModelBinding, canonical)
+            if binding is None and canonical == "content":
+                binding = session.get(ModelBinding, "context")
+            elif binding is None and canonical in {"draft", "design"}:
+                binding = session.get(ModelBinding, "svg")
+            provider_id = binding.provider_id if binding else None
+        if not provider_id:
             return None
-        provider = session.get(ModelProvider, binding.provider_id)
+        provider = session.get(ModelProvider, provider_id)
         if provider is None:
             return None
         return ProviderSnapshot(
@@ -265,6 +340,20 @@ def snapshot_bound_provider(role: str) -> ProviderSnapshot | None:
         session.close()
 
 
+def expert_mode_enabled() -> bool:
+    try:
+        session = get_session_factory()()
+    except Exception:
+        return False
+    try:
+        stage = session.get(ModelStageSettings, "default")
+        return bool(stage and stage.expert_enabled)
+    except Exception:
+        return False
+    finally:
+        session.close()
+
+
 def get_provider(session: Session, provider_id: str) -> ModelProvider:
     return _require_provider(session, provider_id)
 
@@ -276,11 +365,78 @@ def _require_provider(session: Session, provider_id: str) -> ModelProvider:
     return provider
 
 
-def _needs_setup(session: Session, items: list[dict[str, Any]]) -> bool:
+def _needs_setup(
+    session: Session,
+    items: list[dict[str, Any]],
+    *,
+    stage: ModelStageSettings,
+    expert_items: list[dict[str, Any]],
+) -> bool:
     by_role = {item["role"]: item["provider_id"] for item in items}
-    if not by_role.get("context") or not by_role.get("svg"):
+    if any(not by_role.get(role) for role in REQUIRED_STAGE_ROLES):
         return True
+    if stage.expert_enabled:
+        expert_by_role = {item["role"]: item["provider_id"] for item in expert_items}
+        if any(not expert_by_role.get(role) for role in REQUIRED_STAGE_ROLES):
+            return True
     from app.services.reader_settings import reader_is_ready
     from app.services.search_settings import search_is_ready
 
     return not search_is_ready(session) or not reader_is_ready(session)
+
+
+def ensure_stage_settings(session: Session) -> ModelStageSettings:
+    row = session.get(ModelStageSettings, "default")
+    if row is None:
+        row = ModelStageSettings(id="default", expert_enabled=False, expert_bindings_json={})
+        session.add(row)
+        session.flush()
+    return row
+
+
+def migrate_legacy_bindings(session: Session) -> None:
+    bindings = {item.role: item for item in session.scalars(select(ModelBinding))}
+    copies: list[tuple[str, str]] = []
+    if "content" not in bindings and "context" in bindings:
+        copies.append(("content", bindings["context"].provider_id))
+    if "draft" not in bindings and "svg" in bindings:
+        copies.append(("draft", bindings["svg"].provider_id))
+    if "design" not in bindings:
+        source_id = None
+        if "svg" in bindings:
+            source_id = bindings["svg"].provider_id
+        elif "draft" in bindings:
+            source_id = bindings["draft"].provider_id
+        elif any(role == "draft" for role, _provider_id in copies):
+            source_id = next(provider_id for role, provider_id in copies if role == "draft")
+        if source_id:
+            copies.append(("design", source_id))
+    if not copies:
+        return
+    for role, provider_id in copies:
+        session.merge(ModelBinding(role=role, provider_id=provider_id))
+    session.flush()
+
+
+def _canonicalize_binding_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    data = dict(payload)
+    if "content" not in data and "context" in data:
+        data["content"] = data.pop("context")
+    else:
+        data.pop("context", None)
+    if "svg" in data:
+        svg_value = data.pop("svg")
+        data.setdefault("draft", svg_value)
+        data.setdefault("design", svg_value)
+    return data
+
+
+def _serialize_binding(role: str, binding: ModelBinding | None, providers: dict[str, ModelProvider]) -> dict[str, Any]:
+    provider = providers.get(binding.provider_id) if binding else None
+    return {
+        "role": role,
+        "label": ROLE_LABELS[role],
+        "hint": ROLE_HINTS[role],
+        "provider_id": binding.provider_id if binding else None,
+        "provider": serialize_provider(provider) if provider else None,
+    }

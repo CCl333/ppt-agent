@@ -50,6 +50,12 @@ def apply_cjk_fonts(svg_markup: str) -> str:
 
 
 def embed_background_image(svg_markup: str, image_path: str | Path) -> str:
+    root = _parse_svg(_ensure_svg_xmlns(svg_markup))
+    root.insert(0, _background_image_element(image_path))
+    return _serialize_svg(root)
+
+
+def _background_image_element(image_path: str | Path) -> ET.Element:
     path = Path(image_path)
     if not path.is_file():
         raise RuntimeError(f"背景图不存在: {image_path}")
@@ -60,7 +66,6 @@ def embed_background_image(svg_markup: str, image_path: str | Path) -> str:
     if not data:
         raise RuntimeError(f"背景图为空: {image_path}")
     href = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
-    root = _parse_svg(_ensure_svg_xmlns(svg_markup))
     image = ET.Element(f"{{{SVG_NS}}}image")
     image.set("href", href)
     image.set(f"{{{XLINK_NS}}}href", href)
@@ -69,15 +74,115 @@ def embed_background_image(svg_markup: str, image_path: str | Path) -> str:
     image.set("width", str(CANVAS_WIDTH))
     image.set("height", str(CANVAS_HEIGHT))
     image.set("preserveAspectRatio", "xMidYMid slice")
-    root.insert(0, image)
+    return image
+
+
+def inject_fixed_chrome(
+    svg_markup: str,
+    *,
+    tokens: dict[str, dict[str, str]],
+    background_path: str | Path | None = None,
+    page_title: str = "",
+    page_index: int = 1,
+    page_count: int = 1,
+    page_role: str = "content",
+) -> str:
+    root = _parse_svg(_ensure_svg_xmlns(svg_markup))
+    layers: list[ET.Element] = []
+    bg = _token_attrs(tokens, "c-bg")
+    bg_rect = ET.Element(f"{{{SVG_NS}}}rect")
+    bg_rect.set("x", "0")
+    bg_rect.set("y", "0")
+    bg_rect.set("width", str(CANVAS_WIDTH))
+    bg_rect.set("height", str(CANVAS_HEIGHT))
+    bg_rect.set("fill", bg.get("fill") or "#FFFFFF")
+    bg_rect.set("data-chrome", "background")
+    layers.append(bg_rect)
+
+    if background_path:
+        image = _background_image_element(background_path)
+        image.set("data-chrome", "texture")
+        layers.append(image)
+
+    skip_title_bar = page_role in {"cover", "end"}
+    if not skip_title_bar:
+        accent = _token_attrs(tokens, "c-accent")
+        bar = ET.Element(f"{{{SVG_NS}}}rect")
+        bar.set("x", "0")
+        bar.set("y", "0")
+        bar.set("width", str(CANVAS_WIDTH))
+        bar.set("height", "8")
+        bar.set("fill", accent.get("fill") or "#111111")
+        bar.set("data-chrome", "title_bar")
+        layers.append(bar)
+        caption = _token_attrs(tokens, "t-caption")
+        if page_title.strip():
+            title = ET.Element(f"{{{SVG_NS}}}text")
+            title.set("x", "48")
+            title.set("y", "36")
+            title.text = page_title.strip()
+            title.set("data-chrome", "page_title")
+            for key, value in caption.items():
+                title.set(key, value)
+            layers.append(title)
+
+    if page_role != "cover":
+        caption = _token_attrs(tokens, "t-caption")
+        number = ET.Element(f"{{{SVG_NS}}}text")
+        number.set("x", "1232")
+        number.set("y", "700")
+        number.set("text-anchor", "end")
+        number.text = f"{page_index} / {page_count}"
+        number.set("data-chrome", "page_number")
+        for key, value in caption.items():
+            number.set(key, value)
+        layers.append(number)
+
+    for index, layer in enumerate(layers):
+        root.insert(index, layer)
     return _serialize_svg(root)
 
 
-def prepare_page_svg(svg_markup: str, background_path: str | Path | None = None) -> str:
-    svg = apply_cjk_fonts(extract_and_validate_svg(svg_markup))
+def prepare_page_svg(
+    svg_markup: str,
+    background_path: str | Path | None = None,
+    *,
+    stage: str = "draft",
+    style_pack: dict | None = None,
+    chrome: dict | None = None,
+    page_images: list | None = None,
+) -> str:
+    from app.services.page_images import resolve_image_refs
+    from app.services.style_tokens import build_token_map
+    from app.services.svg_contract import expand_token_classes, validate_svg_contract
+
+    svg = extract_and_validate_svg(svg_markup)
+    validate_svg_contract(svg, stage=stage, style_pack=style_pack)
+    svg = resolve_image_refs(svg, page_images)
+    if stage == "design":
+        if style_pack is None:
+            raise RuntimeError("设计稿缺少 style_pack")
+        svg = expand_token_classes(svg, style_pack)
+        svg = apply_cjk_fonts(svg)
+        chrome = chrome or {}
+        svg = inject_fixed_chrome(
+            svg,
+            tokens=build_token_map(style_pack.get("palette"), style_pack.get("typography")),
+            background_path=background_path,
+            page_title=str(chrome.get("page_title") or ""),
+            page_index=int(chrome.get("page_index") or 1),
+            page_count=int(chrome.get("page_count") or 1),
+            page_role=str(chrome.get("page_role") or "content"),
+        )
+        return svg
+    svg = apply_cjk_fonts(svg)
     if background_path:
         svg = embed_background_image(svg, background_path)
     return svg
+
+
+def _token_attrs(tokens: dict[str, dict[str, str]], name: str) -> dict[str, str]:
+    return dict(tokens.get(name) or {})
 
 
 def canvas_size(svg_markup: str) -> tuple[float, float]:
