@@ -58,10 +58,37 @@ def test_build_pptx_rejects_unknown_element(tmp_path: Path):
         )
 
 
-def test_build_pptx_rejects_tspan_coordinates(tmp_path: Path):
-    svg = '<svg viewBox="0 0 1280 720"><text x="10" y="20">a<tspan x="30" y="40">b</tspan></text></svg>'
-    with pytest.raises(RuntimeError, match="tspan"):
-        build_pptx([("page-01", svg)], tmp_path / "tspan.pptx", mode="shapes")
+def test_build_pptx_emits_tspan_coordinates_as_native_text(tmp_path: Path):
+    svg = """
+    <svg viewBox="0 0 1280 720">
+      <text x="10" y="20" font-size="16" fill="#111111">a<tspan x="30" y="40">b</tspan></text>
+    </svg>
+    """
+    export_path = tmp_path / "tspan.pptx"
+    build_pptx([("page-01", svg)], export_path, mode="shapes")
+    with zipfile.ZipFile(export_path) as archive:
+        slide = archive.read("ppt/slides/slide1.xml").decode("utf-8")
+        assert "<a:t>a</a:t>" in slide
+        assert "<a:t>b</a:t>" in slide
+
+
+def test_build_pptx_emits_wrapped_tspans_inside_translated_group(tmp_path: Path):
+    svg = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+      <g transform="translate(200,80)">
+        <text x="10" y="20" font-size="16" fill="#111111">
+          <tspan x="14" dy="0">hello</tspan>
+          <tspan x="14" dy="22">world</tspan>
+        </text>
+      </g>
+    </svg>
+    """
+    export_path = tmp_path / "wrap.pptx"
+    build_pptx([("page-01", svg)], export_path, mode="shapes")
+    with zipfile.ZipFile(export_path) as archive:
+        slide = archive.read("ppt/slides/slide1.xml").decode("utf-8")
+        assert "<a:t>hello</a:t>" in slide
+        assert "<a:t>world</a:t>" in slide
 
 
 def test_build_pptx_rejects_file_image_href(tmp_path: Path):

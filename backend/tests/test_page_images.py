@@ -66,6 +66,27 @@ def test_resolve_and_assert_image_refs():
     assert_svg_uses_images(resolved, catalog, [{"image_id": "IMG-1"}])
 
 
+def test_draft_does_not_require_images_when_catalog_exists():
+    catalog = [{"image_id": "IMG-1"}]
+    svg = """
+    <svg viewBox="0 0 1280 720">
+      <g data-image-slot-id="IMG-1">
+        <rect x="40" y="80" width="400" height="240" fill="none" stroke="#999" stroke-dasharray="6 4"/>
+        <text x="50" y="200">景点现场示意图</text>
+      </g>
+    </svg>
+    """
+    assert_svg_uses_images(svg, catalog, [{"image_id": "IMG-1"}], stage="draft")
+
+
+def test_design_requires_slotted_images():
+    catalog = [{"image_id": "IMG-1"}]
+    empty = '<svg viewBox="0 0 1280 720"><rect width="10" height="10"/></svg>'
+    with pytest.raises(RuntimeError, match="未出现"):
+        assert_svg_uses_images(empty, catalog, [{"image_id": "IMG-1"}], stage="design")
+    assert_svg_uses_images(empty, catalog, [], stage="design")
+
+
 def test_unknown_image_id_is_hard_fail():
     svg = '<svg viewBox="0 0 1280 720"><image data-image-id="IMG-9" x="0" y="0" width="10" height="10"/></svg>'
     with pytest.raises(RuntimeError, match="不存在的配图"):

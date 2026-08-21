@@ -476,7 +476,12 @@ class GenerationService:
         )
         prepared = prepare_page_svg(svg, stage="draft", page_images=page_images)
         assert_svg_matches_plan(prepared, content_plan)
-        assert_svg_uses_images(prepared, page_images, (content_plan or {}).get("image_slots"))
+        assert_svg_uses_images(
+            prepared,
+            page_images,
+            (content_plan or {}).get("image_slots"),
+            stage="draft",
+        )
         return prepared
 
     def generate_design_svg(
@@ -522,7 +527,12 @@ class GenerationService:
             page_images=page_images,
         )
         assert_svg_matches_plan(prepared, content_plan)
-        assert_svg_uses_images(prepared, page_images, (content_plan or {}).get("image_slots"))
+        assert_svg_uses_images(
+            prepared,
+            page_images,
+            (content_plan or {}).get("image_slots"),
+            stage="design",
+        )
         return prepared
 
     def get_style_pack(self, style_id: str | None, *, frozen_card: dict[str, Any] | None = None) -> dict[str, Any]:

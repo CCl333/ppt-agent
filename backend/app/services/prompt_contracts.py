@@ -473,16 +473,16 @@ PROMPT_TEXTS: dict[str, str] = {
     "plan.page_generate.system": """
 你是 AI PPT 的单页内容策划。只输出严格 JSON，不输出 SVG，不定版式。
 
-任务：把这一页观众将读到的全部文案定稿。下游只负责排版，不再发明句子。
+任务：只定这一页的文案骨架（卡标题），不定版式，不写幻灯片上的表、步骤或指标。summary / 大纲只当证据，禁止把 summary_md 段落复制进 note。
 
 规则：
-1. 所有展示给观众的句子必须写进 JSON：title / subtitle / badge / blocks.label / blocks.note / footer。
+1. 只写骨架字段：title / subtitle / badge / blocks.label / blocks.note / footer。不要写完整 SOP、表格行、长因果句。
 2. 优先使用研究摘要与大纲中的证据，不得编造摘要里没有的事实、年份、ROI、时间轴或新章节。
-3. 封面、目录、结尾也必须给出完整文案，不能留空让下游去编。
-4. 演讲人与日期用占位符，例如 `[您的姓名/团队名称]`、`202X年X月X日`。
-5. 内容页 blocks 至少 2 条；每条必须有非空 label。
+3. 封面、目录、结尾也必须给出完整骨架，不能留空让下游去编。
+4. footer 仅封面、结尾填写演讲人与日期占位符，例如 `[您的姓名/团队名称]`、`202X年X月X日`。正文、目录不要写 footer。
+5. 内容页 blocks 必须 3 到 5 条（含 3 和 5）；每条必须有非空 label。label 是卡标题，去空白后不超过 22 字（例：预约现状、抢票标准作业程序 (SOP)）。note 可选短解释，去空白后不超过 22 字；没有就空字符串。subtitle 封面/章节可用一句洞察，去空白后不超过 40 字。label 必须是卡标题，不要用纯数字。
 6. 不要写布局、颜色、字体或 SVG。
-7. 如果输入 page_images 非空，必须从中选出 1 到 2 张写入 image_slots；image_id 必须来自目录，禁止编造。
+7. 如果输入 page_images 非空，可以写 1 个 image_slot（用途 + image_id），不是必须。image_id 必须来自目录，禁止编造。
 8. 如果 page_images 为空，不要写 image_slots。
 
 输出格式：
@@ -575,8 +575,8 @@ PROMPT_TEXTS: dict[str, str] = {
 Bento Grid 规则：
 1. 只输出单个完整 `<svg>...</svg>`。
 2. 画布固定为 `1280x720`。
-3. 只负责排版。所有可见文案必须逐字来自输入的 content_plan，禁止新增句子、数字、章节或时间轴。
-4. 不得编造 content_plan 与 research 中没有的事实。
+3. 每个 content_plan.blocks.label 必须作为一张卡（或明确的主模块）的标题出现。卡片内部用 summary 填短句、表格行、步骤、对比、指标。这是本阶段的职责。禁止把 summary 段落原样贴进卡片；单行建议不超过 30 字；一页不要超过约 550 字。换行用同一个 `<text>` 下的 `<tspan>`，不要拆成多个 `<text>`。允许版式元件：`01` / `1`、表头、单位、`VS`、图位说明、KPI。仍禁止编造 summary / 大纲里没有的事实、年份、价格；禁止发明不在 plan 里的大模块名（小步骤名可以）。
+4. 不得编造 summary、大纲与 content_plan 中没有的事实。
 5. 允许基础中性样式，但不允许注入最终风格主题、品牌视觉或复杂装饰。
 6. 卡片数量不固定，可以是 1、2、3、4、5 或更多；布局选择由信息密度、内容类型和主次关系决定，不允许机械套用同一种模板。
 7. 用卡片面积、位置和形状建立层级：最重要的信息必须占据最大或最核心的卡片，次级信息退居侧边、底部或更小卡片。
@@ -596,14 +596,14 @@ Bento Grid 规则：
 15. 避免这些坏味道：所有卡片同尺寸、平均分配主次、卡片过小导致文本挤压、为了对称牺牲信息层级、页面还有大片未利用空间。
 16. 画布必须是 `viewBox="0 0 1280 720"`。
 17. 所有 `<text>` / `<tspan>` 必须设置 `font-family` 为 `"Microsoft YaHei", "PingFang SC", "Noto Sans SC", "Source Han Sans SC", sans-serif`，不要只用 `sans-serif`。
-18. 只允许这些图元：`<rect>`（可含 rx）/ `<circle>` / `<ellipse>` / `<line>` / `<polygon>` / `<path>`（仅 M L H V Z）/ `<text>` + `<tspan>` / `<image>` / `<g>`。
-19. 禁止 `<filter>` 及任何 fe*、`<clipPath>` / `<mask>` / `<pattern>` / `<use>` / `<textPath>` / `<foreignObject>` / 渐变。
+18. 只允许这些图元：`<rect>`（可含 rx）/ `<circle>` / `<ellipse>` / `<line>` / `<polygon>` / `<path>`（仅 M L H V Z）/ `<text>` + `<tspan>` / `<image>` / `<g>` / `<defs>` / `<style>`。`<defs>` 仅放 `<style>` 字体/class，以及简单线性渐变和箭头 `<marker>`。禁止 `@import` 外部字体，继续用规则 17 的本地字体栈。
+19. 禁止 `<filter>` 及任何 fe*、`<clipPath>` / `<mask>` / `<pattern>` / `<use>` / `<textPath>` / `<foreignObject>`。渐变和 marker 只能写在 `<defs>` 内。
 20. `<g>` 只允许 `translate`，禁止 rotate / skew / matrix。
-21. 如果 page_images / content_plan.image_slots 非空，必须用对应 `data-image-id` 放置 `<image>`，禁止编造目录外的图，禁止写 http/file href。
+21. 有可用配图时画占位 `g`（虚线 `rect` + 用途文字），可用 `data-image-slot-id`；初稿不要放内容 `<image>`。无图不要编占位。
 22. 没有可用配图时不要输出内容 `<image>`。
 """.strip(),
     "draft.page_generate.user": """
-任务：按内容策划稿排版，生成目标页 SVG。文案必须逐字使用 content_plan。
+任务：按内容策划的卡标题排 Bento，用 summary 填充卡片内部，输出 SVG。
 
 输入数据(JSON)：
 {
@@ -638,16 +638,16 @@ Bento Grid 规则：
 4. 颜色只能用输入中给出的 class 令牌，禁止任何字面色值（包括 fill="#..."、stroke="#..."、rgb()、named color、inline style）。
 5. 文本必须带字阶 class：`t-title` / `t-subtitle` / `t-body` / `t-caption` / `t-label`。图形必须带 `c-*` 色板 class。
 6. 不要设置 font-size / font-family / font-weight / fill / stroke 属性，这些由系统按令牌展开。
-7. 背景、标题栏、页码由系统合成。不要画全幅背景矩形，不要引用本地文件路径。内容区从 y=56 到 y=680。
+7. 背景色条、顶栏小标题和页码由系统合成。不要画全幅背景矩形，不要引用本地文件路径。内容区从 y=56 到 y=680。系统不会补副标题或 badge，这两项必须留在内容区。
 8. 只允许这些图元：`<rect>`（可含 rx）/ `<circle>` / `<ellipse>` / `<line>` / `<polygon>` / `<path>`（仅 M L H V Z）/ `<text>` + `<tspan>` / `<image>` / `<g>`。
 9. 禁止 `<filter>` 及任何 fe*、渐变、`<clipPath>` / `<mask>` / `<pattern>` / `<use>` / `<textPath>` / `<foreignObject>`。
 10. `<g>` 只允许 `translate`，禁止 rotate / skew / matrix。
 11. 如果风格表达与内容可读性冲突，优先保留内容可读性。
-12. 文案必须与 content_plan 逐字一致，禁止新增或改写任何可见文本。
-13. 必须保留 draft 中的内容 `<image data-image-id>`，不得删除、不得改 data-image-id、不得改成网络地址。
+12. 保留 draft 的卡标题、阅读顺序和主次；不要新增或删除 content_plan.blocks.label 对应的模块；卡片内部短句以 draft 为准，不要改回 content_plan.note，也不要另起一套数字。draft 里已有的 title、subtitle、badge 字符串必须原样保留（含标点、空格、大小写），禁止同义改写或删掉副标题/徽章。
+13. 若 draft 有占位且 page_images 非空，改成 `<image data-image-id>`；已有 image 则保留 id。仍禁止 http/file href。
 """.strip(),
     "design.svg_generate.user": """
-任务：生成目标页最终 SVG 设计稿。文案必须与 content_plan 逐字一致。
+任务：在 draft SVG 上做视觉增强，不改卡标题、副标题、badge 和模块结构。
 
 输入数据(JSON)：
 {

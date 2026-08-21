@@ -73,6 +73,26 @@ def test_prepare_design_svg_injects_chrome():
     assert "实践路径" in svg
 
 
+def test_flatten_shifts_tspan_x_under_translate():
+    svg = """
+    <svg xmlns="http://www.w3.org/2000/svg">
+      <g transform="translate(200,80)">
+        <text x="10" y="20">
+          <tspan x="14" dy="22">hello</tspan>
+        </text>
+      </g>
+    </svg>
+    """
+    root = _parse_svg(_ensure_svg_xmlns(svg))
+    flatten_group_translates(root)
+    text = next(elem for elem in root.iter() if elem.tag.endswith("text"))
+    tspan = next(elem for elem in root.iter() if elem.tag.endswith("tspan"))
+    assert text.get("x") == "210"
+    assert text.get("y") == "100"
+    assert tspan.get("x") == "214"
+    assert tspan.get("dy") == "22"
+
+
 def test_flatten_converts_relative_path_under_translate():
     svg = '<svg xmlns="http://www.w3.org/2000/svg"><g transform="translate(10,20)"><path d="m0 0 l30 0"/></g></svg>'
     root = _parse_svg(_ensure_svg_xmlns(svg))
@@ -81,3 +101,65 @@ def test_flatten_converts_relative_path_under_translate():
     points, _closed = parse_path_contours(path.get("d") or "")[0]
     assert points[0] == (10.0, 20.0)
     assert (40.0, 20.0) in points
+
+
+def test_draft_allows_defs_and_style():
+    svg = """
+    <svg viewBox="0 0 1280 720">
+      <defs>
+        <style>.x{font-family:Microsoft YaHei}</style>
+      </defs>
+      <rect width="100" height="100" fill="#111111"/>
+    </svg>
+    """
+    validate_svg_contract(svg, stage="draft")
+
+
+def test_design_rejects_defs_and_style():
+    svg = """
+    <svg viewBox="0 0 1280 720">
+      <defs>
+        <style>.x{font-family:Microsoft YaHei}</style>
+      </defs>
+      <rect x="80" y="80" width="100" height="100" class="c-surface"/>
+    </svg>
+    """
+    with pytest.raises(SvgContractError, match="forbidden_element"):
+        validate_svg_contract(svg, stage="design", style_pack=STYLE_PACKS["consulting"])
+
+
+def test_draft_still_rejects_filter():
+    svg = '<svg viewBox="0 0 1280 720"><filter id="a"/><rect width="10" height="10" fill="#111"/></svg>'
+    with pytest.raises(SvgContractError, match="forbidden_element"):
+        validate_svg_contract(svg, stage="draft")
+
+
+def test_draft_allows_gradient_inside_defs():
+    svg = """
+    <svg viewBox="0 0 1280 720">
+      <defs>
+        <linearGradient id="g">
+          <stop offset="0" stop-color="#2563EB"/>
+          <stop offset="1" stop-color="#93C5FD"/>
+        </linearGradient>
+        <marker id="arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+          <path d="M0 0 L6 3 L0 6 Z" fill="#111"/>
+        </marker>
+      </defs>
+      <rect width="100" height="100" fill="url(#g)"/>
+    </svg>
+    """
+    validate_svg_contract(svg, stage="draft")
+
+
+def test_draft_rejects_gradient_outside_defs():
+    svg = """
+    <svg viewBox="0 0 1280 720">
+      <linearGradient id="g">
+        <stop offset="0" stop-color="#2563EB"/>
+      </linearGradient>
+      <rect width="100" height="100" fill="#111"/>
+    </svg>
+    """
+    with pytest.raises(SvgContractError, match="forbidden_element"):
+        validate_svg_contract(svg, stage="draft")

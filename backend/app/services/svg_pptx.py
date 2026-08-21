@@ -170,16 +170,16 @@ def _emit_points(slide, elem: ET.Element, points: list[tuple[float, float]], *, 
 
 
 def _emit_text(slide, elem: ET.Element) -> None:
-    content = _text_content(elem).strip()
-    if not content:
-        return
-    font_px = parse_length(elem.get("font-size"), 16.0)
-    x = parse_length(elem.get("x"))
-    y = parse_length(elem.get("y"))
+    for content, x, y, style in _collect_text_fragments(elem):
+        _emit_text_box(slide, elem, style, content, x, y)
+
+
+def _emit_text_box(slide, parent: ET.Element, style: ET.Element, content: str, x: float, y: float) -> None:
+    font_px = _node_font_px(style, parent)
     width = max(estimated_text_width(content, font_px) + font_px * 0.4, font_px)
     height = font_px * 1.35
     top = y - font_px * ASCENT_RATIO
-    anchor = (elem.get("text-anchor") or "start").strip()
+    anchor = (parent.get("text-anchor") or style.get("text-anchor") or "start").strip()
     if anchor == "end":
         left = x - width
         align = PP_ALIGN.RIGHT
@@ -198,8 +198,8 @@ def _emit_text(slide, elem: ET.Element) -> None:
     else:
         run = paragraph.add_run()
     run.text = content
-    _apply_run_font(run, elem, font_px)
-    fill, opacity = _fill_color(elem)
+    _apply_run_font(run, style, font_px, parent=parent)
+    fill, opacity = _node_fill(style, parent)
     if fill:
         run.font.color.rgb = _rgb(fill)
         if opacity < 0.999:
@@ -241,11 +241,11 @@ def _configure_textbox(shape, align: PP_ALIGN) -> None:
     etree.SubElement(body_pr, qn("a:spAutoFit"))
 
 
-def _apply_run_font(run, elem: ET.Element, font_px: float) -> None:
+def _apply_run_font(run, elem: ET.Element, font_px: float, *, parent: ET.Element | None = None) -> None:
     run.font.size = Pt(font_px * PT_PER_PX)
-    weight = (elem.get("font-weight") or "").strip().lower()
+    weight = (elem.get("font-weight") or (parent.get("font-weight") if parent is not None else "") or "").strip().lower()
     run.font.bold = weight in {"bold", "700", "800", "900"} or (weight.isdigit() and int(weight) >= 600)
-    family = _primary_font(elem.get("font-family") or "")
+    family = _primary_font(elem.get("font-family") or (parent.get("font-family") if parent is not None else "") or "")
     run.font.name = family
     rpr = run._r.find(qn("a:rPr"))
     if rpr is None:
@@ -381,22 +381,62 @@ def _primary_font(family: str) -> str:
     return normalize_family(family) or "Microsoft YaHei"
 
 
-def _text_content(elem: ET.Element) -> str:
-    parts: list[str] = []
-    if elem.text:
-        parts.append(elem.text)
+def _collect_text_fragments(elem: ET.Element) -> list[tuple[str, float, float, ET.Element]]:
+    fragments: list[tuple[str, float, float, ET.Element]] = []
+    x = parse_length(elem.get("x"))
+    y = parse_length(elem.get("y"))
+    font_px = parse_length(elem.get("font-size"), 16.0)
+
+    def commit(raw: str | None, cx: float, cy: float, style: ET.Element) -> tuple[float, float]:
+        content = re.sub(r"[\t\n\r]+", " ", raw or "").strip()
+        if not content:
+            return cx, cy
+        fragments.append((content, cx, cy, style))
+        size = _node_font_px(style, elem) if style is not elem else font_px
+        return cx + estimated_text_width(content, size), cy
+
+    x, y = commit(elem.text, x, y, elem)
     for child in list(elem):
         tag = _local_tag(child)
-        if tag == "tspan":
-            for attr in ("x", "y", "dx", "dy"):
-                if (child.get(attr) or "").strip():
-                    raise RuntimeError("tspan 不得设置 x/y/dx/dy，导出器无法保留分片坐标")
-            parts.append("".join(child.itertext()))
-        elif tag not in {"title", "desc"}:
+        if tag in {"title", "desc"}:
+            x, y = commit(child.tail, x, y, elem)
+            continue
+        if tag != "tspan":
             raise RuntimeError(f"text 内含有无法翻译的子节点 <{tag}>")
-        if child.tail:
-            parts.append(child.tail)
-    return "".join(parts)
+        for nested in child.iter():
+            if nested is child:
+                continue
+            if _local_tag(nested) == "tspan" and any((nested.get(attr) or "").strip() for attr in ("x", "y", "dx", "dy")):
+                raise RuntimeError("嵌套 tspan 带坐标，导出器无法保留分片坐标")
+        fx, fy = x, y
+        if (child.get("x") or "").strip():
+            fx = parse_length(child.get("x"))
+        if (child.get("y") or "").strip():
+            fy = parse_length(child.get("y"))
+        if (child.get("dx") or "").strip():
+            fx += parse_length(child.get("dx"))
+        if (child.get("dy") or "").strip():
+            fy += parse_length(child.get("dy"))
+        x, y = commit("".join(child.itertext()), fx, fy, child)
+        x, y = commit(child.tail, x, y, elem)
+    return fragments
+
+
+def _node_font_px(node: ET.Element, parent: ET.Element | None) -> float:
+    if (node.get("font-size") or "").strip():
+        return parse_length(node.get("font-size"), 16.0)
+    if parent is not None and (parent.get("font-size") or "").strip():
+        return parse_length(parent.get("font-size"), 16.0)
+    return 16.0
+
+
+def _node_fill(node: ET.Element, parent: ET.Element | None) -> tuple[str | None, float]:
+    fill, opacity = _fill_color(node)
+    if fill:
+        return fill, opacity
+    if parent is not None:
+        return _fill_color(parent)
+    return None, 1.0
 
 
 def _is_hidden(elem: ET.Element) -> bool:

@@ -160,19 +160,25 @@ def resolve_image_refs(svg_markup: str, catalog: list[dict[str, Any]] | None) ->
     return _serialize_svg(root)
 
 
-def assert_svg_uses_images(svg_markup: str, catalog: list[dict[str, Any]] | None, slots: list[dict[str, Any]] | None) -> None:
+def assert_svg_uses_images(
+    svg_markup: str,
+    catalog: list[dict[str, Any]] | None,
+    slots: list[dict[str, Any]] | None,
+    *,
+    stage: str = "design",
+) -> None:
     catalog_ids = {str(item.get("image_id") or "").strip() for item in catalog or []}
     catalog_ids.discard("")
     used = collect_image_ids(svg_markup)
     unknown = [image_id for image_id in used if image_id not in catalog_ids]
     if unknown:
         raise RuntimeError(f"SVG 引用了目录外的配图: {', '.join(unknown)}")
+    if stage == "draft":
+        return
     required = [str(item.get("image_id") or "").strip() for item in slots or [] if str(item.get("image_id") or "").strip()]
     missing = [image_id for image_id in required if image_id not in used]
     if missing:
         raise RuntimeError(f"策划指定的配图未出现在 SVG 中: {', '.join(missing)}")
-    if catalog_ids and not used:
-        raise RuntimeError("有可用配图但 SVG 未引用任何 data-image-id")
 
 
 def fetch_image(url: str, *, timeout: float = 15.0) -> tuple[str, bytes]:

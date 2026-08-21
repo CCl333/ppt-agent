@@ -58,7 +58,7 @@ def test_patch_page_draft_keeps_previous_version_retrievable(service, db_session
     assert current.version_no == previous.version_no + 1
 
 
-def test_patch_page_draft_rejects_text_outside_content_plan(service, db_session):
+def test_patch_page_draft_rejects_missing_plan_label(service, db_session):
     project = make_project(db_session, stage="draft")
     page = make_content_page(db_session, project, page_code="page-03", title="策划页", sort_order=1)
     previous = db_session.get(DraftVersion, page.current_draft_version_id)
@@ -78,3 +78,23 @@ def test_patch_page_draft_rejects_text_outside_content_plan(service, db_session)
     assert exc.value.status_code == 422
     db_session.refresh(page)
     assert page.current_draft_version_id == previous.id
+
+
+def test_patch_page_draft_allows_extra_text_when_skeleton_present(service, db_session):
+    project = make_project(db_session, stage="draft")
+    page = make_content_page(db_session, project, page_code="page-03", title="策划页", sort_order=1)
+    previous = db_session.get(DraftVersion, page.current_draft_version_id)
+    assert previous is not None
+    previous.content_plan_json = {
+        "page_code": "page-03",
+        "title": "策划页",
+        "subtitle": "",
+        "badge": "",
+        "blocks": [{"role": "point", "label": "要点一", "note": "解释"}],
+        "footer": {},
+    }
+    db_session.commit()
+
+    svg = '<svg viewBox="0 0 1280 720"><text>策划页</text><text>要点一</text><text>100%</text></svg>'
+    result = service.patch_page_draft(project.id, page.id, svg)
+    assert "100%" in result["draft"]["draft_svg_markup"]

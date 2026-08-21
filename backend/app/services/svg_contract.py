@@ -31,8 +31,10 @@ ALLOWED_TAGS = {
     "image",
     "title",
     "desc",
+    "defs",
+    "style",
 }
-FORBIDDEN_TAGS = {
+ALWAYS_FORBIDDEN_TAGS = {
     "filter",
     "clippath",
     "mask",
@@ -40,13 +42,13 @@ FORBIDDEN_TAGS = {
     "use",
     "textpath",
     "foreignobject",
-    "radialgradient",
-    "lineargradient",
-    "stop",
-    "defs",
-    "marker",
     "symbol",
-    "style",
+}
+DRAFT_DEFS_TAGS = {
+    "lineargradient",
+    "radialgradient",
+    "stop",
+    "marker",
 }
 ALLOWED_PATH_COMMANDS = set("MLHVZmlhvz")
 _COLOR_ATTRS = ("fill", "stroke", "stop-color", "color", "flood-color")
@@ -85,7 +87,7 @@ def validate_svg_contract(
 ) -> None:
     root = _parse_svg(_ensure_svg_xmlns(svg_markup))
     violations: list[SvgViolation] = []
-    _walk_validate(root, "/svg", stage, violations, text_token=False)
+    _walk_validate(root, "/svg", stage, violations, text_token=False, in_defs=False)
     if violations:
         first = violations[0]
         raise SvgContractError(
@@ -130,13 +132,15 @@ def _walk_validate(
     violations: list[SvgViolation],
     *,
     text_token: bool,
+    in_defs: bool,
 ) -> None:
     tag = _local_tag(elem)
     lname = tag.lower()
-    if lname.startswith("fe") or lname in FORBIDDEN_TAGS:
+    rule = _tag_violation(lname, stage=stage, in_defs=in_defs)
+    if rule == "forbidden_element":
         violations.append(SvgViolation(xpath, "forbidden_element", f"禁止使用 <{tag}>"))
         return
-    if lname not in ALLOWED_TAGS:
+    if rule == "unknown_element":
         violations.append(SvgViolation(xpath, "unknown_element", f"不支持的图元 <{tag}>"))
         return
     transform = (elem.get("transform") or "").strip()
@@ -161,7 +165,28 @@ def _walk_validate(
         child_tag = _local_tag(child)
         counts[child_tag] = counts.get(child_tag, 0) + 1
         child_path = f"{xpath}/{child_tag}[{counts[child_tag]}]"
-        _walk_validate(child, child_path, stage, violations, text_token=child_text_token)
+        _walk_validate(
+            child,
+            child_path,
+            stage,
+            violations,
+            text_token=child_text_token,
+            in_defs=in_defs or lname == "defs",
+        )
+
+
+def _tag_violation(lname: str, *, stage: str, in_defs: bool) -> str | None:
+    if lname.startswith("fe") or lname in ALWAYS_FORBIDDEN_TAGS:
+        return "forbidden_element"
+    if lname in {"defs", "style"}:
+        return "forbidden_element" if stage == "design" else None
+    if lname in DRAFT_DEFS_TAGS:
+        if stage == "draft" and in_defs:
+            return None
+        return "forbidden_element"
+    if lname in ALLOWED_TAGS:
+        return None
+    return "unknown_element"
 
 
 def _validate_design_paint(
@@ -255,8 +280,9 @@ def _flatten(elem: ET.Element, dx: float, dy: float) -> None:
         return
     if local_dx or local_dy:
         _apply_offset(elem, tag, local_dx, local_dy)
+    next_dx, next_dy = (local_dx, local_dy) if tag in {"text", "tspan"} else (0.0, 0.0)
     for child in list(elem):
-        _flatten(child, 0.0, 0.0)
+        _flatten(child, next_dx, next_dy)
 
 
 def _parse_translate(transform: str | None) -> tuple[float, float] | None:
@@ -274,6 +300,11 @@ def _apply_offset(elem: ET.Element, tag: str, dx: float, dy: float) -> None:
     if tag in {"rect", "image", "text"}:
         _shift_attr(elem, "x", dx)
         _shift_attr(elem, "y", dy)
+    elif tag == "tspan":
+        if "x" in elem.attrib:
+            _shift_attr(elem, "x", dx)
+        if "y" in elem.attrib:
+            _shift_attr(elem, "y", dy)
     elif tag in {"circle", "ellipse"}:
         _shift_attr(elem, "cx", dx)
         _shift_attr(elem, "cy", dy)
