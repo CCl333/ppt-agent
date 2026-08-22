@@ -49,6 +49,7 @@ def test_materialize_page_images_writes_files():
         fetch=fake_fetch,
     )
     assert catalog[0]["image_id"] == "IMG-1"
+    assert catalog[0]["license_status"] == "unknown"
     assert Path(catalog[0]["storage_path"]).read_bytes() == PNG_1X1
 
 

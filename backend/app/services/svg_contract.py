@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from app.services.style_tokens import TOKEN_CLASS_NAMES, build_token_map
+from app.services.style_tokens import TOKEN_CLASS_NAMES, build_token_map, resolve_text_token
 from app.services.svg import (
     CANVAS_HEIGHT,
     CANVAS_WIDTH,
@@ -109,8 +109,10 @@ def expand_token_classes(svg_markup: str, style_pack: dict[str, Any]) -> str:
         if not raw_class:
             continue
         names = [name for name in raw_class.split() if name]
+        resolved = resolve_text_token(names, elem.get("data-text-role"))
         for name in names:
-            attrs = token_map.get(name)
+            lookup = resolved if name.startswith("t-") and resolved else name
+            attrs = token_map.get(lookup)
             if not attrs:
                 continue
             tag = _local_tag(elem)
@@ -212,7 +214,7 @@ def _validate_design_paint(
     if tag in {"text", "tspan"}:
         has_text = bool((elem.text or "").strip()) or any((child.tail or "").strip() for child in elem)
         if has_text and not has_text_token:
-            violations.append(SvgViolation(xpath, "text_token", "文本必须使用 t-title/t-subtitle/t-body/t-caption/t-label"))
+            violations.append(SvgViolation(xpath, "text_token", "文本必须使用语义字阶 class（t-page-title/t-card-title/t-kpi 等）"))
         return has_text_token
     if tag in {"rect", "circle", "ellipse", "polygon", "polyline", "path", "line"}:
         paint_classes = [name for name in classes if name.startswith("c-")]

@@ -23,6 +23,7 @@ async def lifespan(_: FastAPI):
     settings.upload_path.mkdir(parents=True, exist_ok=True)
     settings.background_path.mkdir(parents=True, exist_ok=True)
     settings.export_path.mkdir(parents=True, exist_ok=True)
+    settings.quality_eval_path.mkdir(parents=True, exist_ok=True)
     init_db()
     start_scheduler()
     yield
@@ -35,6 +36,7 @@ def create_app() -> FastAPI:
     settings.upload_path.mkdir(parents=True, exist_ok=True)
     settings.background_path.mkdir(parents=True, exist_ok=True)
     settings.export_path.mkdir(parents=True, exist_ok=True)
+    settings.quality_eval_path.mkdir(parents=True, exist_ok=True)
     init_db()
     app = FastAPI(
         title="PPT Agent Backend",
@@ -59,8 +61,10 @@ def create_app() -> FastAPI:
     app.mount("/storage/exports", AttachmentStaticFiles(directory=settings.export_path), name="storage-exports")
 
     @app.get("/healthz")
-    def healthz() -> dict[str, str]:
-        return {"status": "ok"}
+    def healthz() -> dict:
+        from app.services.runtime import runtime_payload
+
+        return runtime_payload()
 
     return app
 

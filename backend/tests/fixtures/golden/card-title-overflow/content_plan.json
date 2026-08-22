@@ -1,0 +1,13 @@
+{
+  "page_code": "page-05",
+  "title": "出发前要做的事",
+  "subtitle": "把预约和行程锁死",
+  "badge": "",
+  "blocks": [
+    {"role": "point", "label": "预约制深度解析与实施路径", "note": "先看放票窗口"},
+    {"role": "point", "label": "抢票 SOP", "note": "三步完成预约"},
+    {"role": "point", "label": "行程清单", "note": "证件与交通"}
+  ],
+  "footer": {},
+  "image_slots": []
+}

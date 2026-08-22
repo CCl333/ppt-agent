@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720">
+  <rect x="64" y="150" width="360" height="240" rx="12" class="c-surface" fill="#EEF4F8"/>
+  <text x="80" y="198" class="t-title c-ink-1" data-node-id="block-1-title" data-text-role="card-title" data-layout-box="80,160,328,48" font-size="40px" font-weight="700" fill="#0F172A">预约制深度解析与实施路径</text>
+  <text x="80" y="248" class="t-body c-ink-2" data-node-id="block-1-body" data-text-role="body" data-layout-box="80,220,328,40" font-size="16px" fill="#475569">先看放票窗口</text>
+  <rect x="448" y="150" width="360" height="240" rx="12" class="c-surface" fill="#EEF4F8"/>
+  <text x="464" y="198" class="t-title c-ink-1" data-node-id="block-2-title" data-text-role="card-title" data-layout-box="464,160,328,48" font-size="40px" font-weight="700" fill="#0F172A">抢票 SOP</text>
+  <text x="464" y="248" class="t-body c-ink-2" data-node-id="block-2-body" data-text-role="body" data-layout-box="464,220,328,40" font-size="16px" fill="#475569">三步完成预约</text>
+  <rect x="832" y="150" width="360" height="240" rx="12" class="c-surface" fill="#EEF4F8"/>
+  <text x="848" y="198" class="t-title c-ink-1" data-node-id="block-3-title" data-text-role="card-title" data-layout-box="848,160,328,48" font-size="40px" font-weight="700" fill="#0F172A">行程清单</text>
+  <text x="848" y="248" class="t-body c-ink-2" data-node-id="block-3-body" data-text-role="body" data-layout-box="848,220,328,40" font-size="16px" fill="#475569">证件与交通</text>
+</svg>

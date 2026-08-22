@@ -4,7 +4,7 @@ from typing import Any
 
 from app.services.svg import CJK_FONT_STACK
 
-TOKEN_CLASS_NAMES = (
+COLOR_CLASS_NAMES = (
     "c-bg",
     "c-surface",
     "c-surface-alt",
@@ -15,13 +15,36 @@ TOKEN_CLASS_NAMES = (
     "c-ink-1",
     "c-ink-2",
     "c-ink-3",
-    "t-title",
-    "t-subtitle",
+)
+SEMANTIC_TEXT_TOKENS = (
+    "t-display",
+    "t-page-title",
+    "t-card-title",
+    "t-kpi",
+    "t-kpi-unit",
     "t-body",
     "t-caption",
     "t-label",
-    "shadow-sm",
+    "t-table-header",
+    "t-toc-item",
 )
+LEGACY_TEXT_TOKENS = ("t-title", "t-subtitle")
+TOKEN_CLASS_NAMES = COLOR_CLASS_NAMES + SEMANTIC_TEXT_TOKENS + LEGACY_TEXT_TOKENS + ("shadow-sm",)
+
+TEXT_ROLE_TO_TOKEN = {
+    "display": "t-display",
+    "page-title": "t-page-title",
+    "card-title": "t-card-title",
+    "kpi": "t-kpi",
+    "kpi-unit": "t-kpi-unit",
+    "body": "t-body",
+    "caption": "t-caption",
+    "label": "t-label",
+    "table-header": "t-table-header",
+    "toc-item": "t-toc-item",
+}
+TITLE_ONLY_ROLES = {"display", "page-title"}
+FORBIDDEN_LEGACY_TITLE_ROLES = {"card-title", "kpi", "kpi-unit", "toc-item", "table-header"}
 
 _FALLBACK_PALETTE = {
     "background": "#F8FAFC",
@@ -46,11 +69,10 @@ def build_token_map(
     type_spec = typography or {}
     title_family = str(type_spec.get("title_family") or CJK_FONT_STACK)
     body_family = str(type_spec.get("body_family") or CJK_FONT_STACK)
-    title_size = str(type_spec.get("title_size_px") or 36)
-    body_size = str(type_spec.get("body_size_px") or 16)
-    subtitle_size = str(max(int(float(title_size)) - 14, 18))
-    caption_size = str(max(int(float(body_size)) - 3, 11))
-    return {
+    title_weight = str(type_spec.get("title_weight") or "700")
+    body_weight = str(type_spec.get("body_weight") or "400")
+    roles = derive_role_scale(type_spec)
+    token_map: dict[str, dict[str, str]] = {
         "c-bg": {"fill": bg},
         "c-surface": {"fill": _norm_hex(colors["surface"])},
         "c-surface-alt": {"fill": _norm_hex(colors["surface_alt"])},
@@ -61,23 +83,115 @@ def build_token_map(
         "c-ink-1": {"fill": ink1},
         "c-ink-2": {"fill": ink2},
         "c-ink-3": {"fill": ink3},
-        "t-title": {
-            "fill": ink1,
-            "font-size": f"{title_size}px",
-            "font-weight": str(type_spec.get("title_weight") or "700"),
-            "font-family": title_family,
-        },
-        "t-subtitle": {"fill": ink1, "font-size": f"{subtitle_size}px", "font-weight": "600", "font-family": title_family},
-        "t-body": {
-            "fill": ink2,
-            "font-size": f"{body_size}px",
-            "font-weight": str(type_spec.get("body_weight") or "400"),
-            "font-family": body_family,
-        },
-        "t-caption": {"fill": ink3, "font-size": f"{caption_size}px", "font-weight": "400", "font-family": body_family},
-        "t-label": {"fill": accent, "font-size": "12px", "font-weight": "600", "font-family": body_family},
         "shadow-sm": {},
     }
+    families = {
+        "t-display": title_family,
+        "t-page-title": title_family,
+        "t-card-title": title_family,
+        "t-kpi": title_family,
+        "t-title": title_family,
+        "t-subtitle": title_family,
+        "t-toc-item": title_family,
+        "t-table-header": title_family,
+        "t-kpi-unit": body_family,
+        "t-body": body_family,
+        "t-caption": body_family,
+        "t-label": body_family,
+    }
+    weights = {
+        "t-display": title_weight,
+        "t-page-title": title_weight,
+        "t-card-title": "600",
+        "t-kpi": title_weight,
+        "t-title": title_weight,
+        "t-subtitle": "600",
+        "t-toc-item": "600",
+        "t-table-header": "600",
+        "t-kpi-unit": body_weight,
+        "t-body": body_weight,
+        "t-caption": "400",
+        "t-label": "600",
+    }
+    fills = {
+        "t-display": ink1,
+        "t-page-title": ink1,
+        "t-card-title": ink1,
+        "t-kpi": ink1,
+        "t-title": ink1,
+        "t-subtitle": ink1,
+        "t-toc-item": ink1,
+        "t-table-header": ink1,
+        "t-kpi-unit": ink2,
+        "t-body": ink2,
+        "t-caption": ink3,
+        "t-label": accent,
+    }
+    for name in SEMANTIC_TEXT_TOKENS + LEGACY_TEXT_TOKENS:
+        spec = roles[name]
+        token_map[name] = {
+            "fill": fills[name],
+            "font-size": f"{spec['size_px']}px",
+            "font-weight": weights[name],
+            "font-family": families[name],
+        }
+    return token_map
+
+
+def derive_role_scale(typography: dict[str, Any] | None) -> dict[str, dict[str, int]]:
+    type_spec = typography or {}
+    title = _as_int(type_spec.get("title_size_px"), 36)
+    body = _as_int(type_spec.get("body_size_px"), 16)
+    defaults = {
+        "t-display": {"size_px": min(title + 6, 56), "min_px": 28, "max_px": 56},
+        "t-page-title": {"size_px": title, "min_px": 26, "max_px": 48},
+        "t-card-title": {"size_px": max(min(body + 4, 22), 16), "min_px": 16, "max_px": 24},
+        "t-kpi": {"size_px": max(body * 2, 24), "min_px": 20, "max_px": 48},
+        "t-kpi-unit": {"size_px": body, "min_px": 12, "max_px": 18},
+        "t-subtitle": {"size_px": max(title - 14, 18), "min_px": 14, "max_px": 28},
+        "t-body": {"size_px": body, "min_px": 14, "max_px": 20},
+        "t-caption": {"size_px": max(body - 3, 11), "min_px": 11, "max_px": 14},
+        "t-label": {"size_px": 12, "min_px": 10, "max_px": 14},
+        "t-table-header": {"size_px": max(body, 14), "min_px": 12, "max_px": 18},
+        "t-toc-item": {"size_px": max(body + 2, 16), "min_px": 14, "max_px": 22},
+        "t-title": {"size_px": title, "min_px": 26, "max_px": 48},
+    }
+    defaults["t-title"] = dict(defaults["t-page-title"])
+    overlay = type_spec.get("roles") if isinstance(type_spec.get("roles"), dict) else {}
+    for name, spec in defaults.items():
+        raw = overlay.get(name)
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("size_px") is not None:
+            spec["size_px"] = _as_int(raw.get("size_px"), spec["size_px"])
+        if raw.get("min_px") is not None:
+            spec["min_px"] = _as_int(raw.get("min_px"), spec["min_px"])
+        if raw.get("max_px") is not None:
+            spec["max_px"] = _as_int(raw.get("max_px"), spec["max_px"])
+    return defaults
+
+
+def min_font_px_for_token(token: str | None, typography: dict[str, Any] | None = None) -> float:
+    if not token:
+        return 10.0
+    spec = derive_role_scale(typography).get(token)
+    if spec:
+        return float(spec["min_px"])
+    return 10.0
+
+
+def default_min_font_map(typography: dict[str, Any] | None = None) -> dict[str, float]:
+    return {name: float(spec["min_px"]) for name, spec in derive_role_scale(typography).items()}
+
+
+def resolve_text_token(class_names: list[str], text_role: str | None) -> str | None:
+    role_token = TEXT_ROLE_TO_TOKEN.get((text_role or "").strip())
+    if role_token:
+        return role_token
+    for name in class_names:
+        if name.startswith("t-"):
+            return name
+    return None
 
 
 def style_pack_for_prompt(style_pack: dict[str, Any]) -> dict[str, Any]:
@@ -99,14 +213,28 @@ def style_pack_for_prompt(style_pack: dict[str, Any]) -> dict[str, Any]:
             "c-ink-1": "主文字",
             "c-ink-2": "次文字",
             "c-ink-3": "辅助文字",
-            "t-title": "标题字阶",
+            "t-display": "封面/章节/结束页主标题，每页最多一个",
+            "t-page-title": "内容页主标题，每页最多一个",
+            "t-card-title": "卡片和模块标题，不得用于 KPI",
+            "t-kpi": "关键数字",
+            "t-kpi-unit": "KPI 单位",
+            "t-title": "兼容旧标题，只允许页主标题",
             "t-subtitle": "副标题字阶",
             "t-body": "正文字阶",
-            "t-caption": "说明文字",
-            "t-label": "标签/徽章",
+            "t-caption": "来源、注释、辅助说明",
+            "t-label": "标签/徽章/系统 chrome 小标题",
+            "t-table-header": "表头",
+            "t-toc-item": "目录项",
             "shadow-sm": "轻投影意图，不要用 filter",
         },
     }
+
+
+def _as_int(raw: Any, default: int) -> int:
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return default
 
 
 def _norm_hex(value: str) -> str:

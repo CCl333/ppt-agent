@@ -21,7 +21,15 @@ PYTHONPATH=backend .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 默认会创建 `FILE_STORAGE_ROOT` 下的 `uploads` / `backgrounds` / `exports`。数据库默认 SQLite：`sqlite:///./backend/data/ppt_agent.db`（WAL + foreign_keys）。也支持 PostgreSQL。
 
-健康检查：`GET /healthz`。
+Schema 由 `schema_migrations` 版本链管理，不再在启动时 `create_all` + 手写 ALTER。空库会初始化到 HEAD；已有库若落后，非 production 可自动升级，production 只检查并拒绝启动。显式升级（SQLite 会先备份）：
+
+```powershell
+$env:PYTHONPATH="backend"
+.venv\Scripts\python.exe -m app.core.migrations
+.venv\Scripts\python.exe -m app.core.migrations --check
+```
+
+健康检查：`GET /healthz`（含 `schema_version` / `schema_head`）。
 
 ## 阶段机
 

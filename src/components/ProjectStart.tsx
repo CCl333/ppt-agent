@@ -233,7 +233,7 @@ export default function ProjectStart({
       {
         key: 'page_count_target',
         title: '页数目标',
-        description: '这是整份 PPT 的总页数，包含封面、目录、内容页和结尾页。',
+        description: '所选数字是整份 PPT 的最终页数，包含封面、目录、章节过渡页、正文和收尾。',
         answered: hasValue(pageCountAnswer),
         kind: 'page_count',
       },
@@ -538,9 +538,14 @@ export default function ProjectStart({
                   }
                 >
                   <div className="font-semibold">{option.label}</div>
-                  <div className={selected ? 'mt-2 text-xs text-blue-50/90' : 'mt-2 text-xs text-slate-500'}>
-                    {option.page_count ? `${option.page_count} 页` : option.reason || '使用该推荐值'}
+                  <div className={selected ? 'mt-2 text-sm text-blue-50' : 'mt-2 text-sm text-slate-700'}>
+                    {option.page_count ? `${option.page_count} 页` : '推荐页数'}
                   </div>
+                  {option.reason ? (
+                    <div className={selected ? 'mt-1 text-xs text-blue-50/90' : 'mt-1 text-xs text-slate-500'}>
+                      {option.reason}
+                    </div>
+                  ) : null}
                 </button>
               );
             })}
@@ -550,7 +555,7 @@ export default function ProjectStart({
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <div className="text-sm font-medium text-slate-700">自定义页数</div>
-                  <div className="mt-1 text-xs text-slate-500">直接填写总页数，系统会把它当成整份 PPT 的明确目标。</div>
+                  <div className="mt-1 text-xs text-slate-500">填写整份 PPT 的最终页数，包含封面、目录、章节过渡页、正文和收尾。</div>
                 </div>
                 {customSelected ? <span className="rounded-full bg-blue-100 px-3 py-1 text-xs font-medium text-blue-700">当前已使用</span> : null}
               </div>

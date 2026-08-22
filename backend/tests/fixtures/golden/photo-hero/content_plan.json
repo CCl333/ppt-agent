@@ -1,0 +1,23 @@
+{
+  "page_code": "page-04",
+  "title": "中轴线现场",
+  "subtitle": "",
+  "badge": "",
+  "blocks": [
+    {"role": "point", "label": "空间格局", "note": "由北向南"},
+    {"role": "point", "label": "参观节奏", "note": "预留整块时间"},
+    {"role": "point", "label": "预约窗口", "note": "分时段入场"}
+  ],
+  "footer": {},
+  "image_slots": [{"image_id": "asset-7", "label": "现场", "placement": "hero"}],
+  "visual_slots": [
+    {
+      "slot_id": "visual-1",
+      "kind": "photo",
+      "source_mode": "search",
+      "priority": "required",
+      "asset_id": "asset-7",
+      "status": "bound"
+    }
+  ]
+}

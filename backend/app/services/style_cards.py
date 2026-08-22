@@ -260,7 +260,29 @@ def _typography_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "body_size_px": _safe_size(body.get("size_px"), 16),
         "title_weight": str(title.get("weight") or "700"),
         "body_weight": str(body.get("weight") or "400"),
+        "roles": _role_sizes_from_tokens(tokens, title.get("size_px"), body.get("size_px")),
     }
+
+
+def _role_sizes_from_tokens(tokens: dict[str, Any], title_size: Any, body_size: Any) -> dict[str, dict[str, int]]:
+    from app.services.style_tokens import derive_role_scale
+
+    overlay: dict[str, dict[str, int]] = {}
+    for name, spec in tokens.items():
+        if not str(name).startswith("t-") or not isinstance(spec, dict):
+            continue
+        size = spec.get("size_px")
+        if size is None:
+            continue
+        overlay[str(name)] = {"size_px": _safe_size(size, 16)}
+    derived = derive_role_scale(
+        {
+            "title_size_px": _safe_size(title_size, 36),
+            "body_size_px": _safe_size(body_size, 16),
+            "roles": overlay,
+        }
+    )
+    return derived
 
 
 def _safe_family(raw: Any) -> str:

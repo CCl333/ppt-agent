@@ -40,6 +40,7 @@ def fresh_db():
     get_settings().upload_path.mkdir(parents=True, exist_ok=True)
     get_settings().background_path.mkdir(parents=True, exist_ok=True)
     get_settings().export_path.mkdir(parents=True, exist_ok=True)
+    get_settings().quality_eval_path.mkdir(parents=True, exist_ok=True)
     init_db()
     yield
     reset_db_state()

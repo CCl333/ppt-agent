@@ -1,0 +1,137 @@
+{
+  "schema_version": "golden.v1",
+  "recorded_at": "2026-08-22",
+  "source": "docs/初稿到导出-稳定性开发文档.md M0/M1",
+  "build_fingerprint": {
+    "contract_version": "page-quality.v1",
+    "validator_version": "quality.v1",
+    "canvas": {"width": 1280, "height": 720},
+    "safe_area": {"x": 48, "y": 56, "w": 1184, "h": 624},
+    "title_size_px": 40,
+    "body_size_px": 16,
+    "classification_taxonomy": [
+      "provider",
+      "contract",
+      "layout",
+      "asset",
+      "export",
+      "deployment",
+      "database"
+    ]
+  },
+  "cases": [
+    {
+      "id": "card-title-overflow",
+      "classification": "layout",
+      "svg_file": "card-title-overflow/design.svg",
+      "plan_file": "card-title-overflow/content_plan.json",
+      "svg_contract_stage": "draft",
+      "svg_contract": "pass",
+      "quality_stage": "design",
+      "quality": "fail",
+      "error_code": "TEXT_OUT_OF_BOUNDS",
+      "description": "现场第5页同类故障：卡标题被 t-title 放大到 40px，几何盒未扩张"
+    },
+    {
+      "id": "text-overlap",
+      "classification": "layout",
+      "svg_file": "text-overlap/design.svg",
+      "svg_contract_stage": "draft",
+      "svg_contract": "pass",
+      "quality_stage": "design",
+      "quality": "fail",
+      "error_code": "TEXT_OVERLAP",
+      "description": "相邻卡标题共用 t-title 40px 后 bbox 重叠"
+    },
+    {
+      "id": "long-title",
+      "classification": "layout",
+      "svg_file": "long-title/design.svg",
+      "svg_contract_stage": "draft",
+      "svg_contract": "pass",
+      "quality_stage": "design",
+      "quality": "fail",
+      "error_code": "TEXT_OUTSIDE_CANVAS",
+      "description": "长页标题在 40px 下超出画布"
+    },
+    {
+      "id": "kpi-as-title",
+      "classification": "contract",
+      "svg_file": "kpi-as-title/design.svg",
+      "svg_contract_stage": "draft",
+      "svg_contract": "pass",
+      "quality_stage": "design",
+      "quality": "fail",
+      "error_code": "ROLE_TOKEN_MISMATCH",
+      "description": "KPI 数字误用 t-title，语义字阶必须拆开"
+    },
+    {
+      "id": "dense-cjk",
+      "classification": "layout",
+      "svg_file": "dense-cjk/design.svg",
+      "svg_contract_stage": "draft",
+      "svg_contract": "pass",
+      "quality_stage": "design",
+      "quality": "fail",
+      "error_code": "TEXT_OUT_OF_BOUNDS",
+      "description": "中文高密度正文超出文本盒"
+    },
+    {
+      "id": "tspan-wrap",
+      "classification": "export",
+      "svg_file": "tspan-wrap/design.svg",
+      "svg_contract_stage": "draft",
+      "svg_contract": "pass",
+      "quality_stage": "design",
+      "quality": "pass",
+      "export_preflight": "pass",
+      "description": "普通带坐标/dy 的 tspan，native shapes 应成功"
+    },
+    {
+      "id": "nested-tspan",
+      "classification": "export",
+      "svg_file": "nested-tspan/design.svg",
+      "svg_contract_stage": "draft",
+      "svg_contract": "pass",
+      "quality_stage": "design",
+      "quality": "fail",
+      "error_code": "EXPORT_SHAPES_PREFLIGHT",
+      "export_preflight": "fail",
+      "description": "嵌套带坐标 tspan，shapes 预检必须失败且不得降级 image"
+    },
+    {
+      "id": "photo-hero",
+      "classification": "asset",
+      "svg_file": "photo-hero/design.svg",
+      "plan_file": "photo-hero/content_plan.json",
+      "svg_contract_stage": "draft",
+      "svg_contract": "pass",
+      "quality_stage": "design",
+      "quality": "pass",
+      "description": "已绑定 data URI 照片槽，M1 可通过"
+    },
+    {
+      "id": "unresolved-chart",
+      "classification": "asset",
+      "svg_file": "unresolved-chart/design.svg",
+      "plan_file": "unresolved-chart/content_plan.json",
+      "svg_contract_stage": "draft",
+      "svg_contract": "pass",
+      "quality_stage": "design",
+      "quality": "fail",
+      "error_code": "UNRESOLVED_REQUIRED_SLOT",
+      "description": "required chart 槽未实现，说明文字不能当作成品"
+    },
+    {
+      "id": "cover",
+      "classification": "layout",
+      "svg_file": "cover/design.svg",
+      "svg_contract_stage": "draft",
+      "svg_contract": "pass",
+      "quality_stage": "design",
+      "quality": "pass",
+      "export_preflight": "pass",
+      "description": "固定封面页 happy path"
+    }
+  ]
+}

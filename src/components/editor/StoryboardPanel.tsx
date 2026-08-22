@@ -13,14 +13,30 @@ type StoryboardContentPage = {
   design_status?: string;
 };
 
+type StoryboardSectionPage = StoryboardContentPage & {
+  subtitle?: string;
+  visual_intent?: string;
+};
+
 type StoryboardSection = {
   key: string;
+  part_id: string | null;
   title: string;
+  sectionPage: StoryboardSectionPage | null;
   pages: StoryboardContentPage[];
 };
 
 type StoryboardPatchPayload = Array<{
+  part_id?: string | null;
   part_title: string;
+  section_page?: {
+    enabled: boolean;
+    page_id?: string | null;
+    title?: string;
+    subtitle?: string;
+    preview_items?: string[];
+    visual_intent?: string;
+  } | null;
   pages: Array<{
     page_id?: string | null;
     title: string;
@@ -59,6 +75,12 @@ function normalizeBullets(items: string[], fallback: string): string[] {
 function cloneSections(sections: StoryboardSection[]): StoryboardSection[] {
   return sections.map((section) => ({
     ...section,
+    sectionPage: section.sectionPage
+      ? {
+          ...section.sectionPage,
+          content_outline: [...section.sectionPage.content_outline],
+        }
+      : null,
     pages: section.pages.map((page) => ({
       ...page,
       content_outline: [...page.content_outline],
@@ -70,6 +92,13 @@ function sanitizeSections(sections: StoryboardSection[]): StoryboardSection[] {
   return sections.map((section, sectionIndex) => ({
     ...section,
     title: normalizeTitle(section.title, `新章节 ${formatSectionNo(sectionIndex)}`),
+    sectionPage: section.sectionPage
+      ? {
+          ...section.sectionPage,
+          title: normalizeTitle(section.sectionPage.title, section.title || `章节页 ${formatSectionNo(sectionIndex)}`),
+          content_outline: normalizeBullets(section.sectionPage.content_outline, '本章预告'),
+        }
+      : null,
     pages: section.pages.map((page, pageIndex) => ({
       ...page,
       title: normalizeTitle(page.title, `新内容页 ${pageIndex + 1}`),
@@ -80,7 +109,18 @@ function sanitizeSections(sections: StoryboardSection[]): StoryboardSection[] {
 
 function buildPayload(sections: StoryboardSection[]): StoryboardPatchPayload {
   return sanitizeSections(sections).map((section) => ({
+    part_id: section.part_id,
     part_title: section.title,
+    section_page: section.sectionPage
+      ? {
+          enabled: true,
+          page_id: section.sectionPage.page_id,
+          title: section.sectionPage.title,
+          subtitle: section.sectionPage.subtitle,
+          preview_items: section.sectionPage.content_outline,
+          visual_intent: section.sectionPage.visual_intent,
+        }
+      : {enabled: false},
     pages: section.pages.map((page) => ({
       page_id: page.page_id,
       title: page.title,
@@ -95,25 +135,19 @@ function buildSignature(sections: StoryboardSection[]): string {
 
 function splitStoryboardPages(pages: PageSummary[]) {
   const orderedPages = [...pages].sort((left, right) => left.sort_order - right.sort_order);
-  const prefixPages: PageSummary[] = [];
-  const suffixPages: PageSummary[] = [];
-  const contentPages: PageSummary[] = [];
-  let seenContent = false;
+  const prefixPages = orderedPages.filter((page) => page.page_role === 'cover' || page.page_role === 'toc');
+  const suffixPages = orderedPages.filter((page) => page.page_role === 'end');
+  const bodyPages = orderedPages.filter((page) => page.page_role === 'section' || page.page_role === 'content');
+  return {prefixPages, suffixPages, bodyPages};
+}
 
-  orderedPages.forEach((page) => {
-    if (page.page_role === 'content') {
-      seenContent = true;
-      contentPages.push(page);
-      return;
-    }
-    if (!seenContent) {
-      prefixPages.push(page);
-      return;
-    }
-    suffixPages.push(page);
-  });
-
-  return {prefixPages, suffixPages, contentPages};
+function pageCompositionLabel(pages: PageSummary[]): string {
+  const cover = pages.filter((page) => page.page_role === 'cover').length;
+  const toc = pages.filter((page) => page.page_role === 'toc').length;
+  const section = pages.filter((page) => page.page_role === 'section').length;
+  const content = pages.filter((page) => page.page_role === 'content').length;
+  const end = pages.filter((page) => page.page_role === 'end').length;
+  return `封面 ${cover} + 目录 ${toc} + 章节过渡 ${section} + 正文 ${content} + 收尾 ${end} = ${pages.length}`;
 }
 
 function createContentPage(page: PageSummary): StoryboardContentPage {
@@ -128,55 +162,56 @@ function createContentPage(page: PageSummary): StoryboardContentPage {
   };
 }
 
-function buildSectionsFromPartTitle(contentPages: PageSummary[]): StoryboardSection[] {
-  const sections: StoryboardSection[] = [];
-  const sectionIndexByTitle = new Map<string, number>();
-
-  contentPages.forEach((page) => {
-    const title = normalizeTitle(page.part_title ?? '', '未命名章节');
-    const existingIndex = sectionIndexByTitle.get(title);
-    if (existingIndex === undefined) {
-      sectionIndexByTitle.set(title, sections.length);
-      sections.push({
-        key: `part-${sections.length}`,
-        title,
-        pages: [createContentPage(page)],
-      });
-      return;
-    }
-    sections[existingIndex].pages.push(createContentPage(page));
-  });
-
-  return sections;
+function createSectionPage(page: PageSummary): StoryboardSectionPage {
+  return createContentPage(page);
 }
 
-function buildSectionsFromOutline(contentPages: PageSummary[], outline: OutlineResponse | null): StoryboardSection[] {
-  const parts = outline?.outline?.ppt_outline?.parts ?? [];
-  if (!parts.length) {
-    return buildSectionsFromPartTitle(contentPages);
-  }
+function partKey(page: PageSummary): string {
+  return page.part_id || `legacy-${normalizeTitle(page.part_title ?? '', '未命名章节')}`;
+}
+
+function buildSectionsFromPages(bodyPages: PageSummary[], outline: OutlineResponse | null): StoryboardSection[] {
+  const outlineParts = outline?.outline?.ppt_outline?.parts ?? [];
+  const visualByPartId = new Map<string, {subtitle?: string; visual_intent?: string}>();
+  outlineParts.forEach((part, index) => {
+    const partId = part.part_id || `part-${index + 1}`;
+    visualByPartId.set(partId, {
+      subtitle: part.section_page?.subtitle,
+      visual_intent: part.section_page?.visual_intent,
+    });
+  });
 
   const sections: StoryboardSection[] = [];
-  let contentIndex = 0;
-
-  for (const [partIndex, part] of parts.entries()) {
-    const partPages = Array.isArray(part.pages) ? part.pages : [];
-    const nextPages = contentPages.slice(contentIndex, contentIndex + partPages.length).map(createContentPage);
-    if (nextPages.length !== partPages.length) {
-      return buildSectionsFromPartTitle(contentPages);
+  const sectionIndexByKey = new Map<string, number>();
+  bodyPages.forEach((page) => {
+    const key = partKey(page);
+    let index = sectionIndexByKey.get(key);
+    if (index === undefined) {
+      index = sections.length;
+      sectionIndexByKey.set(key, index);
+      sections.push({
+        key,
+        part_id: page.part_id,
+        title: normalizeTitle(page.part_title ?? '', `新章节 ${formatSectionNo(index)}`),
+        sectionPage: null,
+        pages: [],
+      });
     }
-    sections.push({
-      key: `part-${partIndex}`,
-      title: normalizeTitle(part.part_title ?? '', `新章节 ${formatSectionNo(partIndex)}`),
-      pages: nextPages,
-    });
-    contentIndex += partPages.length;
-  }
-
-  if (contentIndex !== contentPages.length) {
-    return buildSectionsFromPartTitle(contentPages);
-  }
-
+    const section = sections[index];
+    if (page.page_role === 'section') {
+      const meta = visualByPartId.get(page.part_id || key) || {};
+      section.sectionPage = {
+        ...createSectionPage(page),
+        subtitle: meta.subtitle,
+        visual_intent: meta.visual_intent,
+      };
+      if (page.part_title) {
+        section.title = page.part_title;
+      }
+      return;
+    }
+    section.pages.push(createContentPage(page));
+  });
   return sections;
 }
 
@@ -189,6 +224,10 @@ function buildDisplayOrderMap(prefixPages: PageSummary[], sections: StoryboardSe
     currentOrder += 1;
   });
   sections.forEach((section) => {
+    if (section.sectionPage) {
+      displayOrderMap.set(section.sectionPage.key, currentOrder);
+      currentOrder += 1;
+    }
     section.pages.forEach((page) => {
       displayOrderMap.set(page.key, currentOrder);
       currentOrder += 1;
@@ -679,11 +718,11 @@ export default function StoryboardPanel({
 }) {
   const tempIdRef = useRef(0);
   const layout = useMemo(() => {
-    const {prefixPages, suffixPages, contentPages} = splitStoryboardPages(pages);
+    const {prefixPages, suffixPages, bodyPages} = splitStoryboardPages(pages);
     return {
       prefixPages,
       suffixPages,
-      sections: buildSectionsFromOutline(contentPages, outline),
+      sections: buildSectionsFromPages(bodyPages, outline),
     };
   }, [outline, pages]);
 
@@ -826,7 +865,16 @@ export default function StoryboardPanel({
       ...sections,
       {
         key: `section-${Date.now()}`,
+        part_id: null,
         title: `新章节 ${formatSectionNo(sections.length)}`,
+        sectionPage: sections.some((item) => item.sectionPage)
+          ? {
+              key: `section-page-${Date.now()}`,
+              page_id: null,
+              title: `新章节 ${formatSectionNo(sections.length)}`,
+              content_outline: ['本章预告'],
+            }
+          : null,
         pages: [],
       },
     ];
@@ -872,7 +920,9 @@ export default function StoryboardPanel({
     const shouldDelete =
       typeof window === 'undefined'
         ? true
-        : window.confirm(`删除章节「${section.title || `章节 ${formatSectionNo(sectionIndex)}`}」？章节内 ${section.pages.length} 个内容页会一起删除。`);
+        : window.confirm(
+            `删除章节「${section.title || `章节 ${formatSectionNo(sectionIndex)}`}」？章节页和 ${section.pages.length} 个内容页会一起删除。`,
+          );
     if (!shouldDelete) {
       return;
     }
@@ -938,9 +988,14 @@ export default function StoryboardPanel({
                     </div>
                   ))}
                 </div>
-                <div className="mt-8 flex items-center justify-between border-t border-white/20 pt-5">
-                  <span className="text-xs font-bold tracking-wide">PPT Structure</span>
-                  <span className="text-xs opacity-80">{sections.length} 个章节</span>
+                <div className="mt-8 border-t border-white/20 pt-5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold tracking-wide">PPT Structure</span>
+                    <span className="text-xs opacity-80">{sections.length} 个章节</span>
+                  </div>
+                  <div className="mt-2 text-[11px] font-medium leading-relaxed text-white/85">
+                    {pageCompositionLabel(pages)}
+                  </div>
                 </div>
                 <div className="absolute top-1/2 -right-8 h-px w-8 border-t-2 border-dashed border-slate-300" />
               </div>
@@ -976,7 +1031,7 @@ export default function StoryboardPanel({
                   <SectionCard
                     index={sectionIndex}
                     title={section.title}
-                    pageCount={section.pages.length}
+                    pageCount={section.pages.length + (section.sectionPage ? 1 : 0)}
                     saving={isSaving}
                     dropPosition={
                       dropTarget?.type === 'section' && dropTarget.sectionIndex === sectionIndex ? dropTarget.position : null
@@ -996,6 +1051,44 @@ export default function StoryboardPanel({
 
                   <div className="relative flex items-center gap-8">
                     <div className="absolute top-1/2 -left-12 h-px w-12 border-t-2 border-dashed border-slate-300" />
+
+                    {section.sectionPage ? (
+                      <div className="relative flex items-center gap-8">
+                        <StoryboardPageCard
+                          pageId={section.sectionPage.page_id}
+                          title={section.sectionPage.title}
+                          contentOutline={section.sectionPage.content_outline}
+                          roleLabel="章节页"
+                          displayOrder={displayOrderMap.get(section.sectionPage.key) ?? sectionIndex + 1}
+                          surface={surface}
+                          active={section.sectionPage.page_id === activePageId}
+                          editable
+                          saving={isSaving}
+                          unsaved={!section.sectionPage.page_id}
+                          searchStatus={section.sectionPage.search_status}
+                          draftStatus={section.sectionPage.draft_status}
+                          designStatus={section.sectionPage.design_status}
+                          onTitleChange={(value) =>
+                            setSections((current) => {
+                              const next = cloneSections(current);
+                              if (next[sectionIndex]?.sectionPage) {
+                                next[sectionIndex].sectionPage = {
+                                  ...next[sectionIndex].sectionPage!,
+                                  title: value,
+                                };
+                              }
+                              return next;
+                            })
+                          }
+                          onTitleBlur={() => {
+                            if (isDirty) {
+                              persistSections(sections);
+                            }
+                          }}
+                          onJump={onJump}
+                        />
+                      </div>
+                    ) : null}
 
                     {section.pages.map((page, pageIndex) => (
                       <div key={page.key} className="relative flex items-center gap-8">

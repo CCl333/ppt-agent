@@ -17,6 +17,9 @@ from app.models.entities import (
     ResearchSession,
 )
 from app.services.page_images import materialize_page_images
+from app.services.page_quality import apply_report_to_version, assert_quality_ready, evaluate_page_quality
+from app.services.page_scene import extract_page_scene, propose_layout_plan
+from app.services.visual_plan import propose_visual_plan
 from app.services.search_plan import merge_search_results, next_search_round, search_coverage
 from app.services.search_quality import MIN_DIGEST_CHARS
 from app.services.style_cards import get_library_card
@@ -477,7 +480,28 @@ class PageFlowMixin:
             "latest_instruction": latest_instruction,
         }
         plan = self.generator.generate_content_plan(page_context=page_context)
-        svg = self.generator.generate_draft_svg(page_context=page_context, content_plan=plan)
+        if page.page_role == "section":
+            visual_intent = str((self._section_meta_from_outline(page) or {}).get("visual_intent") or "").strip()
+            if visual_intent:
+                plan["visual_intent"] = visual_intent
+        visual_plan = propose_visual_plan(plan, page_images=page.page_images_json or [], page_role=page.page_role)
+        plan = {**plan, "visual_slots": visual_plan.get("slots") or []}
+        layout_plan = propose_layout_plan(plan, page_role=page.page_role)
+        svg = self.generator.generate_draft_svg(
+            page_context=page_context,
+            content_plan=plan,
+            layout_plan=layout_plan,
+            visual_plan=visual_plan,
+        )
+        extracted = extract_page_scene(svg, content_plan=plan, base_scene=layout_plan)
+        report = evaluate_page_quality(
+            svg,
+            stage="draft",
+            content_plan=plan,
+            layout_plan=layout_plan,
+            visual_plan=visual_plan,
+            run_export_preflight=False,
+        )
         version_no = (self.session.scalar(select(func.count(DraftVersion.id)).where(DraftVersion.page_id == page.id)) or 0) + 1
         draft = DraftVersion(
             project_id=project.id,
@@ -488,14 +512,21 @@ class PageFlowMixin:
             research_session_id=page.current_research_session_id,
             draft_svg_markup=svg,
             content_plan_json=plan,
+            visual_plan_json=visual_plan,
+            layout_plan_json=extracted,
         )
+        apply_report_to_version(draft, report, svg_markup=svg)
         self.session.add(draft)
         self.session.flush()
         page.current_draft_version_id = draft.id
+        if report.get("hard_fail"):
+            page.draft_status = "failed"
+            self._update_artifact_staleness(page)
+            assert_quality_ready(report, stage="draft")
         page.draft_status = "ready"
         page.design_status = "stale" if page.current_design_version_id else "empty"
         self._update_artifact_staleness(page)
-        return {"draft_version_id": draft.id, "summary_source": summary_source}
+        return {"draft_version_id": draft.id, "summary_source": summary_source, "quality_report": report}
 
     def _run_page_design(
         self,
@@ -512,11 +543,15 @@ class PageFlowMixin:
         page_count = self.session.scalar(select(func.count(ProjectPage.id)).where(ProjectPage.project_id == project.id)) or 1
         brief = self._get_current_brief(page)
         plan = draft.content_plan_json if isinstance(draft.content_plan_json, dict) else {}
+        base_scene = draft.layout_plan_json if isinstance(draft.layout_plan_json, dict) else {}
+        visual_plan = draft.visual_plan_json if isinstance(draft.visual_plan_json, dict) else propose_visual_plan(plan, page_images=page.page_images_json or [], page_role=page.page_role)
         svg = self.generator.generate_design_svg(
             draft_svg=draft.draft_svg_markup,
             style_pack_id=project.style_preset,
             background_asset_path=project.background_asset_path,
             content_plan=plan,
+            layout_plan=base_scene,
+            visual_plan=visual_plan,
             page_images=page.page_images_json or [],
             frozen_card=self._frozen_style_card(project) or get_library_card(self.session, str(project.style_preset or "")),
             chrome={
@@ -527,6 +562,15 @@ class PageFlowMixin:
             },
         )
         version_no = (self.session.scalar(select(func.count(DesignVersion.id)).where(DesignVersion.page_id == page.id)) or 0) + 1
+        extracted = extract_page_scene(svg, content_plan=plan, base_scene=base_scene)
+        report = evaluate_page_quality(
+            svg,
+            stage="design",
+            content_plan=plan,
+            layout_plan=base_scene if base_scene.get("nodes") else extracted,
+            visual_plan=visual_plan,
+            run_export_preflight=True,
+        )
         design = DesignVersion(
             project_id=project.id,
             page_id=page.id,
@@ -536,13 +580,20 @@ class PageFlowMixin:
             style_pack_id=project.style_preset,
             background_asset_path=project.background_asset_path,
             design_svg_markup=svg,
+            visual_plan_json=visual_plan,
+            layout_plan_json=extracted,
         )
+        apply_report_to_version(design, report, svg_markup=svg)
         self.session.add(design)
         self.session.flush()
         page.current_design_version_id = design.id
+        if report.get("hard_fail"):
+            page.design_status = "failed"
+            self._update_artifact_staleness(page)
+            assert_quality_ready(report, stage="design")
         page.design_status = "ready"
         self._update_artifact_staleness(page)
-        return {"design_version_id": design.id}
+        return {"design_version_id": design.id, "quality_report": report}
 
     def run_page_action_flow(
         self,

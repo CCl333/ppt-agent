@@ -5,7 +5,7 @@ import zipfile
 from pathlib import Path
 
 from app.services.export import build_pptx, rasterize_svg_to_png
-from tests.helpers import make_content_page, make_project
+from tests.helpers import drain_tasks, make_content_page, make_project
 
 SAMPLE_SVG = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720">
@@ -49,10 +49,16 @@ def test_create_export_pptx_via_api(client, db_session):
     db_session.commit()
 
     response = client.post(f"/api/v1/projects/{project.id}/exports", json={"export_format": "pptx"})
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
     payload = response.json()
     export_id = payload["export_id"]
-    assert "企业落地大模型实践路径.pptx" in payload["file_path"].replace("\\", "/")
+    assert payload["status"] == "queued"
+    drain_tasks()
+    completed = client.get(f"/api/v1/projects/{project.id}/exports/{export_id}")
+    assert completed.status_code == 200
+    payload = completed.json()
+    assert payload["status"] == "completed"
+    assert "企业落地大模型实践路径" in payload["file_path"].replace("\\", "/")
     download = client.get(f"/api/v1/projects/{project.id}/exports/{export_id}/download")
     assert download.status_code == 200
     disposition = download.headers.get("content-disposition", "")
@@ -78,4 +84,49 @@ def test_export_rejects_incomplete_design(client, db_session):
         with_design=False,
     )
     response = client.post(f"/api/v1/projects/{project.id}/exports", json={"export_format": "pptx"})
-    assert response.status_code == 422
+    assert response.status_code == 202, response.text
+    export_id = response.json()["export_id"]
+    drain_tasks()
+    status = client.get(f"/api/v1/projects/{project.id}/exports/{export_id}")
+    assert status.status_code == 200
+    detail = status.json()
+    assert detail["status"] == "failed"
+    assert detail.get("error_code")
+    download = client.get(f"/api/v1/projects/{project.id}/exports/{export_id}/download")
+    assert download.status_code == 409
+
+
+def test_export_unknown_element_creates_failed_job_without_image_fallback(client, db_session):
+    from app.models.entities import DesignVersion, ExportJob
+
+    project = make_project(db_session, stage="design")
+    page = make_content_page(db_session, project, page_code="p1", title="坏页", sort_order=1)
+    design = db_session.get(DesignVersion, page.current_design_version_id)
+    design.design_svg_markup = '<svg viewBox="0 0 1280 720"><foo/></svg>'
+    db_session.commit()
+
+    response = client.post(f"/api/v1/projects/{project.id}/exports", json={"export_format": "pptx"})
+    assert response.status_code == 202, response.text
+    export_id = response.json()["export_id"]
+    drain_tasks()
+    db_session.expire_all()
+    job = db_session.get(ExportJob, export_id)
+    assert job is not None
+    assert job.status == "failed"
+    assert job.export_format == "pptx"
+    assert job.render_mode == "shapes"
+    assert job.error_code in {"EXPORT_SHAPES_FAILED", "EXPORT_SHAPES_PREFLIGHT", "UNCLASSIFIED"}
+    assert "image" not in str(job.error_detail_json.get("message") or "").lower() or "pptx-image" not in str(job.error_detail_json).lower()
+    download = client.get(f"/api/v1/projects/{project.id}/exports/{export_id}/download")
+    assert download.status_code == 409
+
+
+def test_page_quality_endpoint_returns_reports(client, db_session):
+    project = make_project(db_session, stage="design")
+    page = make_content_page(db_session, project, page_code="p1", title="质量页", sort_order=1)
+    response = client.get(f"/api/v1/projects/{project.id}/pages/{page.id}/quality")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["page_id"] == page.id
+    assert "draft" in payload
+    assert "design" in payload

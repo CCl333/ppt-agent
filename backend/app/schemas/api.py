@@ -71,14 +71,54 @@ class DraftPatchRequest(BaseModel):
     svg_markup: str = Field(min_length=1)
 
 
+class SceneBoxPayload(BaseModel):
+    x: float
+    y: float
+    w: float
+    h: float
+
+
+class SceneTextEditPayload(BaseModel):
+    node_id: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+
+
+class SceneBoxEditPayload(BaseModel):
+    node_id: str = Field(min_length=1)
+    box: SceneBoxPayload
+
+
+class SceneSlotVisibilityPayload(BaseModel):
+    slot_id: str = Field(min_length=1)
+    visible: bool
+
+
+class ScenePatchRequest(BaseModel):
+    base_version_id: str = Field(min_length=1)
+    text_edits: list[SceneTextEditPayload] = Field(default_factory=list)
+    box_edits: list[SceneBoxEditPayload] = Field(default_factory=list)
+    slot_visibility: list[SceneSlotVisibilityPayload] = Field(default_factory=list)
+
+
 class StoryboardPagePatchRequest(BaseModel):
     page_id: str | None = None
     title: str = Field(min_length=1)
     content_outline: list[str] = Field(default_factory=list)
 
 
+class StoryboardSectionPagePatchRequest(BaseModel):
+    enabled: bool | None = None
+    page_id: str | None = None
+    title: str | None = None
+    subtitle: str | None = None
+    preview_items: list[str] = Field(default_factory=list)
+    visual_intent: str | None = None
+
+
 class StoryboardSectionPatchRequest(BaseModel):
+    part_id: str | None = None
     part_title: str = Field(min_length=1)
+    section_page: StoryboardSectionPagePatchRequest | None = None
     pages: list[StoryboardPagePatchRequest] = Field(default_factory=list)
 
 
@@ -97,6 +137,29 @@ class BatchActionRequest(BaseModel):
 
 class ExportCreateRequest(BaseModel):
     export_format: str = "pptx"
+    render_mode: str | None = None
+    idempotency_key: str | None = None
+
+
+class QualityEvalEstimateRequest(BaseModel):
+    mode: str = "quick"
+    scope: str = "canary"
+    page_ids: list[str] = Field(default_factory=list)
+    pairwise_candidates: int = Field(default=2, ge=2, le=4)
+
+
+class QualityEvalCreateRequest(QualityEvalEstimateRequest):
+    requested_models: list[str] = Field(default_factory=list)
+    idempotency_key: str | None = None
+
+
+class QualityEvalHumanReviewRequest(BaseModel):
+    page_id: str = Field(min_length=1)
+    reviewer_id: str = Field(min_length=1)
+    blind: bool = True
+    scores: dict[str, int] = Field(default_factory=dict)
+    pairwise: dict[str, str] | None = None
+    notes: str = ""
 
 
 class StyleCardConfirmRequest(BaseModel):

@@ -67,12 +67,14 @@ def normalize_content_plan(
     presenter = normalize_text(footer_raw.get("presenter"))
     date = normalize_text(footer_raw.get("date"))
     footer = {key: value for key, value in (("presenter", presenter), ("date", date)) if value}
-    if page_role in {"content", "toc"}:
+    if page_role in {"content", "toc", "section"}:
         footer = {}
     if page_role == "content" and not blocks:
         raise RuntimeError("内容页策划稿缺少 blocks")
     if page_role == "content" and not (CONTENT_BLOCK_MIN <= len(blocks) <= CONTENT_BLOCK_MAX):
         raise RuntimeError(f"内容策划 blocks 数量必须为 {CONTENT_BLOCK_MIN}～{CONTENT_BLOCK_MAX}")
+    if page_role == "section" and not blocks and not subtitle:
+        raise RuntimeError("章节页策划稿缺少 subtitle 或预告要点")
     if page_role in {"cover", "end", "toc"} and not blocks and not subtitle:
         raise RuntimeError("封面/目录/结尾策划稿缺少 subtitle 或价值点")
     catalog_ids = {
@@ -96,7 +98,7 @@ def normalize_content_plan(
             {
                 "image_id": image_id,
                 "label": normalize_text(item.get("label")) or image_id,
-                "placement": normalize_text(item.get("placement")) or "hero",
+                "placement": normalize_text(item.get("placement")) or ("hero" if page_role == "cover" else "support"),
             }
         )
     if slots and not catalog_ids:
@@ -109,6 +111,7 @@ def normalize_content_plan(
         "blocks": blocks,
         "footer": footer,
         "image_slots": slots,
+        **({"visual_intent": normalize_text(payload.get("visual_intent"))} if page_role == "section" and normalize_text(payload.get("visual_intent")) else {}),
     }
 
 

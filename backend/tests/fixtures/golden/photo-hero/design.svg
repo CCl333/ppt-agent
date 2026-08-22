@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720">
+  <text x="80" y="120" class="t-title" data-node-id="page-title" font-size="32px" fill="#0F172A">中轴线现场</text>
+  <image x="448" y="160" width="720" height="400" data-image-id="asset-7" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="/>
+  <text x="80" y="200" class="t-body" font-size="16px" fill="#475569">空间格局</text>
+  <text x="80" y="240" class="t-body" font-size="16px" fill="#475569">参观节奏</text>
+  <text x="80" y="280" class="t-body" font-size="16px" fill="#475569">预约窗口</text>
+</svg>

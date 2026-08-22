@@ -32,6 +32,19 @@ def append_event(
     return event
 
 
+def query_events_after(session: Session, project_id: str, after_id: int, limit: int = 100) -> list[ProjectEvent]:
+    from sqlalchemy import select
+
+    return list(
+        session.scalars(
+            select(ProjectEvent)
+            .where(ProjectEvent.project_id == project_id, ProjectEvent.stream_id > after_id)
+            .order_by(ProjectEvent.stream_id.asc())
+            .limit(max(1, limit))
+        )
+    )
+
+
 def serialize_event(event: ProjectEvent) -> dict[str, Any]:
     return {
         "stream_id": event.stream_id,

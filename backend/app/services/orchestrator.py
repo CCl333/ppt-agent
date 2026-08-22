@@ -18,6 +18,7 @@ from app.core.config import get_settings
 from app.core.db import is_sqlite_locked, session_scope
 from app.models.base import new_id
 from app.models.entities import (
+    BatchRun,
     DesignVersion,
     DraftVersion,
     ExportJob,
@@ -27,16 +28,27 @@ from app.models.entities import (
     ProjectEvent,
     ProjectMessage,
     ProjectPage,
+    QualityEvalJob,
     RequirementForm,
     ResearchSession,
 )
 from app.services.clarification import CLARIFICATION_CODES, project_title_from_answers
 from app.services.content_plan import assert_svg_matches_plan, has_content_plan
+from app.services.error_policy import QualityGateError, classify_exception
 from app.services.events import append_event, serialize_event
 from app.services.export_name import cover_title_from_outline, resolve_export_stem
 from app.services.font_policy import build_font_report
 from app.services.page_images import public_catalog
+from app.services.page_quality import apply_report_to_version, evaluate_page_quality
+from app.services.page_scene import extract_page_scene
+from app.services.scene_patch import ScenePatchError, apply_scene_patch
 from app.services.search_plan import search_coverage
+from app.services.storyboard import (
+    build_section_summary,
+    build_storyboard_tree,
+    normalize_section_page,
+    want_section_page,
+)
 from app.services.style_cards import (
     get_library_card,
     list_library_cards,
@@ -47,8 +59,10 @@ from app.services.style_cards import (
 from app.services.tasks import (
     cancel_tasks as request_task_cancel,
     enqueue_batch_action,
+    enqueue_export_job,
     enqueue_page_action,
     enqueue_project_task,
+    enqueue_quality_eval_job,
     wake_scheduler,
 )
 from app.services.generation import GenerationService
@@ -890,7 +904,9 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         outline = self._get_current_outline(project_id)
         if not outline:
             raise HTTPException(status_code=404, detail="大纲尚未生成")
-        return self.serialize_outline(outline)
+        payload = self.serialize_outline(outline)
+        payload["storyboard"] = self._serialize_storyboard(project_id)
+        return payload
 
     def list_pages(self, project_id: str) -> list[dict[str, Any]]:
         self._require_project(project_id)
@@ -912,18 +928,27 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         )
         outline_payload = json.loads(json.dumps(current_outline.outline_json or {}))
         ppt_outline = outline_payload.get("ppt_outline") or {}
-        content_pages = [page for page in pages if page.page_role == "content"]
-        existing_page_by_id = {page.id: page for page in content_pages}
+        content_by_id = {page.id: page for page in pages if page.page_role == "content"}
+        section_by_id = {page.id: page for page in pages if page.page_role == "section"}
+        section_by_part_id: dict[str, ProjectPage] = {}
+        for page in pages:
+            if page.page_role == "section" and page.part_id:
+                section_by_part_id.setdefault(str(page.part_id), page)
         requested_existing_ids: list[str] = []
         rebuilt_parts: list[dict[str, Any]] = []
-        ordered_content_pages: list[ProjectPage] = []
-
+        ordered_body_pages: list[ProjectPage] = []
+        section_stale_ids: set[str] = set()
         used_page_ids: set[str] = set()
+        used_part_ids: set[str] = set()
         next_page_code_no = 1
+        next_part_no = 1
         for page in pages:
             match = re.fullmatch(r"page-(\d+)", page.page_code or "")
             if match:
                 next_page_code_no = max(next_page_code_no, int(match.group(1)) + 1)
+            match_part = re.fullmatch(r"part-(\d+)", page.part_id or "")
+            if match_part:
+                next_part_no = max(next_part_no, int(match_part.group(1)) + 1)
 
         def allocate_page_code() -> str:
             nonlocal next_page_code_no
@@ -931,18 +956,48 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             next_page_code_no += 1
             return code
 
+        def allocate_part_id() -> str:
+            nonlocal next_part_no
+            part_id = f"part-{next_part_no}"
+            next_part_no += 1
+            return part_id
+
+        previous_content_ids_by_part: dict[str, list[str]] = {}
+        for page in pages:
+            if page.page_role != "content" or not page.part_id:
+                continue
+            previous_content_ids_by_part.setdefault(page.part_id, []).append(page.id)
+
         for part_payload in parts_payload:
             part_title = str(part_payload.get("part_title") or "").strip() or "未命名章节"
+            part_id = str(part_payload.get("part_id") or "").strip()
+            if not part_id or part_id in used_part_ids:
+                for page_payload in part_payload.get("pages", []):
+                    existing = content_by_id.get(str(page_payload.get("page_id") or ""))
+                    if existing and existing.part_id and existing.part_id not in used_part_ids:
+                        part_id = existing.part_id
+                        break
+                if not part_id or part_id in used_part_ids:
+                    section_payload_early = part_payload.get("section_page") if isinstance(part_payload.get("section_page"), dict) else {}
+                    existing_section_page = section_by_id.get(str(section_payload_early.get("page_id") or ""))
+                    if existing_section_page and existing_section_page.part_id and existing_section_page.part_id not in used_part_ids:
+                        part_id = existing_section_page.part_id
+                if not part_id or part_id in used_part_ids:
+                    part_id = allocate_part_id()
+            used_part_ids.add(part_id)
             rebuilt_pages: list[dict[str, Any]] = []
+            ordered_content: list[ProjectPage] = []
+            content_changed = False
+            previous_content_ids = previous_content_ids_by_part.get(part_id, [])
+
             for page_payload in part_payload.get("pages", []):
                 page_id = page_payload.get("page_id")
                 title = str(page_payload.get("title") or "").strip() or "新内容页"
                 content_outline = [str(item).strip() for item in page_payload.get("content_outline", []) if str(item).strip()]
-
                 if page_id:
                     if page_id in used_page_ids:
                         raise HTTPException(status_code=422, detail="storyboard 页面重复，无法重排")
-                    page = existing_page_by_id.get(page_id)
+                    page = content_by_id.get(page_id)
                     if not page:
                         raise HTTPException(status_code=422, detail="storyboard 页面不存在，无法重排")
                     used_page_ids.add(page_id)
@@ -950,7 +1005,9 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
                     brief = self._get_current_brief(page)
                     current_title = brief.title if brief else ""
                     current_content_outline = brief.content_outline_json if brief else []
-                    if current_title != title or current_content_outline != content_outline or page.part_title != part_title:
+                    title_or_outline_changed = current_title != title or current_content_outline != content_outline
+                    grouping_changed = page.part_title != part_title or page.part_id != part_id
+                    if title_or_outline_changed:
                         self._new_page_brief_version(
                             page=page,
                             title=title,
@@ -958,103 +1015,180 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
                             section_title=part_title,
                         )
                         self._mark_page_structure_changed(page)
+                        content_changed = True
+                    elif grouping_changed:
+                        page.part_id = part_id
+                        page.part_title = part_title
+                    page.part_id = part_id
+                    page.part_title = part_title
                 else:
-                    page = ProjectPage(
-                        project_id=project.id,
-                        page_code=allocate_page_code(),
+                    page = self._create_empty_page(
+                        project,
                         page_role="content",
+                        page_code=allocate_page_code(),
+                        part_id=part_id,
                         part_title=part_title,
-                        sort_order=0,
-                        outline_status="ready",
-                        search_status="empty",
-                        summary_status="empty",
-                        draft_status="empty",
-                        design_status="empty",
-                        page_summary_md="",
-                        page_summary_citations_json=[],
-                        page_search_queries_json=[],
-                        page_search_results_json=[],
-                        page_corpus_digest_json={},
-                        artifact_staleness_json={},
-                    )
-                    self.session.add(page)
-                    self.session.flush()
-                    self._new_page_brief_version(
-                        page=page,
                         title=title,
                         content_outline=content_outline,
-                        section_title=part_title,
                     )
                     self._mark_page_structure_changed(page)
+                    content_changed = True
+                ordered_content.append(page)
+                rebuilt_pages.append({"title": title, "content": content_outline})
 
-                ordered_content_pages.append(page)
-                rebuilt_pages.append(
-                    {
-                        "title": title,
-                        "content": content_outline,
-                    }
+            next_content_ids = [page.id for page in ordered_content]
+            if next_content_ids != previous_content_ids:
+                content_changed = True
+
+            section_payload = part_payload.get("section_page")
+            existing_section = None
+            if isinstance(section_payload, dict) and section_payload.get("page_id"):
+                existing_section = section_by_id.get(str(section_payload.get("page_id")))
+                if existing_section is None:
+                    raise HTTPException(status_code=422, detail="storyboard 章节页不存在，无法重排")
+            if existing_section is None:
+                existing_section = section_by_part_id.get(part_id)
+            should_have_section = want_section_page(
+                section_payload,
+                has_existing=existing_section is not None,
+            )
+            content_titles = [item["title"] for item in rebuilt_pages]
+            section_meta = normalize_section_page(
+                section_payload if isinstance(section_payload, dict) else (self._section_meta_from_page(existing_section) if existing_section else {}),
+                part_title=part_title,
+                content_titles=content_titles,
+                enabled=should_have_section,
+            )
+            section_page = None
+            if should_have_section:
+                preview_items = section_meta.get("preview_items") or content_titles
+                section_title = str(section_meta.get("title") or part_title)
+                if existing_section:
+                    if existing_section.id in used_page_ids:
+                        raise HTTPException(status_code=422, detail="storyboard 页面重复，无法重排")
+                    section_page = existing_section
+                    used_page_ids.add(section_page.id)
+                    brief = self._get_current_brief(section_page)
+                    current_title = brief.title if brief else ""
+                    current_preview = brief.content_outline_json if brief else []
+                    meta_changed = (
+                        current_title != section_title
+                        or list(current_preview) != list(preview_items)
+                        or section_page.part_title != part_title
+                    )
+                    section_page.part_id = part_id
+                    section_page.part_title = part_title
+                    if meta_changed:
+                        self._new_page_brief_version(
+                            page=section_page,
+                            title=section_title,
+                            content_outline=preview_items,
+                            section_title=part_title,
+                        )
+                    if meta_changed or content_changed:
+                        section_stale_ids.add(section_page.id)
+                else:
+                    section_page = self._create_empty_page(
+                        project,
+                        page_role="section",
+                        page_code=allocate_page_code(),
+                        part_id=part_id,
+                        part_title=part_title,
+                        title=section_title,
+                        content_outline=preview_items,
+                    )
+                    section_stale_ids.add(section_page.id)
+                self._refresh_section_summary(
+                    section_page,
+                    part_title=part_title,
+                    section_meta=section_meta,
+                    content_titles=content_titles,
                 )
+                ordered_body_pages.append(section_page)
+            ordered_body_pages.extend(ordered_content)
             rebuilt_parts.append(
                 {
+                    "part_id": part_id,
                     "part_title": part_title,
+                    "section_page": section_meta,
                     "pages": rebuilt_pages,
                 }
             )
 
-        requested_existing_id_set = set(requested_existing_ids)
-        deleted_content_pages = [page for page in content_pages if page.id not in requested_existing_id_set]
-        for page in deleted_content_pages:
-            self.session.delete(page)
+        requested_existing_id_set = set(requested_existing_ids) | {
+            page.id for page in ordered_body_pages if page.page_role == "section"
+        }
+        for page in list(content_by_id.values()) + list(section_by_id.values()):
+            if page.id not in requested_existing_id_set and page not in ordered_body_pages:
+                if page.page_role == "section":
+                    sibling_part = page.part_id
+                    for body in ordered_body_pages:
+                        if body.page_role == "section" and body.part_id == sibling_part:
+                            section_stale_ids.add(body.id)
+                self.session.delete(page)
 
         ppt_outline["parts"] = rebuilt_parts
-
-        prefix_pages: list[ProjectPage] = []
-        suffix_pages: list[ProjectPage] = []
-        seen_content = False
-        for page in pages:
-            if page.page_role == "content":
-                seen_content = True
-                continue
-            if not seen_content:
-                prefix_pages.append(page)
-            else:
-                suffix_pages.append(page)
-
-        ordered_pages = prefix_pages + ordered_content_pages + suffix_pages
+        prefix_pages = [page for page in pages if page.page_role in {"cover", "toc"}]
+        suffix_pages = [page for page in pages if page.page_role == "end"]
+        ordered_pages = prefix_pages + ordered_body_pages + suffix_pages
         for sort_order, page in enumerate(ordered_pages, start=1):
             page.sort_order = sort_order
 
+        for page in ordered_pages:
+            if page.id in section_stale_ids:
+                self._mark_section_outputs_stale(page)
+
         current_outline_changed = current_outline.outline_json != outline_payload
-        current_order_ids = [page.id for page in content_pages]
-        next_order_ids = [page.id for page in ordered_content_pages]
-        if not current_outline_changed and current_order_ids == next_order_ids:
+        current_order_ids = [page.id for page in pages]
+        next_order_ids = [page.id for page in ordered_pages]
+        needs_new_outline = (
+            current_outline_changed
+            or current_order_ids != next_order_ids
+            or bool(section_stale_ids)
+        )
+        session_dirty = bool(self.session.new or self.session.dirty or self.session.deleted)
+        if not needs_new_outline and not session_dirty:
+            items = [self.serialize_page(page) for page in ordered_pages]
             return {
-                "items": [self.serialize_page(page) for page in ordered_pages],
+                "items": items,
                 "outline": self.serialize_outline(current_outline),
+                "storyboard": build_storyboard_tree(items),
             }
 
-        next_outline = OutlineVersion(
-            project_id=project.id,
-            version_no=current_outline.version_no + 1,
-            status="ready",
-            outline_json=outline_payload,
-        )
-        self.session.add(next_outline)
+        saved_outline = current_outline
+        if needs_new_outline:
+            saved_outline = OutlineVersion(
+                project_id=project.id,
+                version_no=current_outline.version_no + 1,
+                status="ready",
+                outline_json=outline_payload,
+            )
+            self.session.add(saved_outline)
         self.session.commit()
+        items = [self.serialize_page(page) for page in ordered_pages]
         return {
-            "items": [self.serialize_page(page) for page in ordered_pages],
-            "outline": self.serialize_outline(next_outline),
+            "items": items,
+            "outline": self.serialize_outline(saved_outline),
+            "storyboard": build_storyboard_tree(items),
         }
 
     def patch_page_outline(self, project_id: str, page_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         page = self._require_page(project_id, page_id)
-        brief = self._new_page_brief_version(
+        self._new_page_brief_version(
             page=page,
             title=payload["title"],
             content_outline=payload["content_outline"],
             section_title=payload.get("section_title"),
         )
-        self._mark_page_structure_changed(page)
+        if page.page_role == "section":
+            self._mark_section_outputs_stale(page)
+        else:
+            self._mark_page_structure_changed(page)
+            if page.page_role == "content" and page.part_id:
+                section = self._section_page_for_part(project_id, page.part_id)
+                if section:
+                    self._mark_section_outputs_stale(section)
+                    self._refresh_section_summary_from_pages(section)
         self.session.commit()
         return self.serialize_page(page, include_versions=True)
 
@@ -1081,6 +1215,19 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
                 assert_svg_matches_plan(markup, plan)
             except RuntimeError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
+        base_scene = current.layout_plan_json if current and isinstance(current.layout_plan_json, dict) else {}
+        visual_plan = current.visual_plan_json if current and isinstance(current.visual_plan_json, dict) else {}
+        extracted = extract_page_scene(markup, content_plan=plan, base_scene=base_scene)
+        report = evaluate_page_quality(
+            markup,
+            stage="draft",
+            content_plan=plan,
+            layout_plan=base_scene if base_scene.get("nodes") else extracted,
+            visual_plan=visual_plan,
+            run_export_preflight=False,
+        )
+        if report.get("hard_fail"):
+            raise HTTPException(status_code=422, detail=QualityGateError(report).as_detail())
         version_no = (
             (self.session.scalar(select(func.count(DraftVersion.id)).where(DraftVersion.page_id == page.id)) or 0) + 1
         )
@@ -1093,7 +1240,84 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             research_session_id=current.research_session_id if current else page.current_research_session_id,
             draft_svg_markup=markup,
             content_plan_json=plan,
+            visual_plan_json=visual_plan,
+            layout_plan_json=extracted,
         )
+        apply_report_to_version(draft, report, svg_markup=markup)
+        self.session.add(draft)
+        self.session.flush()
+        page.current_draft_version_id = draft.id
+        page.draft_status = "ready"
+        page.design_status = "stale" if page.current_design_version_id else "empty"
+        self._update_artifact_staleness(page)
+        self.session.commit()
+        return self.serialize_page(page, include_versions=True)
+
+    def patch_page_scene(self, project_id: str, page_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        page = self._require_page(project_id, page_id)
+        current = self._get_current_draft(page)
+        if current is None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="当前页还没有策划稿，不能保存画布修改")
+        base_version_id = str(payload.get("base_version_id") or "").strip()
+        if base_version_id != current.id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=ScenePatchError(
+                    "策划稿已有更新，请刷新后再保存",
+                    status_code=409,
+                    error_code="DRAFT_VERSION_CONFLICT",
+                    extra={"current_version_id": current.id},
+                ).as_detail(),
+            )
+        try:
+            patched = apply_scene_patch(
+                svg_markup=current.draft_svg_markup,
+                content_plan=current.content_plan_json if isinstance(current.content_plan_json, dict) else {},
+                visual_plan=current.visual_plan_json if isinstance(current.visual_plan_json, dict) else {},
+                layout_plan=current.layout_plan_json if isinstance(current.layout_plan_json, dict) else {},
+                text_edits=payload.get("text_edits") or [],
+                box_edits=payload.get("box_edits") or [],
+                slot_visibility=payload.get("slot_visibility") or [],
+            )
+            markup = extract_and_validate_svg(patched["svg_markup"])
+        except ScenePatchError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        plan = patched["content_plan"]
+        visual_plan = patched["visual_plan"]
+        layout_plan = patched["layout_plan"]
+        if has_content_plan(plan):
+            try:
+                assert_svg_matches_plan(markup, plan)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        report = evaluate_page_quality(
+            markup,
+            stage="draft",
+            content_plan=plan,
+            layout_plan=layout_plan,
+            visual_plan=visual_plan,
+            run_export_preflight=False,
+        )
+        if report.get("hard_fail"):
+            raise HTTPException(status_code=422, detail=QualityGateError(report).as_detail())
+        version_no = (
+            (self.session.scalar(select(func.count(DraftVersion.id)).where(DraftVersion.page_id == page.id)) or 0) + 1
+        )
+        draft = DraftVersion(
+            project_id=page.project_id,
+            page_id=page.id,
+            version_no=version_no,
+            status="ready",
+            page_brief_version_id=current.page_brief_version_id,
+            research_session_id=current.research_session_id,
+            draft_svg_markup=markup,
+            content_plan_json=plan,
+            visual_plan_json=visual_plan,
+            layout_plan_json=layout_plan,
+        )
+        apply_report_to_version(draft, report, svg_markup=markup)
         self.session.add(draft)
         self.session.flush()
         page.current_draft_version_id = draft.id
@@ -1144,9 +1368,40 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             action_type=action_type,
             agent_run_id=agent_run_id,
         )
+        batch = self.session.scalars(
+            select(BatchRun).where(BatchRun.project_id == project_id, BatchRun.agent_run_id == agent_run_id)
+        ).first()
         self.session.commit()
         wake_scheduler()
-        return {"status": "queued", "agent_run_id": agent_run_id, "task_ids": [item.task_id for item in tasks]}
+        from app.services.batch_run import serialize_batch_run
+
+        if batch is None:
+            return {"status": "queued", "agent_run_id": agent_run_id, "task_ids": [item.task_id for item in tasks]}
+        return serialize_batch_run(self.session, batch)
+
+    def get_batch_run(self, project_id: str, batch_run_id: str) -> dict[str, Any]:
+        self._require_project(project_id)
+        batch = self.session.get(BatchRun, batch_run_id)
+        if batch is None or batch.project_id != project_id:
+            raise HTTPException(status_code=404, detail="批次不存在")
+        from app.services.batch_run import serialize_batch_run
+
+        return serialize_batch_run(self.session, batch)
+
+    def retry_failed_batch(self, project_id: str, batch_run_id: str) -> dict[str, Any]:
+        self._require_project(project_id)
+        from app.services.batch_run import retry_failed_batch, serialize_batch_run
+
+        agent_run_id = new_id()
+        batch = retry_failed_batch(
+            self.session,
+            project_id=project_id,
+            batch_run_id=batch_run_id,
+            agent_run_id=agent_run_id,
+        )
+        self.session.commit()
+        wake_scheduler()
+        return serialize_batch_run(self.session, batch)
 
     def cancel_tasks(self, project_id: str, page_id: str | None = None) -> dict[str, Any]:
         self._require_project(project_id)
@@ -1170,28 +1425,230 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             raise HTTPException(status_code=404, detail="当前页设计稿尚未生成")
         return self.serialize_design(design)
 
-    def create_export(self, project_id: str, export_format: str) -> dict[str, Any]:
-        project = self._require_project(project_id)
-        if export_format == "zip":
-            export_path = self._build_export_archive(project)
-        elif export_format == "pptx":
-            export_path = self._build_export_pptx(project, mode="shapes")
-        elif export_format == "pptx-image":
-            export_path = self._build_export_pptx(project, mode="image")
-        else:
-            raise HTTPException(status_code=400, detail="当前仅支持 zip、pptx 或 pptx-image 导出")
-        stored_format = "pptx" if export_format.startswith("pptx") else export_format
-        export_job = ExportJob(
-            project_id=project_id,
-            export_format=stored_format,
-            status="completed",
-            file_path=str(export_path),
-            font_report_json=build_font_report(self._design_svgs_for_export(project)),
+    def create_export(
+        self,
+        project_id: str,
+        export_format: str,
+        render_mode: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        from app.services.export_job import (
+            build_export_snapshot,
+            create_export_job,
+            find_active_export,
+            resolve_render_mode,
+            serialize_export_job,
         )
-        self.session.add(export_job)
-        self.session.flush()
+
+        project = self._require_project(project_id)
+        resolved_mode = resolve_render_mode(export_format, render_mode)
+        snapshot = build_export_snapshot(self.session, project)
+        existing = find_active_export(
+            self.session,
+            project_id=project_id,
+            export_format=export_format,
+            input_hash=str(snapshot.get("input_hash") or ""),
+            idempotency_key=idempotency_key,
+        )
+        if existing:
+            return serialize_export_job(self.session, existing, project=project)
+        export_job = create_export_job(
+            self.session,
+            project,
+            export_format=export_format,
+            render_mode=resolved_mode,
+            snapshot=snapshot,
+            idempotency_key=idempotency_key,
+        )
+        enqueue_export_job(self.session, project_id=project_id, export_id=export_job.id)
         self.session.commit()
-        return self.serialize_export(export_job)
+        wake_scheduler()
+        return serialize_export_job(self.session, export_job, project=project)
+
+    def estimate_quality_eval(
+        self,
+        project_id: str,
+        *,
+        mode: str,
+        scope: str = "canary",
+        page_ids: list[str] | None = None,
+        pairwise_candidates: int = 2,
+    ) -> dict[str, Any]:
+        from app.services.quality_eval import estimate_quality_eval
+
+        project = self._require_project(project_id)
+        return estimate_quality_eval(
+            self.session,
+            project,
+            mode=mode,
+            scope=scope,
+            page_ids=page_ids,
+            pairwise_candidates=pairwise_candidates,
+        )
+
+    def create_quality_eval(
+        self,
+        project_id: str,
+        *,
+        mode: str,
+        scope: str = "canary",
+        page_ids: list[str] | None = None,
+        pairwise_candidates: int = 2,
+        requested_models: list[str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        from app.services.quality_eval import create_quality_eval_job, serialize_quality_eval_job
+
+        project = self._require_project(project_id)
+        job, created = create_quality_eval_job(
+            self.session,
+            project,
+            mode=mode,
+            scope=scope,
+            page_ids=page_ids,
+            pairwise_candidates=pairwise_candidates,
+            requested_models=requested_models,
+            idempotency_key=idempotency_key,
+        )
+        if created:
+            enqueue_quality_eval_job(self.session, project_id=project_id, eval_id=job.id)
+            self.session.commit()
+            wake_scheduler()
+        return serialize_quality_eval_job(self.session, job, project=project)
+
+    def run_quality_eval_job(self, eval_id: str) -> None:
+        from app.services.quality_eval import execute_quality_eval_job
+
+        job = self.session.get(QualityEvalJob, eval_id)
+        if job is None:
+            raise RuntimeError("主观评估任务不存在")
+        execute_quality_eval_job(self.session, job, eval_root=self.settings.quality_eval_path)
+
+    def get_quality_eval(self, project_id: str, eval_id: str) -> dict[str, Any]:
+        from app.services.quality_eval import serialize_quality_eval_job
+
+        job = self.session.get(QualityEvalJob, eval_id)
+        if not job or job.project_id != project_id:
+            raise HTTPException(status_code=404, detail="主观评估任务不存在")
+        project = self._require_project(project_id)
+        return serialize_quality_eval_job(self.session, job, project=project)
+
+    def list_quality_evals(self, project_id: str) -> dict[str, Any]:
+        from app.services.quality_eval import list_quality_eval_jobs, serialize_quality_eval_job
+
+        self._require_project(project_id)
+        jobs = list_quality_eval_jobs(self.session, project_id)
+        return {"items": [serialize_quality_eval_job(self.session, job) for job in jobs]}
+
+    def add_quality_eval_human_review(self, project_id: str, eval_id: str, review: dict[str, Any]) -> dict[str, Any]:
+        from app.services.quality_eval import add_human_review
+
+        job = self.session.get(QualityEvalJob, eval_id)
+        if not job or job.project_id != project_id:
+            raise HTTPException(status_code=404, detail="主观评估任务不存在")
+        payload = add_human_review(self.session, job, review)
+        self.session.commit()
+        return payload
+
+    def run_export_job(self, export_id: str) -> None:
+        from app.services.export_job import execute_export_job
+
+        export_job = self.session.get(ExportJob, export_id)
+        if export_job is None:
+            raise RuntimeError("导出任务不存在")
+        project = self._require_project(export_job.project_id)
+        outline = self._get_current_outline(project.id)
+        first_page = self.session.scalars(
+            select(ProjectPage)
+            .where(ProjectPage.project_id == project.id)
+            .order_by(ProjectPage.sort_order.asc())
+            .limit(1)
+        ).first()
+        first_title = None
+        if first_page:
+            brief = self._get_current_brief(first_page)
+            first_title = brief.title if brief else None
+        execute_export_job(
+            self.session,
+            export_job,
+            export_root=self.settings.export_path,
+            outline_json=outline.outline_json if outline else None,
+            first_page_title=first_title,
+            project_title=project.title,
+        )
+
+    def _persist_failed_export(
+        self,
+        project_id: str,
+        export_format: str,
+        render_mode: str | None,
+        detail: dict[str, Any],
+    ) -> ExportJob:
+        job_id = new_id()
+        payload = dict(detail)
+        payload["export_id"] = job_id
+        export_job = ExportJob(
+            id=job_id,
+            project_id=project_id,
+            export_format=export_format,
+            render_mode=render_mode,
+            status="failed",
+            file_path="",
+            error_code=str(payload.get("error_code") or "EXPORT_FAILED"),
+            error_detail_json=payload,
+        )
+        detail["export_id"] = job_id
+        self.session.add(export_job)
+        self.session.commit()
+        return export_job
+
+    def get_page_quality(self, project_id: str, page_id: str) -> dict[str, Any]:
+        page = self._require_page(project_id, page_id)
+        draft = self._get_current_draft(page)
+        design = self._get_current_design(page)
+        from app.services.quality_eval import not_run_subjective_eval, subjective_eval_for_page
+
+        subjective = (
+            subjective_eval_for_page(
+                self.session,
+                project_id=project_id,
+                page_id=page_id,
+                design_version_id=page.current_design_version_id,
+            )
+            if design
+            else not_run_subjective_eval()
+        )
+        return {
+            "page_id": page.id,
+            "draft_status": page.draft_status,
+            "design_status": page.design_status,
+            "subjective_eval": subjective,
+            "draft": {
+                "version_id": draft.id,
+                "status": draft.status,
+                "status_reason": draft.status_reason,
+                "retryability": draft.retryability,
+                "svg_hash": draft.svg_hash,
+                "quality_report": draft.quality_report_json or {},
+                "layout_plan": draft.layout_plan_json or {},
+                "visual_plan": draft.visual_plan_json or {},
+            }
+            if draft
+            else None,
+            "design": {
+                "version_id": design.id,
+                "status": design.status,
+                "status_reason": design.status_reason,
+                "retryability": design.retryability,
+                "svg_hash": design.svg_hash,
+                "quality_report": design.quality_report_json or {},
+                "layout_plan": design.layout_plan_json or {},
+                "visual_plan": design.visual_plan_json or {},
+                "export_preflight": design.export_preflight_json or {},
+            }
+            if design
+            else None,
+        }
 
     def get_export(self, project_id: str, export_id: str) -> dict[str, Any]:
         export = self.session.get(ExportJob, export_id)
@@ -1200,15 +1657,22 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         return self.serialize_export(export)
 
     def get_export_file_path(self, project_id: str, export_id: str) -> str:
+        from app.services.export_job import resolve_download_path
+
         export = self.session.get(ExportJob, export_id)
         if not export or export.project_id != project_id:
             raise HTTPException(status_code=404, detail="导出任务不存在")
-        return export.file_path
+        path = resolve_download_path(export)
+        self.session.commit()
+        return path
 
     def get_export_download_name(self, project_id: str, export_id: str) -> str:
         export = self.session.get(ExportJob, export_id)
         if not export or export.project_id != project_id:
             raise HTTPException(status_code=404, detail="导出任务不存在")
+        download_name = (export.manifest_json or {}).get("download_name")
+        if download_name:
+            return str(download_name)
         return Path(export.file_path).name
 
     def _serialize_page_preview(self, page: ProjectPage) -> dict[str, Any]:
@@ -1323,6 +1787,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             "project_id": page.project_id,
             "page_code": page.page_code,
             "page_role": page.page_role,
+            "part_id": page.part_id,
             "part_title": page.part_title,
             "sort_order": page.sort_order,
             "title": brief.title if brief else "",
@@ -1343,6 +1808,12 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             "current_brief_version_id": page.current_brief_version_id,
             "current_draft_version_id": page.current_draft_version_id,
             "current_design_version_id": page.current_design_version_id,
+            "draft_status_reason": draft.status_reason if draft else None,
+            "design_status_reason": design.status_reason if design else None,
+            "draft_retryability": draft.retryability if draft else None,
+            "design_retryability": design.retryability if design else None,
+            "draft_svg_hash": draft.svg_hash if draft else None,
+            "design_svg_hash": design.svg_hash if design else None,
             "draft_preview_svg_markup": draft.draft_svg_markup if draft and draft.draft_svg_markup.strip() else None,
             "design_preview_svg_markup": design.design_svg_markup if design and design.design_svg_markup.strip() else None,
             "created_at": page.created_at.isoformat(),
@@ -1365,6 +1836,13 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             "research_session_id": draft.research_session_id,
             "draft_svg_markup": draft.draft_svg_markup,
             "content_plan_json": draft.content_plan_json or {},
+            "visual_plan_json": draft.visual_plan_json or {},
+            "layout_plan_json": draft.layout_plan_json or {},
+            "quality_report": draft.quality_report_json or {},
+            "svg_hash": draft.svg_hash,
+            "status_reason": draft.status_reason,
+            "retryability": draft.retryability,
+            "contract_version": draft.contract_version,
             "created_at": draft.created_at.isoformat(),
             "updated_at": draft.updated_at.isoformat(),
         }
@@ -1381,22 +1859,24 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
             "style_pack_id": design.style_pack_id,
             "background_asset_path": design.background_asset_path,
             "design_svg_markup": design.design_svg_markup,
+            "visual_plan_json": design.visual_plan_json or {},
+            "layout_plan_json": design.layout_plan_json or {},
+            "quality_report": design.quality_report_json or {},
+            "export_preflight": design.export_preflight_json or {},
+            "svg_hash": design.svg_hash,
+            "status_reason": design.status_reason,
+            "retryability": design.retryability,
+            "contract_version": design.contract_version,
             "style_pack": self._resolve_style_pack(project, design.style_pack_id),
             "created_at": design.created_at.isoformat(),
             "updated_at": design.updated_at.isoformat(),
         }
 
     def serialize_export(self, export_job: ExportJob) -> dict[str, Any]:
-        return {
-            "export_id": export_job.id,
-            "project_id": export_job.project_id,
-            "export_format": export_job.export_format,
-            "status": export_job.status,
-            "file_path": export_job.file_path,
-            "font_report": export_job.font_report_json or {},
-            "created_at": export_job.created_at.isoformat(),
-            "updated_at": export_job.updated_at.isoformat(),
-        }
+        from app.services.export_job import serialize_export_job
+
+        project = self.session.get(Project, export_job.project_id)
+        return serialize_export_job(self.session, export_job, project=project)
 
     def _require_project(self, project_id: str) -> Project:
         project = self.session.get(Project, project_id)
@@ -1561,6 +2041,142 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         page.outline_status = "ready"
         return brief
 
+    def _create_empty_page(
+        self,
+        project: Project,
+        *,
+        page_role: str,
+        page_code: str,
+        part_id: str | None,
+        part_title: str | None,
+        title: str,
+        content_outline: list[str],
+    ) -> ProjectPage:
+        is_content = page_role == "content"
+        page = ProjectPage(
+            project_id=project.id,
+            page_code=page_code,
+            page_role=page_role,
+            part_id=part_id,
+            part_title=part_title,
+            sort_order=0,
+            outline_status="ready",
+            search_status="empty" if is_content else "confirmed",
+            summary_status="empty" if is_content else "confirmed",
+            draft_status="empty",
+            design_status="empty",
+            page_summary_md="",
+            page_summary_citations_json=[],
+            page_search_queries_json=[],
+            page_search_results_json=[],
+            page_corpus_digest_json={},
+            artifact_staleness_json={},
+        )
+        self.session.add(page)
+        self.session.flush()
+        self._new_page_brief_version(
+            page=page,
+            title=title,
+            content_outline=content_outline,
+            section_title=part_title,
+        )
+        return page
+
+    def _section_page_for_part(self, project_id: str, part_id: str | None) -> ProjectPage | None:
+        if not part_id:
+            return None
+        return self.session.scalars(
+            select(ProjectPage).where(
+                ProjectPage.project_id == project_id,
+                ProjectPage.page_role == "section",
+                ProjectPage.part_id == part_id,
+            )
+        ).first()
+
+    def _section_meta_from_page(self, page: ProjectPage | None) -> dict[str, Any]:
+        if page is None:
+            return {}
+        brief = self._get_current_brief(page)
+        outline_meta = self._section_meta_from_outline(page)
+        return {
+            "title": brief.title if brief else page.page_code,
+            "subtitle": str(outline_meta.get("subtitle") or ""),
+            "preview_items": brief.content_outline_json if brief else [],
+            "visual_intent": str(outline_meta.get("visual_intent") or ""),
+        }
+
+    def _section_meta_from_outline(self, page: ProjectPage) -> dict[str, Any]:
+        outline = self._get_current_outline(page.project_id)
+        ppt_outline = (outline.outline_json or {}).get("ppt_outline") if outline else {}
+        if not isinstance(ppt_outline, dict):
+            return {}
+        for part in ppt_outline.get("parts") or []:
+            if not isinstance(part, dict):
+                continue
+            if str(part.get("part_id") or "") == str(page.part_id or ""):
+                return part.get("section_page") if isinstance(part.get("section_page"), dict) else {}
+        return {}
+
+    def _refresh_section_summary(
+        self,
+        page: ProjectPage,
+        *,
+        part_title: str | None,
+        section_meta: dict[str, Any],
+        content_titles: list[str],
+    ) -> None:
+        page.page_summary_md = build_section_summary(
+            part_title=part_title or page.part_title or "",
+            section_page=section_meta,
+            content_titles=content_titles,
+        )
+        page.summary_status = "confirmed"
+        page.search_status = "confirmed"
+
+    def _refresh_section_summary_from_pages(self, section_page: ProjectPage) -> None:
+        brief = self._get_current_brief(section_page)
+        content_titles: list[str] = []
+        stmt = (
+            select(ProjectPage)
+            .where(
+                ProjectPage.project_id == section_page.project_id,
+                ProjectPage.page_role == "content",
+                ProjectPage.part_id == section_page.part_id,
+            )
+            .order_by(ProjectPage.sort_order.asc())
+        )
+        for child in self.session.scalars(stmt):
+            child_brief = self._get_current_brief(child)
+            if child_brief and child_brief.title.strip():
+                content_titles.append(child_brief.title)
+        self._refresh_section_summary(
+            section_page,
+            part_title=section_page.part_title,
+            section_meta={
+                "title": brief.title if brief else section_page.part_title,
+                "preview_items": brief.content_outline_json if brief else [],
+            },
+            content_titles=content_titles,
+        )
+
+    def _mark_section_outputs_stale(self, page: ProjectPage) -> None:
+        if page.page_role != "section":
+            return
+        page.search_status = "confirmed"
+        page.summary_status = "confirmed"
+        if page.current_draft_version_id:
+            page.draft_status = "stale"
+        else:
+            page.draft_status = "empty"
+        if page.current_design_version_id:
+            page.design_status = "stale"
+        else:
+            page.design_status = "empty"
+        self._update_artifact_staleness(page)
+
+    def _serialize_storyboard(self, project_id: str) -> dict[str, Any]:
+        return build_storyboard_tree(self.list_pages(project_id))
+
     def _mark_page_structure_changed(self, page: ProjectPage) -> None:
         if page.page_role == "content":
             if page.page_search_results_json:
@@ -1599,6 +2215,7 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
                     "page_id": page.id,
                     "page_code": page.page_code,
                     "page_role": page.page_role,
+                    "part_id": page.part_id,
                     "section_title": page.part_title,
                     "title": brief.title if brief else "",
                     "content_outline": brief.content_outline_json if brief else [],
@@ -1884,10 +2501,15 @@ class PptAgentService(InitFlowMixin, OutlineFlowMixin, PageFlowMixin, BatchFlowM
         result_snapshot: dict[str, Any] | None = None,
     ) -> None:
         error_message = self._format_exception_message(exc)
+        classified = classify_exception(exc)
         run.step_failed(step_code, step_name, error_message)
         snapshot = {
             "error_message": error_message,
             "error_type": exc.__class__.__name__,
+            "error_code": classified.get("error_code"),
+            "error_category": classified.get("category"),
+            "retryability": classified.get("retryability"),
+            "violations": classified.get("violations") or [],
             **(result_snapshot or {}),
         }
         self._persist_agent_message(

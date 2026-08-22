@@ -90,6 +90,7 @@ def enqueue_page_action(
     agent_run_id: str,
     replace_existing: bool = True,
     priority: int = 100,
+    batch_run_id: str | None = None,
 ) -> AgentTask:
     task_type = PAGE_ACTION_TO_TASK_TYPE.get(action_type)
     if not task_type:
@@ -106,8 +107,10 @@ def enqueue_page_action(
             "action_type": action_type,
             "agent_run_id": agent_run_id,
             "replace_existing": replace_existing,
+            "batch_run_id": batch_run_id,
         },
         priority=priority,
+        batch_run_id=batch_run_id,
     )
 
 
@@ -117,16 +120,37 @@ def enqueue_batch_action(
     project_id: str,
     action_type: str,
     agent_run_id: str,
+    page_ids: list[str] | None = None,
+    parent_batch_run_id: str | None = None,
+    retry_reason: str | None = None,
 ) -> list[AgentTask]:
+    from app.services.batch_run import create_batch_run, refresh_batch_run
+
     page_action = BATCH_TO_PAGE_ACTION.get(action_type)
     if not page_action:
         raise HTTPException(status_code=400, detail=f"不支持的批量动作: {action_type}")
     pages = list(
         session.scalars(select(ProjectPage).where(ProjectPage.project_id == project_id).order_by(ProjectPage.sort_order.asc()))
     )
+    if page_ids is not None:
+        allowed = set(page_ids)
+        candidate_pages = [page for page in pages if page.id in allowed]
+    else:
+        candidate_pages = pages
+    eligible_ids = {page.id for page in candidate_pages if _batch_page_eligible(page, action_type)}
+    batch = create_batch_run(
+        session,
+        project_id=project_id,
+        action_type=action_type,
+        agent_run_id=agent_run_id,
+        pages=pages,
+        eligible_ids=eligible_ids,
+        parent_batch_run_id=parent_batch_run_id,
+        retry_reason=retry_reason,
+    )
     created: list[AgentTask] = []
     for page in pages:
-        if not _batch_page_eligible(page, action_type):
+        if page.id not in eligible_ids:
             continue
         try:
             created.append(
@@ -138,21 +162,69 @@ def enqueue_batch_action(
                     agent_run_id=agent_run_id,
                     replace_existing=True,
                     priority=0,
+                    batch_run_id=batch.id,
                 )
             )
         except HTTPException as exc:
             if exc.status_code != status.HTTP_409_CONFLICT:
                 raise
+    batch.queued_count = len(created)
+    batch.skipped_count = max(0, len(pages) - len(created))
+    session.flush()
+    refresh_batch_run(session, batch.id)
     append_event(
         session,
         project_id=project_id,
         event_type="task.batch_queued",
-        stage="search",
+        stage=action_type,
         scope_type="project",
-        payload={"action_type": action_type, "queued": len(created), "agent_run_id": agent_run_id},
+        payload={
+            "action_type": action_type,
+            "queued": len(created),
+            "skipped": batch.skipped_count,
+            "expected": batch.expected_count,
+            "agent_run_id": agent_run_id,
+            "batch_run_id": batch.id,
+        },
         agent_run_id=agent_run_id,
     )
     return created
+
+
+def enqueue_export_job(
+    session: Session,
+    *,
+    project_id: str,
+    export_id: str,
+    agent_run_id: str | None = None,
+) -> AgentTask:
+    return _insert_task(
+        session,
+        project_id=project_id,
+        page_id=None,
+        task_type="export",
+        task_context={"export_id": export_id, "agent_run_id": agent_run_id or ""},
+        priority=80,
+        max_retry_num=1,
+    )
+
+
+def enqueue_quality_eval_job(
+    session: Session,
+    *,
+    project_id: str,
+    eval_id: str,
+    agent_run_id: str | None = None,
+) -> AgentTask:
+    return _insert_task(
+        session,
+        project_id=project_id,
+        page_id=None,
+        task_type="quality_eval",
+        task_context={"eval_id": eval_id, "agent_run_id": agent_run_id or ""},
+        priority=60,
+        max_retry_num=1,
+    )
 
 
 def cancel_tasks(session: Session, *, project_id: str, page_id: str | None = None) -> int:
@@ -177,6 +249,7 @@ def cancel_tasks(session: Session, *, project_id: str, page_id: str | None = Non
         target_page_id=page_id,
         payload={"pending": pending_count, "processing": processing_count},
     )
+    _refresh_batches_for_project(session, project_id)
     return pending_count + processing_count
 
 
@@ -211,6 +284,12 @@ def reclaim_expired_tasks(session: Session | None = None) -> int:
             recovered += 1
     session.flush()
     _clear_orphaned_running_pages(session)
+    batch_ids = {task.batch_run_id for task in expired if task.batch_run_id}
+    if batch_ids:
+        from app.services.batch_run import refresh_batch_run
+
+        for batch_id in batch_ids:
+            refresh_batch_run(session, str(batch_id))
     return recovered
 
 
@@ -256,19 +335,22 @@ def _insert_task(
     task_type: str,
     task_context: dict[str, Any],
     priority: int,
+    batch_run_id: str | None = None,
+    max_retry_num: int = 3,
 ) -> AgentTask:
     now = now_utc()
     task = AgentTask(
         task_id=new_id(),
         project_id=project_id,
         page_id=page_id,
+        batch_run_id=batch_run_id,
         task_type=task_type,
         task_stage="init",
         status=STATUS_PENDING,
         priority=priority,
         next_run_at=now,
         retry_num=0,
-        max_retry_num=3,
+        max_retry_num=max_retry_num,
         task_context=task_context,
         schedule_log=[{"at": now.isoformat(), "event": "queued"}],
         cancel_requested=0,
@@ -366,6 +448,10 @@ def _execute_claimed_task(task_id: str) -> None:
             _finish_task(session, task, STATUS_CANCELED, "canceled before run")
             return
         _append_log(task, "started")
+        if task.batch_run_id:
+            from app.services.batch_run import refresh_batch_run
+
+            refresh_batch_run(session, task.batch_run_id)
         context = dict(task.task_context or {})
         service = PptAgentService(session)
         try:
@@ -383,6 +469,10 @@ def _execute_claimed_task(task_id: str) -> None:
                     str(context.get("agent_run_id") or new_id()),
                     bool(context.get("replace_existing", True)),
                 )
+            elif task.task_type == "export":
+                service.run_export_job(str(context["export_id"]))
+            elif task.task_type == "quality_eval":
+                service.run_quality_eval_job(str(context["eval_id"]))
             else:
                 raise RuntimeError(f"未知任务类型: {task.task_type}")
             session.refresh(task)
@@ -405,6 +495,9 @@ def _handle_failure(task_id: str, error: str) -> None:
         if task is None:
             return
         task.retry_num += 1
+        context = dict(task.task_context or {})
+        context["last_error"] = error[:300]
+        task.task_context = context
         if task.cancel_requested:
             _finish_task(session, task, STATUS_CANCELED, error)
             return
@@ -450,6 +543,86 @@ def _finish_task(session: Session, task: AgentTask, status_value: int, note: str
         target_page_id=task.page_id,
         payload={"task_id": task.task_id, "status": status_value, "note": note[:300]},
         agent_run_id=str((task.task_context or {}).get("agent_run_id") or ""),
+    )
+    if task.batch_run_id:
+        from app.services.batch_run import refresh_batch_run
+
+        refresh_batch_run(session, task.batch_run_id)
+    _sync_export_job_terminal(session, task, status_value, note)
+    _sync_quality_eval_terminal(session, task, status_value, note)
+
+
+def _sync_export_job_terminal(session: Session, task: AgentTask, status_value: int, note: str) -> None:
+    if task.task_type != "export" or status_value not in {STATUS_FAILED, STATUS_CANCELED}:
+        return
+    export_id = str((task.task_context or {}).get("export_id") or "")
+    if not export_id:
+        return
+    from app.models.entities import ExportJob
+    from app.services.export_job import fail_export_job
+
+    job = session.get(ExportJob, export_id)
+    if job is None or job.status not in {"queued", "running"}:
+        return
+    if status_value == STATUS_CANCELED:
+        fail_export_job(
+            session,
+            job,
+            {
+                "error_code": "EXPORT_CANCELED",
+                "category": "user_action_required",
+                "message": "导出已取消",
+                "retryability": "retry_now",
+            },
+            status="canceled",
+        )
+        return
+    fail_export_job(
+        session,
+        job,
+        {
+            "error_code": "EXPORT_WORKER_FAILED",
+            "category": "transient_infra",
+            "message": note[:300] or "导出 worker 失败",
+            "retryability": "retry_now",
+        },
+    )
+
+
+def _sync_quality_eval_terminal(session: Session, task: AgentTask, status_value: int, note: str) -> None:
+    if task.task_type != "quality_eval" or status_value not in {STATUS_FAILED, STATUS_CANCELED}:
+        return
+    eval_id = str((task.task_context or {}).get("eval_id") or "")
+    if not eval_id:
+        return
+    from app.models.entities import QualityEvalJob
+    from app.services.quality_eval import fail_quality_eval_job
+
+    job = session.get(QualityEvalJob, eval_id)
+    if job is None or job.status not in {"queued", "running"}:
+        return
+    if status_value == STATUS_CANCELED:
+        fail_quality_eval_job(
+            session,
+            job,
+            {
+                "error_code": "QUALITY_EVAL_CANCELED",
+                "category": "user_action_required",
+                "message": "主观评估已取消",
+                "retryability": "retry_now",
+            },
+            status_value="canceled",
+        )
+        return
+    fail_quality_eval_job(
+        session,
+        job,
+        {
+            "error_code": "QUALITY_EVAL_WORKER_FAILED",
+            "category": "transient_infra",
+            "message": note[:300] or "主观评估 worker 失败",
+            "retryability": "retry_now",
+        },
     )
 
 
@@ -503,6 +676,16 @@ def _clear_orphaned_running_pages(session: Session) -> None:
             page.draft_status = "failed"
         if page.design_status == "running":
             page.design_status = "failed"
+
+
+def _refresh_batches_for_project(session: Session, project_id: str) -> None:
+    from app.services.batch_run import refresh_batch_run
+
+    batch_ids = set(
+        session.scalars(select(AgentTask.batch_run_id).where(AgentTask.project_id == project_id, AgentTask.batch_run_id.is_not(None)))
+    )
+    for batch_id in batch_ids:
+        refresh_batch_run(session, str(batch_id))
 
 
 def _append_log(task: AgentTask, event: str) -> None:

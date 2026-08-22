@@ -5,13 +5,12 @@ import json
 
 from fastapi import APIRouter, Depends, Header, Query, Request
 from sse_starlette.sse import EventSourceResponse
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.db import get_db
-from app.models.entities import ProjectEvent
 from app.schemas.api import MessageCreateRequest, ProjectCreateRequest
-from app.services.events import serialize_event
+from app.services.events import query_events_after, serialize_event
 from app.services.orchestrator import PptAgentService
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -101,21 +100,20 @@ async def stream_events(
     request: Request,
     db: Session = Depends(get_db),
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    after_id: int | None = Query(default=None),
 ) -> EventSourceResponse:
-    start_id = int(last_event_id) if last_event_id and last_event_id.isdigit() else 0
+    if after_id is not None:
+        start_id = after_id
+    else:
+        start_id = int(last_event_id) if last_event_id and last_event_id.isdigit() else 0
+    replay_limit = max(1, get_settings().event_stream_replay_limit)
 
     async def event_generator():
         current_id = start_id
         while True:
             if await request.is_disconnected():
                 break
-            stmt = (
-                select(ProjectEvent)
-                .where(ProjectEvent.project_id == project_id, ProjectEvent.stream_id > current_id)
-                .order_by(ProjectEvent.stream_id.asc())
-                .limit(100)
-            )
-            events = list(db.scalars(stmt))
+            events = query_events_after(db, project_id, current_id, replay_limit)
             for event in events:
                 current_id = event.stream_id
                 payload = serialize_event(event)

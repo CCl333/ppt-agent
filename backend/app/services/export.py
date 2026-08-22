@@ -4,6 +4,9 @@ import io
 import re
 import zipfile
 from pathlib import Path
+from posixpath import normpath
+
+from typing import Any
 
 from lxml import etree
 from pptx import Presentation
@@ -63,12 +66,59 @@ def build_pptx(
     return _build_pptx_shapes(slides, export_path)
 
 
+def verify_pptx_package(path: Path, *, render_mode: str, expected_slide_count: int) -> dict[str, Any]:
+    issues: list[str] = []
+    with zipfile.ZipFile(path) as archive:
+        names = set(archive.namelist())
+        if "ppt/presentation.xml" not in names:
+            issues.append("缺少 ppt/presentation.xml")
+        else:
+            presentation = archive.read("ppt/presentation.xml").decode("utf-8")
+            if f'cx="{SLIDE_WIDTH_EMU}"' not in presentation:
+                issues.append("画布宽度与 16:9 约定不一致")
+        slides = sorted(
+            [
+                name
+                for name in names
+                if name.startswith("ppt/slides/slide") and name.endswith(".xml") and "/_rels/" not in name
+            ],
+            key=lambda name: int(re.search(r"\d+", name).group(0) if re.search(r"\d+", name) else 0),
+        )
+        if len(slides) != expected_slide_count:
+            issues.append(f"slide 数 {len(slides)} 与快照 {expected_slide_count} 不一致")
+        joined = ""
+        for slide_name in slides:
+            joined += archive.read(slide_name).decode("utf-8")
+            rels_name = f"ppt/slides/_rels/{Path(slide_name).name}.rels"
+            if rels_name not in names:
+                continue
+            rels = archive.read(rels_name).decode("utf-8")
+            for target in re.findall(r'Target="([^"]+)"', rels):
+                if target.startswith("http"):
+                    continue
+                resolved = normpath(f"ppt/slides/{target}")
+                if resolved not in names:
+                    issues.append(f"幻灯片关系指向缺失对象: {target}")
+        if render_mode == "shapes" and "svgBlip" in joined:
+            issues.append("shapes 模式包含整页 SVG blip")
+        if render_mode == "image" and "svgBlip" not in joined:
+            issues.append("image 模式缺少 SVG blip")
+        if render_mode == "image" and not any(name.startswith("ppt/media/") and name.endswith(".png") for name in names):
+            issues.append("image 模式缺少 PNG 主图")
+    if issues:
+        raise RuntimeError("；".join(issues))
+    return {"slide_count": len(slides), "issues": []}
+
+
 def _build_pptx_shapes(slides: list[tuple[str, str]], export_path: Path) -> Path:
     presentation = Presentation()
     presentation.slide_width = Emu(SLIDE_WIDTH_EMU)
     presentation.slide_height = Emu(SLIDE_HEIGHT_EMU)
-    for _page_code, svg_markup in slides:
-        add_svg_slide(presentation, extract_and_validate_svg(svg_markup))
+    for page_code, svg_markup in slides:
+        try:
+            add_svg_slide(presentation, extract_and_validate_svg(svg_markup))
+        except Exception as exc:
+            raise RuntimeError(f"页面 {page_code} native shapes 导出失败: {exc}") from exc
     export_path = Path(export_path)
     export_path.parent.mkdir(parents=True, exist_ok=True)
     presentation.save(str(export_path))

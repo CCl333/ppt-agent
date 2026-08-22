@@ -17,6 +17,7 @@ from app.models.entities import (
     ResearchSession,
 )
 from app.services.clarification import apply_working_title_to_outline, project_title_from_answers
+from app.services.storyboard import enrich_outline_section_pages, iter_outline_page_defs, build_section_summary
 from app.services.tasks import enqueue_batch_action, wake_scheduler
 
 
@@ -79,6 +80,7 @@ class OutlineFlowMixin:
                 ),
                 requirement_form.answers_json or {},
             )
+            outline_payload = enrich_outline_section_pages(outline_payload, page_count_target=page_count_target)
             working_title = project_title_from_answers(requirement_form.answers_json)
             if working_title:
                 project.title = working_title
@@ -141,28 +143,44 @@ class OutlineFlowMixin:
             self.session.delete(page)
         self.session.flush()
 
-        page_defs: list[tuple[str, str | None, str, list[str]]] = []
+        outline_payload = enrich_outline_section_pages(outline_payload, page_count_target=project.page_count_target or 0)
         ppt_outline = outline_payload["ppt_outline"]
-        page_defs.append(("cover", None, ppt_outline["cover"]["title"], ppt_outline["cover"].get("content", [])))
-        page_defs.append(("toc", None, ppt_outline["table_of_contents"]["title"], ppt_outline["table_of_contents"].get("content", [])))
-        for section in ppt_outline.get("parts", []):
-            for page in section.get("pages", []):
-                page_defs.append(("content", section["part_title"], page["title"], page.get("content", [])))
-        page_defs.append(("end", None, ppt_outline["end_page"]["title"], ppt_outline["end_page"].get("content", [])))
-
-        for sort_order, (role, part_title, title, content) in enumerate(page_defs, start=1):
+        page_defs = iter_outline_page_defs(ppt_outline)
+        for sort_order, spec in enumerate(page_defs, start=1):
+            role = spec["page_role"]
+            part_title = spec.get("part_title")
+            title = spec["title"]
+            content = spec.get("content") or []
+            section_meta = spec.get("section_page") if isinstance(spec.get("section_page"), dict) else None
+            is_content = role == "content"
+            is_section = role == "section"
+            if is_section:
+                summary_md = build_section_summary(
+                    part_title=part_title or title,
+                    section_page=section_meta,
+                    content_titles=[
+                        item["title"]
+                        for item in page_defs
+                        if item.get("page_role") == "content" and item.get("part_id") == spec.get("part_id")
+                    ],
+                )
+            elif not is_content:
+                summary_md = "；".join(content[:2]) or title
+            else:
+                summary_md = ""
             page = ProjectPage(
                 project_id=project.id,
                 page_code=f"page-{sort_order:02d}",
                 page_role=role,
+                part_id=spec.get("part_id"),
                 part_title=part_title,
                 sort_order=sort_order,
                 outline_status="ready",
-                search_status="confirmed" if role != "content" else "empty",
-                summary_status="confirmed" if role != "content" else "empty",
+                search_status="confirmed" if not is_content else "empty",
+                summary_status="confirmed" if not is_content else "empty",
                 draft_status="empty",
                 design_status="empty",
-                page_summary_md="；".join(content[:2]) or title if role != "content" else "",
+                page_summary_md=summary_md,
                 page_summary_citations_json=[],
                 page_search_queries_json=[],
                 page_search_results_json=[],

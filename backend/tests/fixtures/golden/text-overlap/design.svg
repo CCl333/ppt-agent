@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720">
+  <text x="80" y="200" class="t-title" data-node-id="block-1-title" font-size="40px" fill="#0F172A">卡片标题甲侧内容过长会被放大</text>
+  <text x="80" y="220" class="t-title" data-node-id="block-2-title" font-size="40px" fill="#0F172A">卡片标题乙侧内容同样被放大</text>
+</svg>

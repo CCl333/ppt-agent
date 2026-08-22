@@ -65,11 +65,13 @@ PROMPT_TEXTS: dict[str, str] = {
 3. 只输出严格 JSON。
 
 规则：
-1. 必须给出 3 个页数候选项，分别适合简洁、标准、展开。
-2. 必须给出 3 个封面标题候选项 working_title_options：8 到 24 字，像演示文稿封面，禁止需求口吻（禁止「请」「帮我生成」「约 N 页」）。
-3. 不要生成受众、场合、时长、标题、style_preset、背景图问题，这些由系统固定收集。
-4. 可额外生成 0 到 2 个与主题相关的补充问题。
-5. 每个额外问题必须有恰好 3 个具体候选项，且允许用户自定义。
+1. 必须给出 3 个页数候选项，分别适合简洁、标准、展开。page_count 是整份 PPT 的最终总页数，必须包含封面、目录、章节过渡页、正文页和收尾页，不能按纯正文页估。
+2. 参考落点：简洁 10–12 页、标准 14–16 页、展开 18–22 页。相对旧习惯（约 8 / 12 / 16）各上调 2～4 页。主题极短仍可低于此，但 reason 必须写清「几乎无章节过渡」。
+3. 每个候选项的 reason 必须写清大约几章、几张章节过渡、几张正文。
+4. 必须给出 3 个封面标题候选项 working_title_options：8 到 24 字，像演示文稿封面，禁止需求口吻（禁止「请」「帮我生成」「约 N 页」）。
+5. 不要生成受众、场合、时长、标题、style_preset、背景图问题，这些由系统固定收集。
+6. 可额外生成 0 到 2 个与主题相关的补充问题。
+7. 每个额外问题必须有恰好 3 个具体候选项，且允许用户自定义。
 
 输出格式：
 {
@@ -77,8 +79,8 @@ PROMPT_TEXTS: dict[str, str] = {
     {
       "option_code": "A",
       "label": "简洁版",
-      "page_count": 10,
-      "reason": "适合什么场景"
+      "page_count": 12,
+      "reason": "约 2 章、2 张章节过渡、7 张正文，含封面、目录和收尾"
     }
   ],
   "working_title_options": ["封面标题候选项"],
@@ -120,7 +122,7 @@ PROMPT_TEXTS: dict[str, str] = {
 2. 可额外保留或生成 0 到 2 个与主题相关的补充问题。
 3. 每个额外问题必须有恰好 3 个具体候选项，且允许用户自定义。
 4. 如果用户要求删除某个非固定问题，结果里不要再保留它。
-5. 页数推荐可以沿用现有选项；只有证据明显要求调整时才改。
+5. 页数推荐可以沿用现有选项；只有证据明显要求调整时才改。page_count 仍是最终总页数，含封面、目录、章节过渡、正文和收尾；reason 写清大约几章、几张过渡、几张正文。参考落点：简洁 10–12、标准 14–16、展开 18–22。
 6. 可以给出 3 个新的 working_title_options；没有把握时省略，系统会沿用现有标题候选项。
 
 输出格式：
@@ -129,8 +131,8 @@ PROMPT_TEXTS: dict[str, str] = {
     {
       "option_code": "A",
       "label": "简洁版",
-      "page_count": 10,
-      "reason": "适合什么场景"
+      "page_count": 12,
+      "reason": "约 2 章、2 张章节过渡、7 张正文，含封面、目录和收尾"
     }
   ],
   "working_title_options": ["封面标题候选项"],
@@ -174,10 +176,10 @@ PROMPT_TEXTS: dict[str, str] = {
    - 可以用 [PPT_OUTLINE] 和 [/PPT_OUTLINE] 包裹整段 JSON，但标签只是外壳，不能代替 ppt_outline 字段。
    - 绝对禁止输出 ```json、``` 或其它 Markdown 包裹。
 3. 结果必须完全符合固定 JSON 结构，顶层只允许出现 `ppt_outline`。
-4. 大纲必须包含封面、目录、正文章节和收尾页。
+4. 大纲必须包含封面、目录、正文章节和收尾页。章节页是否落地由系统按总页数和章节数决定，模型仍须为每个 part 填写 `part_id` 与 `section_page` 元数据。
 5. 正文章节必须围绕明确的主线展开，章节顺序要有递进关系，不能只是松散罗列信息。
 6. `table_of_contents.content` 必须与 `parts[].part_title` 一一对应，顺序一致。
-7. `page_count_target` 指整份 PPT 总页数，必须包含封面、目录、所有内容页和收尾页；内容页数量必须与目标页数匹配，不能明显超出或不足。
+7. `page_count_target` 指整份 PPT 最终总页数，包含封面、目录、章节页、正文页和收尾页。正文页数约为 `page_count_target - 3 - 章节数`（启用章节页时）或 `page_count_target - 3`（不启用时）；不要靠堆砌正文去凑页数。
 8. 每页 `content` 只保留 2 到 4 条核心要点，使用短句，不要输出长段落、完整讲稿或空泛套话。
 9. 页标题和章节标题要适合演示表达，避免重复命名；不同页面的职责要清晰，不能大量重复。
 10. 只使用输入中能够支持的信息组织内容，不要编造不存在的数字、案例、结论或来源。
@@ -185,6 +187,7 @@ PROMPT_TEXTS: dict[str, str] = {
 12. `cover.content` 和 `end_page.content` 可以为空数组；如果填写，也只能保留极少量短词。
 13. `cover.title` 必须使用输入 answers.working_title（若已填写且像标题）；不要把用户原始需求口吻当封面标题。
 14. 受众、场合、时长必须体现在封面副标题或内容组织上，不要忽略这些澄清答案。
+15. `section_page.preview_items` 只能使用本章 `pages[].title` 或明确的章节预告短词，禁止编造事实。
 
 输出格式：
 {
@@ -200,7 +203,15 @@ PROMPT_TEXTS: dict[str, str] = {
     },
     "parts": [
       {
+        "part_id": "part-1",
         "part_title": "字符串",
+        "section_page": {
+          "enabled": true,
+          "title": "字符串",
+          "subtitle": "字符串",
+          "preview_items": ["字符串"],
+          "visual_intent": "字符串"
+        },
         "pages": [
           {
             "title": "字符串",
@@ -478,12 +489,13 @@ PROMPT_TEXTS: dict[str, str] = {
 规则：
 1. 只写骨架字段：title / subtitle / badge / blocks.label / blocks.note / footer。不要写完整 SOP、表格行、长因果句。
 2. 优先使用研究摘要与大纲中的证据，不得编造摘要里没有的事实、年份、ROI、时间轴或新章节。
-3. 封面、目录、结尾也必须给出完整骨架，不能留空让下游去编。
-4. footer 仅封面、结尾填写演讲人与日期占位符，例如 `[您的姓名/团队名称]`、`202X年X月X日`。正文、目录不要写 footer。
+3. 封面、目录、结尾、章节页也必须给出完整骨架，不能留空让下游去编。
+4. footer 仅封面、结尾填写演讲人与日期占位符，例如 `[您的姓名/团队名称]`、`202X年X月X日`。正文、目录、章节页不要写 footer。
 5. 内容页 blocks 必须 3 到 5 条（含 3 和 5）；每条必须有非空 label。label 是卡标题，去空白后不超过 22 字（例：预约现状、抢票标准作业程序 (SOP)）。note 可选短解释，去空白后不超过 22 字；没有就空字符串。subtitle 封面/章节可用一句洞察，去空白后不超过 40 字。label 必须是卡标题，不要用纯数字。
-6. 不要写布局、颜色、字体或 SVG。
-7. 如果输入 page_images 非空，可以写 1 个 image_slot（用途 + image_id），不是必须。image_id 必须来自目录，禁止编造。
-8. 如果 page_images 为空，不要写 image_slots。
+6. 章节页（page_role=section）不要套用内容页 3～5 个 block：用 title + subtitle，blocks 只放本章预告短词（0～5 条），禁止编造本章页面标题之外的事实。
+7. 不要写布局、颜色、字体或 SVG。
+8. 如果输入 page_images 非空，可以写 1 个 image_slot（用途 + image_id），不是必须。image_id 必须来自目录，禁止编造。
+9. 如果 page_images 为空，不要写 image_slots。章节页最多规划 0～1 个氛围视觉，且不得标成 required。
 
 输出格式：
 {
@@ -601,6 +613,8 @@ Bento Grid 规则：
 20. `<g>` 只允许 `translate`，禁止 rotate / skew / matrix。
 21. 有可用配图时画占位 `g`（虚线 `rect` + 用途文字），可用 `data-image-slot-id`；初稿不要放内容 `<image>`。无图不要编占位。
 22. 没有可用配图时不要输出内容 `<image>`。
+23. 文本必须用语义字阶：封面/章节主标题 `t-display`，内容页主标题 `t-page-title`，卡标题 `t-card-title`，KPI `t-kpi` / `t-kpi-unit`，正文 `t-body`，表头 `t-table-header`，目录项 `t-toc-item`，注释 `t-caption`。禁止用 `t-title` 同时当页标题、卡标题、KPI 或目录项。
+24. 核心文本必须带稳定 `data-node-id` 和 `data-text-role`，并尽量带 `data-layout-box="x,y,w,h"`。页标题用 `page-title`，卡标题用 `card-title`，KPI 用 `kpi`。输入里的 layout_plan.node_id 必须原样使用，不要另起一套身份。
 """.strip(),
     "draft.page_generate.user": """
 任务：按内容策划的卡标题排 Bento，用 summary 填充卡片内部，输出 SVG。
@@ -620,6 +634,8 @@ Bento Grid 规则：
     "content_summary": "{{content_summary}}"
   },
   "content_plan": {{content_plan_json}},
+  "layout_plan": {{layout_plan_json}},
+  "visual_plan": {{visual_plan_json}},
   "page_images": {{page_images_json}},
   "summary": {
     "summary_md": "{{summary_md}}",
@@ -636,7 +652,7 @@ Bento Grid 规则：
 2. 只输出单个完整 `<svg>...</svg>` 文档。
 3. 画布必须保持 `viewBox="0 0 1280 720"`。
 4. 颜色只能用输入中给出的 class 令牌，禁止任何字面色值（包括 fill="#..."、stroke="#..."、rgb()、named color、inline style）。
-5. 文本必须带字阶 class：`t-title` / `t-subtitle` / `t-body` / `t-caption` / `t-label`。图形必须带 `c-*` 色板 class。
+5. 文本必须带语义字阶 class：`t-display` / `t-page-title` / `t-card-title` / `t-kpi` / `t-kpi-unit` / `t-body` / `t-caption` / `t-label` / `t-table-header` / `t-toc-item`。禁止用 `t-title` 同时当页标题、卡标题、KPI 或目录项。图形必须带 `c-*` 色板 class。核心文本必须带 `data-node-id` 和 `data-text-role`。
 6. 不要设置 font-size / font-family / font-weight / fill / stroke 属性，这些由系统按令牌展开。
 7. 背景色条、顶栏小标题和页码由系统合成。不要画全幅背景矩形，不要引用本地文件路径。内容区从 y=56 到 y=680。系统不会补副标题或 badge，这两项必须留在内容区。
 8. 只允许这些图元：`<rect>`（可含 rx）/ `<circle>` / `<ellipse>` / `<line>` / `<polygon>` / `<path>`（仅 M L H V Z）/ `<text>` + `<tspan>` / `<image>` / `<g>`。
@@ -645,14 +661,17 @@ Bento Grid 规则：
 11. 如果风格表达与内容可读性冲突，优先保留内容可读性。
 12. 保留 draft 的卡标题、阅读顺序和主次；不要新增或删除 content_plan.blocks.label 对应的模块；卡片内部短句以 draft 为准，不要改回 content_plan.note，也不要另起一套数字。draft 里已有的 title、subtitle、badge 字符串必须原样保留（含标点、空格、大小写），禁止同义改写或删掉副标题/徽章。
 13. 若 draft 有占位且 page_images 非空，改成 `<image data-image-id>`；已有 image 则保留 id。仍禁止 http/file href。
+14. 这是受限视觉增强，不是整页重排。必须保留 draft/layout_plan 的 `data-node-id`、`data-text-role`、`data-layout-box` 和核心阅读顺序。不要新增或删除核心节点。
 """.strip(),
     "design.svg_generate.user": """
-任务：在 draft SVG 上做视觉增强，不改卡标题、副标题、badge 和模块结构。
+任务：在 draft SVG 上做视觉增强，不改卡标题、副标题、badge、节点身份和模块结构。
 
 输入数据(JSON)：
 {
   "draft_svg": "{{draft_svg_markup}}",
   "content_plan": {{content_plan_json}},
+  "layout_plan": {{layout_plan_json}},
+  "visual_plan": {{visual_plan_json}},
   "page_images": {{page_images_json}},
   "canvas_constraints": {
     "width": 1280,

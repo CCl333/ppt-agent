@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from app.models.entities import DraftVersion
 from tests.helpers import make_content_page, make_project
 
-VALID_SVG = '<svg viewBox="0 0 1280 720"><text x="40" y="80">改后的策划稿</text></svg>'
+VALID_SVG = '<svg viewBox="0 0 1280 720"><text x="80" y="120">改后的策划稿</text></svg>'
 
 
 def test_patch_page_draft_creates_new_version_and_marks_design_stale(service, db_session):
@@ -95,6 +95,6 @@ def test_patch_page_draft_allows_extra_text_when_skeleton_present(service, db_se
     }
     db_session.commit()
 
-    svg = '<svg viewBox="0 0 1280 720"><text>策划页</text><text>要点一</text><text>100%</text></svg>'
+    svg = '<svg viewBox="0 0 1280 720"><text x="80" y="120">策划页</text><text x="80" y="180">要点一</text><text x="80" y="240">100%</text></svg>'
     result = service.patch_page_draft(project.id, page.id, svg)
     assert "100%" in result["draft"]["draft_svg_markup"]

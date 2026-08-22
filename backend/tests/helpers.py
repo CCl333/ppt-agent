@@ -112,6 +112,7 @@ def make_content_page(
         project_id=project.id,
         page_code=page_code,
         page_role="content",
+        part_id="part-1",
         part_title="章节一",
         sort_order=sort_order,
         outline_status="ready",
@@ -212,3 +213,12 @@ def add_page_chunk(
     session.commit()
     session.refresh(chunk)
     return chunk
+
+
+def drain_tasks(limit: int = 40) -> int:
+    from app.services.tasks import run_once
+
+    ran = 0
+    while ran < limit and run_once():
+        ran += 1
+    return ran

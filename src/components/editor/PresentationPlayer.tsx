@@ -20,6 +20,7 @@ function slideRoleLabel(pageRole: string): string {
   if (pageRole === 'cover') return '首页';
   if (pageRole === 'toc') return '目录';
   if (pageRole === 'end') return '结束页';
+  if (pageRole === 'section') return '章节页';
   return '内容页';
 }
 

@@ -451,7 +451,7 @@ class GenerationService:
         )
         return normalize_style_cards(result, source="generated")
 
-    def generate_draft_svg(self, *, page_context: dict[str, Any], content_plan: dict[str, Any] | None = None) -> str:
+    def generate_draft_svg(self, *, page_context: dict[str, Any], content_plan: dict[str, Any] | None = None, layout_plan: dict[str, Any] | None = None, visual_plan: dict[str, Any] | None = None) -> str:
         summary = page_context["summary"]
         page_images = page_context.get("page_images") or []
         svg = self.models.svg_text(
@@ -466,6 +466,8 @@ class GenerationService:
                     "content_outline_json": page_context["page"]["content_outline"],
                     "content_summary": page_context["page"]["content_summary"],
                     "content_plan_json": content_plan or {},
+                    "layout_plan_json": layout_plan or {},
+                    "visual_plan_json": visual_plan or {},
                     "summary_md": summary["summary_md"],
                     "selected_sources_json": summary["selected_sources"],
                     "page_images_json": prompt_catalog(page_images),
@@ -492,6 +494,8 @@ class GenerationService:
         background_asset_path: str | None,
         chrome: dict[str, Any] | None = None,
         content_plan: dict[str, Any] | None = None,
+        layout_plan: dict[str, Any] | None = None,
+        visual_plan: dict[str, Any] | None = None,
         frozen_card: dict[str, Any] | None = None,
         page_images: list[dict[str, Any]] | None = None,
     ) -> str:
@@ -503,6 +507,8 @@ class GenerationService:
                 {
                     "draft_svg_markup": draft_svg,
                     "content_plan_json": content_plan or {},
+                    "layout_plan_json": layout_plan or {},
+                    "visual_plan_json": visual_plan or {},
                     "page_images_json": prompt_catalog(page_images),
                     "style_pack_json": style_pack_for_prompt(style_pack),
                     "background_asset_json": {

@@ -40,6 +40,7 @@ def prompt_catalog(catalog: list[dict[str, Any]] | None) -> list[dict[str, str]]
                 "caption": str(item.get("caption") or "").strip(),
                 "source_title": str(item.get("source_title") or "").strip(),
                 "source_url": str(item.get("source_url") or "").strip(),
+                "license_status": str(item.get("license_status") or "unknown").strip() or "unknown",
             }
         )
     return items
@@ -62,6 +63,7 @@ def extract_image_candidates(*sources: list[dict[str, Any]] | None) -> list[dict
                         "caption": str(item.get("title") or item.get("caption") or "").strip(),
                         "source_title": str(item.get("title") or "").strip(),
                         "source_url": str(item.get("url") or url).strip(),
+                        "license_status": str(item.get("license_status") or "unknown").strip() or "unknown",
                     }
                 )
     return candidates
@@ -94,6 +96,7 @@ def materialize_page_images(
                 "caption": candidate["caption"] or image_id,
                 "source_title": candidate["source_title"],
                 "source_url": candidate["source_url"],
+                "license_status": str(candidate.get("license_status") or "unknown").strip() or "unknown",
                 "mime": mime,
                 "storage_path": str(path),
             }
@@ -112,6 +115,7 @@ def public_catalog(catalog: list[dict[str, Any]] | None) -> list[dict[str, str]]
                 "caption": str(item.get("caption") or "").strip(),
                 "source_title": str(item.get("source_title") or "").strip(),
                 "source_url": str(item.get("source_url") or "").strip(),
+                "license_status": str(item.get("license_status") or "unknown").strip() or "unknown",
                 "available": "true" if Path(str(item.get("storage_path") or "")).is_file() else "false",
             }
         )

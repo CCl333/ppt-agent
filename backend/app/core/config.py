@@ -18,10 +18,12 @@ class Settings(BaseSettings):
         default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"]
     )
     database_url: str = "sqlite:///./backend/data/ppt_agent.db"
+    schema_auto_migrate: bool | None = None
     file_storage_root: Path = Path("backend/data")
     upload_dir: str = "uploads"
     background_dir: str = "backgrounds"
     export_dir: str = "exports"
+    quality_eval_dir: str = "quality-evals"
 
     context_llm_base_url: str | None = None
     context_llm_api_key: SecretStr | None = None
@@ -69,6 +71,26 @@ class Settings(BaseSettings):
             return []
         return [item.strip() for item in value.split(",") if item.strip()]
 
+    @field_validator("schema_auto_migrate", mode="before")
+    @classmethod
+    def _parse_optional_bool(cls, value: object) -> bool | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError(f"invalid boolean: {value}")
+
+    @property
+    def effective_schema_auto_migrate(self) -> bool:
+        if self.schema_auto_migrate is not None:
+            return self.schema_auto_migrate
+        return self.app_env.strip().lower() not in {"production", "prod"}
+
     @property
     def upload_path(self) -> Path:
         return self.file_storage_root / self.upload_dir
@@ -80,6 +102,10 @@ class Settings(BaseSettings):
     @property
     def export_path(self) -> Path:
         return self.file_storage_root / self.export_dir
+
+    @property
+    def quality_eval_path(self) -> Path:
+        return self.file_storage_root / self.quality_eval_dir
 
 
 @lru_cache(maxsize=1)

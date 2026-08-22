@@ -104,7 +104,7 @@ def inject_fixed_chrome(
         image.set("data-chrome", "texture")
         layers.append(image)
 
-    skip_title_bar = page_role in {"cover", "end"}
+    skip_title_bar = page_role in {"cover", "end", "section"}
     if not skip_title_bar:
         accent = _token_attrs(tokens, "c-accent")
         bar = ET.Element(f"{{{SVG_NS}}}rect")
@@ -115,14 +115,15 @@ def inject_fixed_chrome(
         bar.set("fill", accent.get("fill") or "#111111")
         bar.set("data-chrome", "title_bar")
         layers.append(bar)
-        caption = _token_attrs(tokens, "t-caption")
+        label = _token_attrs(tokens, "t-label")
         if page_title.strip():
             title = ET.Element(f"{{{SVG_NS}}}text")
             title.set("x", "48")
             title.set("y", "36")
             title.text = page_title.strip()
             title.set("data-chrome", "page_title")
-            for key, value in caption.items():
+            title.set("data-text-role", "label")
+            for key, value in label.items():
                 title.set(key, value)
             layers.append(title)
 
@@ -134,6 +135,7 @@ def inject_fixed_chrome(
         number.set("text-anchor", "end")
         number.text = f"{page_index} / {page_count}"
         number.set("data-chrome", "page_number")
+        number.set("data-text-role", "caption")
         for key, value in caption.items():
             number.set(key, value)
         layers.append(number)

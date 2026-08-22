@@ -47,6 +47,17 @@ export function shouldRefreshFromEvent(event: ProjectEvent): boolean {
     'project.created',
     'outline.queued',
     'task.failed',
+    'task.succeeded',
+    'task.batch_queued',
+    'batch.updated',
+    'export.queued',
+    'export.updated',
+    'export.completed',
+    'export.failed',
+    'quality_eval.queued',
+    'quality_eval.updated',
+    'quality_eval.completed',
+    'quality_eval.failed',
   ].includes(event.event_type);
 }
 

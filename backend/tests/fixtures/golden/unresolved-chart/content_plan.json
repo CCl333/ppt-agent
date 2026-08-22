@@ -1,0 +1,24 @@
+{
+  "page_code": "page-06",
+  "title": "预算结构",
+  "subtitle": "",
+  "badge": "",
+  "blocks": [
+    {"role": "point", "label": "交通", "note": "约占三成"},
+    {"role": "point", "label": "住宿", "note": "靠近地铁"},
+    {"role": "point", "label": "门票", "note": "预约优先"}
+  ],
+  "footer": {},
+  "image_slots": [],
+  "visual_slots": [
+    {
+      "slot_id": "visual-1",
+      "kind": "chart",
+      "source_mode": "render",
+      "priority": "required",
+      "status": "planned",
+      "asset_id": null,
+      "output_id": null
+    }
+  ]
+}

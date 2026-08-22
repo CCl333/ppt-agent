@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   Database,
   Download,
+  Eye,
   FileText,
   LoaderCircle,
   Play,
@@ -20,12 +21,15 @@ import {
   connectProjectEventStream,
   createExport,
   createMessage,
+  createQualityEval,
   cancelProjectTasks,
+  estimateQualityEval,
   generatePageDesign,
   generatePageDraft,
   generatePageSearchQueries,
   generatePageSummary,
   generateStyleCards,
+  getBatchRun,
   getExportDownloadUrl,
   getOutline,
   getPage,
@@ -39,14 +43,22 @@ import {
   patchStoryboard,
   patchPageSummary,
   patchPageDraft,
+  patchPageScene,
+  retryFailedBatch,
   retryOutline,
   retryPageSearchResult,
   runBatchAction,
   runPageSearch,
+  waitForExport,
+  waitForQualityEval,
+  type BatchRun,
   type OutlineResponse,
   type PageSummary,
   type ProjectMessage,
   type ProjectSummary,
+  type QualityEvalEstimate,
+  type QualityEvalJob,
+  type StoryboardPatchRequest,
   type StyleCardState,
   type UiSurface,
 } from '../lib/ppt-api';
@@ -55,6 +67,7 @@ import { mergeMessageList, summarizeSourcePipeline, shouldRefreshFromEvent } fro
 import { AgentActivityCard, agentRunFromMessage, reduceAgentRunMap, type AgentRunView } from './AgentActivity';
 import { ReplayBar, useProjectReplay } from './ReplayBar';
 import { DataModal, PageThumbnail, QueryDimensionList, renderStageBadge, renderStatusPill, SearchResultCard, StyleCardPanel, SvgCanvas, type EditorSurface } from './editor/EditorBits';
+import DraftCanvas from './editor/DraftCanvas';
 import PresentationPlayer, { type PresentationSlide, type PresentationSurface } from './editor/PresentationPlayer';
 import StoryboardPanel from './editor/StoryboardPanel';
 
@@ -108,6 +121,7 @@ export default function Editor({
   const [isSavingOutline, setIsSavingOutline] = useState(false);
   const [isSavingSummary, setIsSavingSummary] = useState(false);
   const [isSavingDraft, setIsSavingDraft] = useState(false);
+  const [isSavingScene, setIsSavingScene] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [isDataModalOpen, setIsDataModalOpen] = useState(false);
@@ -124,7 +138,16 @@ export default function Editor({
   const [isStyleBusy, setIsStyleBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [exportNotice, setExportNotice] = useState<string | null>(null);
+  const [exportPhase, setExportPhase] = useState<string | null>(null);
+  const [evalNotice, setEvalNotice] = useState<string | null>(null);
+  const [evalPhase, setEvalPhase] = useState<string | null>(null);
+  const [evalEstimate, setEvalEstimate] = useState<QualityEvalEstimate | null>(null);
+  const [isEvaluating, setIsEvaluating] = useState(false);
+  const [activeBatch, setActiveBatch] = useState<BatchRun | null>(null);
   const activePageIdRef = useRef<string | null>(null);
+  const activeBatchIdRef = useRef<string | null>(null);
+  const exportAbortRef = useRef<AbortController | null>(null);
+  const evalAbortRef = useRef<AbortController | null>(null);
 
   const visibleMessages = useMemo(
     () => sourceMessages.filter((message) => message.scope_type === 'project' || message.target_page_id === activePage?.page_id),
@@ -245,13 +268,25 @@ export default function Editor({
       onEvent: (event) => {
         setLiveRuns((current) => reduceAgentRunMap(current, event));
         if (shouldRefreshFromEvent(event)) refresh.schedule();
+        const batchId = activeBatchIdRef.current;
+        if (batchId && (event.event_type === 'batch.updated' || event.event_type === 'task.succeeded' || event.event_type === 'task.failed')) {
+          void getBatchRun(project.project_id, batchId).then((batch) => {
+            activeBatchIdRef.current = batch.batch_run_id;
+            setActiveBatch(batch);
+          }).catch(() => undefined);
+        }
       },
-      onError: () => setError((current) => current ?? '事件流已断开，稍后会自动重连。'),
+      onError: () => {
+        setError((current) => current ?? '事件流已断开，稍后会自动重连。');
+        refresh.schedule();
+      },
     });
     return () => {
       cancelled = true;
       refresh.dispose();
       disconnect();
+      exportAbortRef.current?.abort();
+      evalAbortRef.current?.abort();
     };
   }, [onProjectUpdated, project.project_id]);
 
@@ -326,6 +361,23 @@ export default function Editor({
     }
   };
 
+  const handleSaveScene = async (payload: Parameters<typeof patchPageScene>[2]) => {
+    if (!activePage || isSavingScene) return;
+    setIsSavingScene(true);
+    try {
+      const nextPage = await patchPageScene(project.project_id, activePage.page_id, payload);
+      setActivePage(nextPage);
+      setPages((current) => replacePageSummary(current, nextPage));
+      setDraftSvgDraft(nextPage.draft?.draft_svg_markup ?? '');
+      setError(null);
+    } catch (caughtError) {
+      setError(getErrorMessage(caughtError, '策划稿画布保存失败'));
+      throw caughtError;
+    } finally {
+      setIsSavingScene(false);
+    }
+  };
+
   const sendMessage = async (content: string, options?: { clearInput?: boolean }) => {
     const normalizedContent = content.trim();
     const isOutlineSurface = surface === 'outline' || project.current_stage === 'outline';
@@ -360,6 +412,118 @@ export default function Editor({
       setError(null);
     } catch (caughtError) {
       setError(getErrorMessage(caughtError, '动作执行失败'));
+    }
+  };
+
+  const rememberBatch = (batch: BatchRun) => {
+    activeBatchIdRef.current = batch.batch_run_id;
+    setActiveBatch(batch);
+  };
+
+  const handleBatchAction = async (
+    actionType: 'project_batch_search' | 'project_batch_summary' | 'project_batch_draft' | 'project_batch_design',
+  ) => {
+    await runAction(async () => {
+      rememberBatch(await runBatchAction(project.project_id, actionType));
+    });
+  };
+
+  const handleRetryFailedBatch = async () => {
+    if (!activeBatch) return;
+    await runAction(async () => {
+      rememberBatch(await retryFailedBatch(project.project_id, activeBatch.batch_run_id));
+    });
+  };
+
+  const handleExport = async () => {
+    exportAbortRef.current?.abort();
+    const controller = new AbortController();
+    exportAbortRef.current = controller;
+    setIsExporting(true);
+    setExportPhase('snapshot');
+    try {
+      const queued = await createExport(project.project_id);
+      const job = await waitForExport(project.project_id, queued.export_id, (current) => {
+        setExportPhase(current.phase || current.status);
+      }, controller.signal);
+      if (job.status !== 'completed' || !job.download_ready) {
+        const detail = job.error_detail as {message?: string} | undefined;
+        throw new Error(detail?.message || job.error_code || '导出失败');
+      }
+      window.open(getExportDownloadUrl(project.project_id, job.export_id), '_blank', 'noopener,noreferrer');
+      const notices = [...(job.font_report?.notices ?? [])];
+      if (job.input_stale) notices.push('该文件对应导出时的旧版本，当前页面已更新。');
+      if (job.render_mode === 'image') notices.push('整页图不可逐字编辑。');
+      setExportNotice(notices.join('\n') || null);
+      setError(null);
+    } catch (caughtError) {
+      if (caughtError instanceof DOMException && caughtError.name === 'AbortError') {
+        return;
+      }
+      setError(getErrorMessage(caughtError, '导出失败'));
+    } finally {
+      if (exportAbortRef.current === controller) {
+        exportAbortRef.current = null;
+      }
+      setIsExporting(false);
+      setExportPhase(null);
+    }
+  };
+
+  const summarizeEvalJob = (job: QualityEvalJob) => {
+    const pages = job.report?.pages ?? [];
+    const hardFails = pages.filter((item) => item.hard_fail || item.tracks?.verdict === 'hard_fail').length;
+    const scored = pages.filter((item) => item.tracks?.subjective_score != null).length;
+    if (job.status === 'failed') {
+      const detail = job.error_detail as {message?: string} | undefined;
+      return detail?.message || job.error_code || '主观评估失败；页面设计状态未改动。';
+    }
+    if (hardFails) {
+      return `主观评估完成：${hardFails} 页仍有硬失败，分数不能覆盖。${scored ? `另有 ${scored} 页仅作诊断。` : '未给出可展示的主观分。'}`;
+    }
+    if (!scored) {
+      return '主观评估完成，但没有给出分数（未运行、跳过或缺少渲染图）。页面仍按硬检查决定是否 ready。';
+    }
+    return `主观评估完成：${scored} 页有诊断分数，不改变硬失败或 ready 状态。`;
+  };
+
+  const handleQualityEval = async () => {
+    evalAbortRef.current?.abort();
+    if (!evalEstimate) {
+      try {
+        const estimate = await estimateQualityEval(project.project_id, {mode: 'quick'});
+        setEvalEstimate(estimate);
+        setEvalNotice(
+          `预计评估 ${estimate.page_count} 页，约 ${estimate.estimated_calls} 次调用 / ${estimate.estimated_tokens} tokens / ${estimate.estimated_duration_s}s。再次点击确认开始；主观分数不会覆盖硬失败。`,
+        );
+      } catch (caughtError) {
+        setError(getErrorMessage(caughtError, '无法预估主观评估'));
+      }
+      return;
+    }
+    const controller = new AbortController();
+    evalAbortRef.current = controller;
+    setIsEvaluating(true);
+    setEvalPhase('snapshot');
+    try {
+      const queued = await createQualityEval(project.project_id, {mode: evalEstimate.mode, scope: evalEstimate.scope});
+      const job = await waitForQualityEval(project.project_id, queued.eval_id, (current) => {
+        setEvalPhase(current.phase || current.status);
+      }, controller.signal);
+      setEvalNotice(summarizeEvalJob(job));
+      setEvalEstimate(null);
+      setError(null);
+    } catch (caughtError) {
+      if (caughtError instanceof DOMException && caughtError.name === 'AbortError') {
+        return;
+      }
+      setError(getErrorMessage(caughtError, '主观评估失败'));
+    } finally {
+      if (evalAbortRef.current === controller) {
+        evalAbortRef.current = null;
+      }
+      setIsEvaluating(false);
+      setEvalPhase(null);
     }
   };
 
@@ -453,14 +617,7 @@ export default function Editor({
   };
 
   const handleStoryboardReorder = async (
-    parts: Array<{
-      part_title: string;
-      pages: Array<{
-        page_id?: string | null;
-        title: string;
-        content_outline: string[];
-      }>;
-    }>,
+    parts: StoryboardPatchRequest['parts'],
   ) => {
     if (isSavingStoryboard) return;
     setIsSavingStoryboard(true);
@@ -689,14 +846,28 @@ export default function Editor({
           <button onClick={() => setIsStoryboardOpen((current) => !current)} className={`flex items-center gap-2 px-4 py-2.5 text-sm font-semibold rounded-xl border transition-all ${isStoryboardOpen ? 'border-blue-200 bg-blue-50 text-blue-700' : 'border-slate-200 text-slate-700 hover:bg-slate-100'}`}><StickyNote size={18} />便利贴</button>
           <button onClick={onBack} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200"><ArrowLeft size={18} />返回</button>
           <button onClick={() => { void handleOpenPresentation(); }} disabled={!canPresent || isPreparingPresentation} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200 disabled:opacity-40">{isPreparingPresentation ? <LoaderCircle size={18} className="animate-spin" /> : <Play size={18} />}放映</button>
-          <button onClick={() => void runAction(() => surface === 'search' ? runBatchAction(project.project_id, 'project_batch_search') : surface === 'draft' ? runBatchAction(project.project_id, 'project_batch_draft') : runBatchAction(project.project_id, 'project_batch_design'))} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200"><Sparkles size={18} />{surface === 'search' ? '批量搜索' : surface === 'draft' ? '批量策划稿' : '批量设计'}</button>
-          {surface === 'search' ? <button onClick={() => void runAction(() => runBatchAction(project.project_id, 'project_batch_summary'))} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200"><Wand2 size={18} />批量 summary</button> : null}
+          <button onClick={() => void handleBatchAction(surface === 'search' ? 'project_batch_search' : surface === 'draft' ? 'project_batch_draft' : 'project_batch_design')} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200"><Sparkles size={18} />{surface === 'search' ? '批量搜索' : surface === 'draft' ? '批量策划稿' : '批量设计'}</button>
+          {surface === 'search' ? <button onClick={() => void handleBatchAction('project_batch_summary')} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200"><Wand2 size={18} />批量 summary</button> : null}
           <button disabled={!hasRunningTask} onClick={() => void runAction(() => cancelProjectTasks(project.project_id))} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-rose-700 hover:bg-rose-50 rounded-xl border border-rose-200 disabled:opacity-40"><Square size={16} />取消</button>
-          <button onClick={async () => { setIsExporting(true); try { const job = await createExport(project.project_id); window.open(getExportDownloadUrl(project.project_id, job.export_id), '_blank', 'noopener,noreferrer'); setError(null); setExportNotice((job.font_report?.notices ?? []).join('\n') || null); } catch (caughtError) { setError(getErrorMessage(caughtError, '导出失败')); } finally { setIsExporting(false); } }} disabled={isExporting || replay.active} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl disabled:bg-blue-300">{isExporting ? <LoaderCircle size={18} className="animate-spin" /> : <Download size={18} />}导出</button>
+          <button onClick={() => void handleQualityEval()} disabled={isEvaluating || replay.active} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-200 disabled:opacity-40">{isEvaluating ? <LoaderCircle size={18} className="animate-spin" /> : <Eye size={18} />}{isEvaluating ? (evalPhase === 'vlm' ? '评审中' : evalPhase === 'render' ? '渲染中' : '评估中') : evalEstimate ? '确认评估' : '视觉评估'}</button>
+          <button onClick={() => void handleExport()} disabled={isExporting || replay.active} className="flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl disabled:bg-blue-300">{isExporting ? <LoaderCircle size={18} className="animate-spin" /> : <Download size={18} />}{isExporting ? (exportPhase === 'preflight' ? '预检中' : exportPhase === 'build' ? '构建中' : exportPhase === 'verify' ? '校验中' : '导出中') : '导出'}</button>
         </div>
       </header>
       <ReplayBar replay={replay} />
+      {activeBatch ? (
+        <div className="px-6 py-2 text-sm text-slate-700 bg-white border-b border-slate-100 flex items-center justify-between gap-4">
+          <span>
+            批量 {activeBatch.status}：成功 {activeBatch.success_count} / 失败 {activeBatch.failed_count} / 运行 {activeBatch.running_count} / 取消 {activeBatch.canceled_count}（排队 {activeBatch.queued_count}，跳过 {activeBatch.skipped_count}）
+          </span>
+          {activeBatch.failed_count > 0 && (activeBatch.status === 'failed' || activeBatch.status === 'partial_success') ? (
+            <button onClick={() => void handleRetryFailedBatch()} className="px-3 py-1 text-xs font-semibold text-blue-700 bg-blue-50 border border-blue-200 rounded-lg">
+              只重试失败页
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       {exportNotice ? <div className="px-6 py-2 text-sm text-amber-800 bg-amber-50 border-b border-amber-100">{exportNotice}</div> : null}
+      {evalNotice ? <div className="px-6 py-2 text-sm text-slate-700 bg-slate-50 border-b border-slate-100">{evalNotice}</div> : null}
 
       {isStoryboardOpen ? (
         <StoryboardPanel
@@ -763,9 +934,9 @@ export default function Editor({
                   <div className="rounded-[2rem] border border-slate-200 bg-white px-6 py-4 shadow-sm flex items-center justify-between gap-4">
                     <div>
                       <div className="text-lg font-semibold text-slate-800">策划稿</div>
-                      <div className="text-sm text-slate-500 mt-1">在这一步定稿内容，确认后再生成设计稿。</div>
+                      <div className="text-sm text-slate-500 mt-1">改文案、开关 optional 槽、拖拽布局盒。保存后会生成新的 LayoutPlan，设计稿按这版对齐。</div>
                     </div>
-                    <button onClick={() => setIsDataModalOpen(true)} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"><FileText size={14} className="inline mr-1" />编辑策划稿</button>
+                    <button onClick={() => setIsDataModalOpen(true)} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"><FileText size={14} className="inline mr-1" />原始数据</button>
                   </div>
                 ) : null}
                 {surface === 'design' ? (
@@ -779,7 +950,17 @@ export default function Editor({
                     onSave={() => void refreshStyleCards(() => saveStyleCardToLibrary(project.project_id))}
                   />
                 ) : null}
-                <SvgCanvas markup={previewMarkup} placeholder={surface === 'draft' ? '当前页策划稿尚未生成' : '当前页设计稿尚未生成'} />
+                {surface === 'draft' ? (
+                  <DraftCanvas
+                    page={activePage}
+                    readOnly={replay.active}
+                    saving={isSavingScene}
+                    onSave={handleSaveScene}
+                    onOpenRaw={() => setIsDataModalOpen(true)}
+                  />
+                ) : (
+                  <SvgCanvas markup={previewMarkup} placeholder="当前页设计稿尚未生成" />
+                )}
               </div>
             )}
           </div>

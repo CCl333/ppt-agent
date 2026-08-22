@@ -12,6 +12,10 @@ from app.schemas.api import (
     ExportCreateRequest,
     PageActionRequest,
     PageOutlinePatchRequest,
+    QualityEvalCreateRequest,
+    QualityEvalEstimateRequest,
+    QualityEvalHumanReviewRequest,
+    ScenePatchRequest,
     StyleCardConfirmRequest,
     StyleCardSaveRequest,
     SummaryPatchRequest,
@@ -133,6 +137,25 @@ def patch_page_draft(
     return service.patch_page_draft(project_id, page_id, payload.svg_markup)
 
 
+@router.post("/pages/{page_id}/scene:patch")
+def patch_page_scene(
+    project_id: str,
+    page_id: str,
+    payload: ScenePatchRequest,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.patch_page_scene(project_id, page_id, payload.model_dump())
+
+
+@router.get("/pages/{page_id}/quality")
+def get_page_quality(
+    project_id: str,
+    page_id: str,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.get_page_quality(project_id, page_id)
+
+
 @router.post("/pages/{page_id}/design:generate")
 def generate_page_design(
     project_id: str,
@@ -158,6 +181,24 @@ def run_batch_action(
     service: PptAgentService = Depends(get_service),
 ) -> dict:
     return service.queue_batch_action(project_id, payload.action_type)
+
+
+@router.get("/batches/{batch_run_id}")
+def get_batch_run(
+    project_id: str,
+    batch_run_id: str,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.get_batch_run(project_id, batch_run_id)
+
+
+@router.post("/batches/{batch_run_id}:retry-failed")
+def retry_failed_batch(
+    project_id: str,
+    batch_run_id: str,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.retry_failed_batch(project_id, batch_run_id)
 
 
 @router.post("/tasks:cancel")
@@ -203,13 +244,18 @@ def save_style_card(
     return service.save_style_card_to_library(project_id, payload.style_id)
 
 
-@router.post("/exports")
+@router.post("/exports", status_code=202)
 def create_export(
     project_id: str,
     payload: ExportCreateRequest,
     service: PptAgentService = Depends(get_service),
 ) -> dict:
-    return service.create_export(project_id, payload.export_format)
+    return service.create_export(
+        project_id,
+        payload.export_format,
+        render_mode=payload.render_mode,
+        idempotency_key=payload.idempotency_key,
+    )
 
 
 @router.get("/exports/{export_id}")
@@ -230,3 +276,62 @@ def download_export(
     file_path = service.get_export_file_path(project_id, export_id)
     filename = service.get_export_download_name(project_id, export_id)
     return FileResponse(file_path, filename=filename)
+
+
+@router.post("/quality-evals:estimate")
+def estimate_quality_eval(
+    project_id: str,
+    payload: QualityEvalEstimateRequest,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.estimate_quality_eval(
+        project_id,
+        mode=payload.mode,
+        scope=payload.scope,
+        page_ids=payload.page_ids or None,
+        pairwise_candidates=payload.pairwise_candidates,
+    )
+
+
+@router.post("/quality-evals", status_code=202)
+def create_quality_eval(
+    project_id: str,
+    payload: QualityEvalCreateRequest,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.create_quality_eval(
+        project_id,
+        mode=payload.mode,
+        scope=payload.scope,
+        page_ids=payload.page_ids or None,
+        pairwise_candidates=payload.pairwise_candidates,
+        requested_models=payload.requested_models or None,
+        idempotency_key=payload.idempotency_key,
+    )
+
+
+@router.get("/quality-evals")
+def list_quality_evals(
+    project_id: str,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.list_quality_evals(project_id)
+
+
+@router.get("/quality-evals/{eval_id}")
+def get_quality_eval(
+    project_id: str,
+    eval_id: str,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.get_quality_eval(project_id, eval_id)
+
+
+@router.post("/quality-evals/{eval_id}/human-reviews")
+def add_quality_eval_human_review(
+    project_id: str,
+    eval_id: str,
+    payload: QualityEvalHumanReviewRequest,
+    service: PptAgentService = Depends(get_service),
+) -> dict:
+    return service.add_quality_eval_human_review(project_id, eval_id, payload.model_dump())

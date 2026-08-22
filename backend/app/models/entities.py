@@ -34,6 +34,8 @@ class Project(Base):
     outline_versions: Mapped[list["OutlineVersion"]] = relationship(back_populates="project")
     pages: Mapped[list["ProjectPage"]] = relationship(back_populates="project")
     exports: Mapped[list["ExportJob"]] = relationship(back_populates="project")
+    batch_runs: Mapped[list["BatchRun"]] = relationship(back_populates="project")
+    quality_evals: Mapped[list["QualityEvalJob"]] = relationship(back_populates="project")
     source_collections: Mapped[list["SourceCollection"]] = relationship(back_populates="project")
     citations: Mapped[list["Citation"]] = relationship(back_populates="project")
     agent_tasks: Mapped[list["AgentTask"]] = relationship(back_populates="project")
@@ -288,6 +290,7 @@ class ProjectPage(Base):
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     page_code: Mapped[str] = mapped_column(index=True)
     page_role: Mapped[str] = mapped_column(default="content")
+    part_id: Mapped[str | None] = mapped_column(nullable=True, index=True)
     part_title: Mapped[str | None] = mapped_column(Text, nullable=True)
     sort_order: Mapped[int] = mapped_column(default=0)
     current_brief_version_id: Mapped[str | None] = mapped_column(nullable=True)
@@ -347,6 +350,13 @@ class DraftVersion(Base):
     research_session_id: Mapped[str | None] = mapped_column(nullable=True)
     draft_svg_markup: Mapped[str] = mapped_column(Text, default="")
     content_plan_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    visual_plan_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    layout_plan_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    quality_report_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    svg_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retryability: Mapped[str | None] = mapped_column(Text, nullable=True)
+    contract_version: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
 
@@ -366,8 +376,43 @@ class DesignVersion(Base):
     style_pack_id: Mapped[str | None] = mapped_column(nullable=True)
     background_asset_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     design_svg_markup: Mapped[str] = mapped_column(Text, default="")
+    visual_plan_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    layout_plan_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    quality_report_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    export_preflight_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    svg_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retryability: Mapped[str | None] = mapped_column(Text, nullable=True)
+    contract_version: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+
+class BatchRun(Base):
+    __tablename__ = "batch_runs"
+
+    id: Mapped[str] = mapped_column(primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    action_type: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(default="queued", index=True)
+    expected_count: Mapped[int] = mapped_column(Integer, default=0)
+    queued_count: Mapped[int] = mapped_column(Integer, default=0)
+    running_count: Mapped[int] = mapped_column(Integer, default=0)
+    success_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    canceled_count: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    failure_summary_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    input_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    build_fingerprint_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    parent_batch_run_id: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    retry_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    agent_run_id: Mapped[str | None] = mapped_column(nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    project: Mapped[Project] = relationship(back_populates="batch_runs")
 
 
 class ExportJob(Base):
@@ -376,13 +421,67 @@ class ExportJob(Base):
     id: Mapped[str] = mapped_column(primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     export_format: Mapped[str] = mapped_column(default="pptx")
-    status: Mapped[str] = mapped_column(default="completed")
-    file_path: Mapped[str] = mapped_column(Text)
+    render_mode: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(default="queued")
+    phase: Mapped[str] = mapped_column(Text, default="snapshot")
+    progress_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    input_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    input_hash: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    file_path: Mapped[str] = mapped_column(Text, default="")
+    temp_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    file_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    slide_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    manifest_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     font_report_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_detail_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    build_fingerprint_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    idempotency_key: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
 
     project: Mapped[Project] = relationship(back_populates="exports")
+
+
+class QualityEvalJob(Base):
+    __tablename__ = "quality_eval_jobs"
+
+    id: Mapped[str] = mapped_column(primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    mode: Mapped[str] = mapped_column(Text, default="quick")
+    scope: Mapped[str] = mapped_column(Text, default="canary")
+    status: Mapped[str] = mapped_column(default="queued", index=True)
+    phase: Mapped[str] = mapped_column(Text, default="snapshot")
+    page_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    requested_models_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    estimated_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    actual_input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    actual_output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
+    actual_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    completed_count: Mapped[int] = mapped_column(Integer, default=0)
+    progress_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    input_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    input_hash: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    report_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    human_reviews_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_detail_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    build_fingerprint_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    judge_prompt_version: Mapped[str | None] = mapped_column(Text, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+    project: Mapped[Project] = relationship(back_populates="quality_evals")
 
 
 class AgentTask(Base):
@@ -390,11 +489,13 @@ class AgentTask(Base):
     __table_args__ = (
         Index("idx_agent_tasks_sched", "status", "next_run_at", "priority"),
         Index("idx_agent_tasks_page", "page_id", "task_type"),
+        Index("idx_agent_tasks_batch", "batch_run_id"),
     )
 
     task_id: Mapped[str] = mapped_column(primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     page_id: Mapped[str | None] = mapped_column(ForeignKey("project_pages.id", ondelete="CASCADE"), nullable=True, index=True)
+    batch_run_id: Mapped[str | None] = mapped_column(nullable=True, index=True)
     task_type: Mapped[str] = mapped_column(Text, index=True)
     task_stage: Mapped[str] = mapped_column(Text, default="init")
     status: Mapped[int] = mapped_column(Integer, default=1, index=True)

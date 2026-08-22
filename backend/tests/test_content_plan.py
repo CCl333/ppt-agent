@@ -123,6 +123,37 @@ def test_normalize_drops_footer_on_content_pages():
     assert plan["footer"] == {}
 
 
+def test_normalize_section_allows_preview_blocks():
+    plan = normalize_content_plan(
+        {
+            "title": "走进北京的时间轴",
+            "subtitle": "从中轴皇城到长城远眺",
+            "blocks": [
+                {"label": "中轴皇城", "note": "故宫与景山"},
+                {"label": "长城远眺", "note": ""},
+            ],
+            "visual_intent": "北京城市轴线",
+        },
+        page_code="page-03",
+        title="走进北京的时间轴",
+        page_role="section",
+    )
+    assert plan["title"] == "走进北京的时间轴"
+    assert plan["footer"] == {}
+    assert plan["visual_intent"] == "北京城市轴线"
+    assert len(plan["blocks"]) == 2
+
+
+def test_normalize_section_requires_subtitle_or_preview():
+    with pytest.raises(RuntimeError, match="章节页"):
+        normalize_content_plan(
+            {"title": "走进北京的时间轴"},
+            page_code="page-03",
+            title="走进北京的时间轴",
+            page_role="section",
+        )
+
+
 def test_cover_plan_fixture_still_normalizes():
     plan = normalize_content_plan(COVER_PLAN, page_code="cover", title=COVER_PLAN["title"], page_role="cover")
     assert plan["title"] == COVER_PLAN["title"]
@@ -139,6 +170,17 @@ def test_normalize_allows_catalog_without_slots():
         page_images=[{"image_id": "IMG-1", "caption": "故宫"}],
     )
     assert plan["image_slots"] == []
+
+
+def test_content_image_slot_defaults_to_support_not_hero():
+    plan = normalize_content_plan(
+        _content_payload(image_slots=[{"image_id": "IMG-1", "label": "故宫"}]),
+        page_code="page-04",
+        title="出发前要做的事",
+        page_role="content",
+        page_images=[{"image_id": "IMG-1", "caption": "故宫"}],
+    )
+    assert plan["image_slots"][0]["placement"] == "support"
 
 
 def test_svg_matches_plan_and_ignores_page_number():

@@ -232,6 +232,7 @@ export interface PageSummary {
   project_id: string;
   page_code: string;
   page_role: string;
+  part_id: string | null;
   part_title: string | null;
   sort_order: number;
   title: string;
@@ -252,6 +253,12 @@ export interface PageSummary {
   current_brief_version_id: string | null;
   current_draft_version_id: string | null;
   current_design_version_id: string | null;
+  draft_status_reason?: string | null;
+  design_status_reason?: string | null;
+  draft_retryability?: string | null;
+  design_retryability?: string | null;
+  draft_svg_hash?: string | null;
+  design_svg_hash?: string | null;
   draft_preview_svg_markup?: string | null;
   design_preview_svg_markup?: string | null;
   preview_surface?: PreviewSurface;
@@ -283,7 +290,16 @@ export interface OutlineResponse {
         content: string[];
       };
       parts: Array<{
+        part_id?: string;
         part_title: string;
+        section_page?: {
+          enabled?: boolean;
+          page_id?: string;
+          title?: string;
+          subtitle?: string;
+          preview_items?: string[];
+          visual_intent?: string;
+        };
         pages: Array<{
           title: string;
           content: string[];
@@ -297,11 +313,50 @@ export interface OutlineResponse {
   };
   created_at: string;
   updated_at: string;
+  storyboard?: StoryboardTree;
+}
+
+export interface StoryboardPageRef {
+  page_id: string;
+  page_role: string;
+  title: string;
+  part_id?: string | null;
+  part_title?: string | null;
+}
+
+export interface StoryboardTree {
+  fixed_prefix: StoryboardPageRef[];
+  sections: Array<{
+    part_id: string;
+    part_title: string;
+    section_page: StoryboardPageRef | null;
+    content_pages: StoryboardPageRef[];
+  }>;
+  fixed_suffix: StoryboardPageRef[];
+  play_order: string[];
+  composition?: {
+    cover: number;
+    toc: number;
+    section: number;
+    content: number;
+    end: number;
+    total: number;
+    label: string;
+  };
 }
 
 export interface StoryboardPatchRequest {
   parts: Array<{
+    part_id?: string | null;
     part_title: string;
+    section_page?: {
+      enabled?: boolean | null;
+      page_id?: string | null;
+      title?: string | null;
+      subtitle?: string | null;
+      preview_items?: string[];
+      visual_intent?: string | null;
+    } | null;
     pages: Array<{
       page_id?: string | null;
       title: string;
@@ -313,6 +368,51 @@ export interface StoryboardPatchRequest {
 export interface StoryboardPatchResponse {
   items: PageSummary[];
   outline: OutlineResponse;
+  storyboard?: StoryboardTree;
+}
+
+export interface LayoutBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface SceneNode {
+  node_id: string;
+  kind: string;
+  role?: string | null;
+  box?: LayoutBox | null;
+  children?: string[];
+  text?: string;
+  text_ref?: string;
+  visual_slot_id?: string;
+}
+
+export interface LayoutPlan {
+  schema_version?: string;
+  canvas?: {width: number; height: number};
+  safe_area?: LayoutBox;
+  nodes?: SceneNode[];
+  reading_order?: string[];
+  layout_replanned?: boolean;
+}
+
+export interface VisualSlot {
+  slot_id: string;
+  kind: string;
+  priority?: string;
+  status?: string;
+  intent?: string;
+  asset_id?: string;
+  box?: LayoutBox;
+}
+
+export interface ScenePatchRequest {
+  base_version_id: string;
+  text_edits?: Array<{node_id: string; text: string}>;
+  box_edits?: Array<{node_id: string; box: LayoutBox}>;
+  slot_visibility?: Array<{slot_id: string; visible: boolean}>;
 }
 
 export interface DraftVersion {
@@ -325,6 +425,13 @@ export interface DraftVersion {
   research_session_id: string | null;
   draft_svg_markup: string;
   content_plan_json?: Record<string, unknown>;
+  visual_plan_json?: Record<string, unknown>;
+  layout_plan_json?: Record<string, unknown>;
+  quality_report?: Record<string, unknown>;
+  svg_hash?: string | null;
+  status_reason?: string | null;
+  retryability?: string | null;
+  contract_version?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -339,6 +446,14 @@ export interface DesignVersion {
   style_pack_id: string | null;
   background_asset_path: string | null;
   design_svg_markup: string;
+  visual_plan_json?: Record<string, unknown>;
+  layout_plan_json?: Record<string, unknown>;
+  quality_report?: Record<string, unknown>;
+  export_preflight?: Record<string, unknown>;
+  svg_hash?: string | null;
+  status_reason?: string | null;
+  retryability?: string | null;
+  contract_version?: string | null;
   style_pack: StyleOption;
   created_at: string;
   updated_at: string;
@@ -361,11 +476,92 @@ export interface ExportJob {
   export_id: string;
   project_id: string;
   export_format: string;
+  render_mode?: string | null;
   status: string;
+  phase?: string;
+  progress?: {current?: number; total?: number; phase?: string};
+  input_hash?: string | null;
+  input_stale?: boolean;
   file_path: string;
+  file_sha256?: string | null;
+  file_size?: number | null;
+  slide_count?: number | null;
+  manifest?: Record<string, unknown>;
   font_report?: FontReport;
+  error_code?: string | null;
+  error_detail?: Record<string, unknown>;
+  download_ready?: boolean;
   created_at: string;
   updated_at: string;
+}
+
+export interface QualityEvalEstimate {
+  mode: string;
+  scope: string;
+  scope_capped: boolean;
+  page_count: number;
+  page_ids: string[];
+  estimated_calls: number;
+  estimated_tokens: number;
+  estimated_cost: number | null;
+  estimated_duration_s: number;
+  pairwise_pairs: number;
+  require_confirmation: boolean;
+  vlm_required: boolean;
+}
+
+export interface QualityEvalJob {
+  eval_id: string;
+  project_id: string;
+  mode: string;
+  scope: string;
+  status: string;
+  phase?: string;
+  page_ids: string[];
+  estimated_tokens: number;
+  actual_input_tokens: number;
+  actual_output_tokens: number;
+  sample_count: number;
+  completed_count: number;
+  progress?: {current?: number; total?: number; phase?: string};
+  input_stale?: boolean;
+  report?: {
+    pages?: Array<{
+      page_id: string;
+      hard_fail?: boolean;
+      tracks?: {
+        verdict?: string;
+        subjective_score?: number | null;
+        raw_subjective_score?: number | null;
+        ready_eligible?: boolean;
+      };
+    }>;
+  };
+  error_code?: string | null;
+  error_detail?: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BatchRun {
+  batch_run_id: string;
+  agent_run_id: string | null;
+  action_type: string;
+  status: string;
+  expected_count: number;
+  queued_count: number;
+  skipped_count: number;
+  running_count: number;
+  success_count: number;
+  failed_count: number;
+  canceled_count: number;
+  failure_summary: Record<string, unknown>;
+  retry_reason?: string | null;
+  parent_batch_run_id?: string | null;
+  task_ids: string[];
+  created_at?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
 }
 
 export interface ProjectMessage {
@@ -491,6 +687,26 @@ function buildUrl(path: string): string {
   return `${API_BASE}${cleanPath}`;
 }
 
+function apiDetailMessage(payload: unknown): string {
+  if (!payload || typeof payload !== 'object') {
+    return '';
+  }
+  const detail = (payload as {detail?: unknown}).detail;
+  if (typeof detail === 'string') {
+    return detail;
+  }
+  if (detail && typeof detail === 'object') {
+    const item = detail as {message?: unknown; error_code?: unknown};
+    if (typeof item.message === 'string' && item.message.trim()) {
+      return item.message;
+    }
+    if (typeof item.error_code === 'string' && item.error_code.trim()) {
+      return item.error_code;
+    }
+  }
+  return JSON.stringify(payload);
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (!(init?.body instanceof FormData) && !headers.has('Content-Type')) {
@@ -506,11 +722,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     let message = response.statusText;
     try {
       const payload = await response.json();
-      if (typeof payload.detail === 'string') {
-        message = payload.detail;
-      } else {
-        message = JSON.stringify(payload);
-      }
+      message = apiDetailMessage(payload) || response.statusText;
     } catch {
       message = response.statusText;
     }
@@ -660,6 +872,10 @@ export async function getPage(projectId: string, pageId: string): Promise<PageSu
   return request<PageSummary>(`/projects/${projectId}/pages/${pageId}`);
 }
 
+export async function getPageQuality(projectId: string, pageId: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/projects/${projectId}/pages/${pageId}/quality`);
+}
+
 export async function retryPageSearchResult(projectId: string, pageId: string, sourceId: string): Promise<PageSummary> {
   return request<PageSummary>(`/projects/${projectId}/pages/${pageId}/search-results/${sourceId}:retry`, {
     method: 'POST',
@@ -722,6 +938,13 @@ export async function patchPageDraft(projectId: string, pageId: string, svgMarku
   });
 }
 
+export async function patchPageScene(projectId: string, pageId: string, payload: ScenePatchRequest): Promise<PageSummary> {
+  return request<PageSummary>(`/projects/${projectId}/pages/${pageId}/scene:patch`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function generatePageDraft(projectId: string, pageId: string): Promise<ActionJobResponse> {
   return request<ActionJobResponse>(`/projects/${projectId}/pages/${pageId}/draft:generate`, {
     method: 'POST',
@@ -745,10 +968,20 @@ export async function getPageDesign(projectId: string, pageId: string): Promise<
 export async function runBatchAction(
   projectId: string,
   actionType: 'project_batch_search' | 'project_batch_summary' | 'project_batch_draft' | 'project_batch_design',
-): Promise<ActionJobResponse> {
-  return request<ActionJobResponse>(`/projects/${projectId}/actions/batch`, {
+): Promise<BatchRun> {
+  return request<BatchRun>(`/projects/${projectId}/actions/batch`, {
     method: 'POST',
     body: JSON.stringify({action_type: actionType}),
+  });
+}
+
+export async function getBatchRun(projectId: string, batchRunId: string): Promise<BatchRun> {
+  return request<BatchRun>(`/projects/${projectId}/batches/${batchRunId}`);
+}
+
+export async function retryFailedBatch(projectId: string, batchRunId: string): Promise<BatchRun> {
+  return request<BatchRun>(`/projects/${projectId}/batches/${batchRunId}:retry-failed`, {
+    method: 'POST',
   });
 }
 
@@ -878,16 +1111,114 @@ export async function saveStyleCardToLibrary(projectId: string, styleId?: string
   });
 }
 
-export async function createExport(projectId: string): Promise<ExportJob> {
+export async function createExport(
+  projectId: string,
+  options?: {exportFormat?: string; renderMode?: string; idempotencyKey?: string},
+): Promise<ExportJob> {
   return request<ExportJob>(`/projects/${projectId}/exports`, {
     method: 'POST',
-    body: JSON.stringify({export_format: 'pptx'}),
+    body: JSON.stringify({
+      export_format: options?.exportFormat ?? 'pptx',
+      render_mode: options?.renderMode,
+      idempotency_key: options?.idempotencyKey,
+    }),
   });
+}
+
+export async function getExport(projectId: string, exportId: string): Promise<ExportJob> {
+  return request<ExportJob>(`/projects/${projectId}/exports/${exportId}`);
+}
+
+export async function waitForExport(
+  projectId: string,
+  exportId: string,
+  onProgress?: (job: ExportJob) => void,
+  signal?: AbortSignal,
+): Promise<ExportJob> {
+  for (let attempt = 0; attempt < 180; attempt += 1) {
+    if (signal?.aborted) {
+      throw new DOMException('导出已取消', 'AbortError');
+    }
+    const job = await getExport(projectId, exportId);
+    onProgress?.(job);
+    if (job.status === 'completed' || job.status === 'failed' || job.status === 'canceled') {
+      return job;
+    }
+    await new Promise((resolve, reject) => {
+      const timer = window.setTimeout(resolve, 500);
+      signal?.addEventListener('abort', () => {
+        window.clearTimeout(timer);
+        reject(new DOMException('导出已取消', 'AbortError'));
+      }, {once: true});
+    });
+  }
+  throw new Error('导出超时');
 }
 
 export function getExportDownloadUrl(projectId: string, exportId: string): string {
   return buildUrl(`/projects/${projectId}/exports/${exportId}/download`);
 }
+
+export async function estimateQualityEval(
+  projectId: string,
+  options?: {mode?: string; scope?: string; pageIds?: string[]},
+): Promise<QualityEvalEstimate> {
+  return request<QualityEvalEstimate>(`/projects/${projectId}/quality-evals:estimate`, {
+    method: 'POST',
+    body: JSON.stringify({
+      mode: options?.mode ?? 'quick',
+      scope: options?.scope ?? 'canary',
+      page_ids: options?.pageIds ?? [],
+    }),
+  });
+}
+
+export async function createQualityEval(
+  projectId: string,
+  options?: {mode?: string; scope?: string; pageIds?: string[]; idempotencyKey?: string},
+): Promise<QualityEvalJob> {
+  return request<QualityEvalJob>(`/projects/${projectId}/quality-evals`, {
+    method: 'POST',
+    body: JSON.stringify({
+      mode: options?.mode ?? 'quick',
+      scope: options?.scope ?? 'canary',
+      page_ids: options?.pageIds ?? [],
+      idempotency_key: options?.idempotencyKey,
+    }),
+  });
+}
+
+export async function getQualityEval(projectId: string, evalId: string): Promise<QualityEvalJob> {
+  return request<QualityEvalJob>(`/projects/${projectId}/quality-evals/${evalId}`);
+}
+
+export async function waitForQualityEval(
+  projectId: string,
+  evalId: string,
+  onProgress?: (job: QualityEvalJob) => void,
+  signal?: AbortSignal,
+): Promise<QualityEvalJob> {
+  for (let attempt = 0; attempt < 180; attempt += 1) {
+    if (signal?.aborted) {
+      throw new DOMException('主观评估已取消', 'AbortError');
+    }
+    const job = await getQualityEval(projectId, evalId);
+    onProgress?.(job);
+    if (job.status === 'completed' || job.status === 'failed' || job.status === 'canceled') {
+      return job;
+    }
+    await new Promise((resolve, reject) => {
+      const timer = window.setTimeout(resolve, 500);
+      signal?.addEventListener('abort', () => {
+        window.clearTimeout(timer);
+        reject(new DOMException('主观评估已取消', 'AbortError'));
+      }, {once: true});
+    });
+  }
+  throw new Error('主观评估超时');
+}
+
+const lastStreamIds = new Map<string, number>();
 
 export function connectProjectEventStream(
   projectId: string,
@@ -896,9 +1227,21 @@ export function connectProjectEventStream(
     onError?: () => void;
   },
 ): () => void {
-  const source = new EventSource(buildUrl(`/projects/${projectId}/events/stream`));
+  const seen = new Set<string>();
+  const afterId = lastStreamIds.get(projectId) ?? 0;
+  const path = afterId > 0
+    ? `/projects/${projectId}/events/stream?after_id=${afterId}`
+    : `/projects/${projectId}/events/stream`;
+  const source = new EventSource(buildUrl(path));
   source.onmessage = (event) => {
-    handlers.onEvent(JSON.parse(event.data) as ProjectEvent);
+    const payload = JSON.parse(event.data) as ProjectEvent;
+    const key = payload.event_id || String(payload.stream_id);
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    lastStreamIds.set(projectId, payload.stream_id);
+    handlers.onEvent(payload);
   };
   source.onerror = () => {
     handlers.onError?.();

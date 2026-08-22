@@ -3,77 +3,16 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Generator
 
-from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
-from app.models.base import Base
+from app.core.migrations import ensure_schema
 
 _ENGINE: Engine | None = None
 _SESSION_FACTORY: sessionmaker[Session] | None = None
-
-_SCHEMA_UPGRADES: dict[str, list[tuple[str, str]]] = {
-    "projects": [
-        ("workflow_constraints_json", "JSON"),
-        ("style_candidates_json", "JSON"),
-        ("style_card_json", "JSON"),
-    ],
-    "requirement_forms": [
-        ("init_search_queries_json", "JSON"),
-        ("init_search_results_json", "JSON"),
-        ("init_corpus_digest_json", "JSON"),
-        ("page_count_options_json", "JSON"),
-    ],
-    "source_collections": [
-        ("page_id", "TEXT"),
-    ],
-    "project_pages": [
-        ("outline_status", "TEXT"),
-        ("search_status", "TEXT"),
-        ("summary_status", "TEXT"),
-        ("page_search_queries_json", "JSON"),
-        ("page_search_results_json", "JSON"),
-        ("page_images_json", "JSON"),
-        ("page_corpus_digest_json", "JSON"),
-        ("page_summary_md", "TEXT"),
-        ("page_summary_citations_json", "JSON"),
-        ("artifact_staleness_json", "JSON"),
-    ],
-    "page_brief_versions": [
-        ("section_title", "TEXT"),
-    ],
-    "draft_versions": [
-        ("content_plan_json", "JSON"),
-    ],
-    "source_chunks": [
-        ("content_for_match", "TEXT"),
-    ],
-    "export_jobs": [
-        ("font_report_json", "JSON"),
-    ],
-    "search_settings": [
-        ("tavily_api_key", "TEXT"),
-        ("tavily_api_url", "TEXT"),
-    ],
-    "research_sessions": [
-        ("page_brief_version_id", "TEXT"),
-        ("based_on_session_id", "TEXT"),
-        ("research_goal", "TEXT"),
-        ("cross_page_outline_snapshot_json", "JSON"),
-        ("key_findings_json", "JSON"),
-        ("overlap_risks_json", "JSON"),
-        ("open_questions_json", "JSON"),
-        ("confirmed_by_message_id", "TEXT"),
-        ("context_snapshot_json", "JSON"),
-        ("created_by_agent_run_id", "TEXT"),
-        ("candidate_sources_json", "JSON"),
-    ],
-}
-
-_SCHEMA_DROPS: dict[str, list[str]] = {
-    "source_chunks": ["content_for_embedding"],
-}
+_SEEDED = False
 
 
 def get_engine() -> Engine:
@@ -130,23 +69,27 @@ def session_scope() -> Generator[Session, None, None]:
 
 
 def init_db() -> None:
+    global _SEEDED
     engine = get_engine()
-    Base.metadata.create_all(bind=engine)
-    _apply_schema_upgrades(engine)
+    ensure_schema(engine, auto_migrate=get_settings().effective_schema_auto_migrate)
+    if _SEEDED:
+        return
     from app.services.model_settings import seed_models_from_env
     from app.services.style_cards import seed_style_library
 
     seed_models_from_env()
     with session_scope() as session:
         seed_style_library(session)
+    _SEEDED = True
 
 
 def reset_db_state() -> None:
-    global _ENGINE, _SESSION_FACTORY
+    global _ENGINE, _SESSION_FACTORY, _SEEDED
     if _ENGINE is not None:
         _ENGINE.dispose()
     _ENGINE = None
     _SESSION_FACTORY = None
+    _SEEDED = False
 
 
 def is_sqlite_locked(exc: BaseException) -> bool:
@@ -162,25 +105,3 @@ def _configure_sqlite(dbapi_connection, _) -> None:
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.execute("PRAGMA busy_timeout=10000")
     cursor.close()
-
-
-def _apply_schema_upgrades(engine: Engine) -> None:
-    inspector = inspect(engine)
-    with engine.begin() as conn:
-        for table_name, columns in _SCHEMA_UPGRADES.items():
-            if table_name not in inspector.get_table_names():
-                continue
-            existing = {column["name"] for column in inspector.get_columns(table_name)}
-            for column_name, ddl in columns:
-                if column_name in existing:
-                    continue
-                conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}"))
-        inspector = inspect(engine)
-        for table_name, columns in _SCHEMA_DROPS.items():
-            if table_name not in inspector.get_table_names():
-                continue
-            existing = {column["name"] for column in inspector.get_columns(table_name)}
-            for column_name in columns:
-                if column_name not in existing:
-                    continue
-                conn.execute(text(f"ALTER TABLE {table_name} DROP COLUMN {column_name}"))

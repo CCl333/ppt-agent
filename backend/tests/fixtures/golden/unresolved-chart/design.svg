@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720">
+  <text x="80" y="120" class="t-title" data-node-id="page-title" font-size="32px" fill="#0F172A">预算结构</text>
+  <rect x="448" y="160" width="720" height="400" class="c-surface" fill="#EEF4F8"/>
+  <text x="640" y="360" class="t-caption" font-size="16px" fill="#64748B">Horizontal Bar Chart</text>
+  <text x="80" y="200" class="t-body" font-size="16px" fill="#475569">交通</text>
+  <text x="80" y="240" class="t-body" font-size="16px" fill="#475569">住宿</text>
+  <text x="80" y="280" class="t-body" font-size="16px" fill="#475569">门票</text>
+</svg>
