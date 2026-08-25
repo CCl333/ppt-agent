@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from app.services.generation import STYLE_PACKS
@@ -60,6 +62,46 @@ def test_expand_tokens_writes_presentation_attrs():
     assert 'font-size="36px"' in expanded
 
 
+def test_expand_tokens_can_keep_draft_font_size():
+    svg = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+      <text class="t-page-title" data-node-id="page-title" data-text-role="page-title" font-size="32px">半日游路线总览</text>
+    </svg>
+    """
+    expanded = expand_token_classes(svg, STYLE_PACKS["consulting"], preserve_font_size=True)
+    assert 'font-size="32px"' in expanded
+    assert 'font-size="36px"' not in expanded
+    assert 'font-size="40px"' not in expanded
+    assert 'fill="' in expanded
+
+
+def test_prepare_design_keeps_draft_font_size_not_style_pack():
+    draft = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+      <style>.t-page-title { font-size: 32px; }</style>
+      <text class="t-page-title" data-node-id="page-title" data-text-role="page-title">半日游路线总览</text>
+    </svg>
+    """
+    design = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+      <text class="t-page-title" data-node-id="page-title" data-text-role="page-title">半日游路线总览</text>
+    </svg>
+    """
+    prepared = prepare_page_svg(
+        design,
+        stage="design",
+        style_pack=STYLE_PACKS["consulting"],
+        chrome={"page_title": "半日游路线总览", "page_index": 4, "page_count": 10},
+        draft_svg=draft,
+    )
+    assert 'data-node-id="page-title"' in prepared
+    title = re.search(r"<text[^>]*data-node-id=\"page-title\"[^>]*>", prepared)
+    assert title is not None
+    assert 'font-size="32px"' in title.group(0)
+    assert 'font-size="40px"' not in title.group(0)
+    assert 'font-size="36px"' not in title.group(0)
+
+
 def test_prepare_design_svg_injects_chrome():
     svg = prepare_page_svg(
         VALID_DESIGN,
@@ -70,7 +112,111 @@ def test_prepare_design_svg_injects_chrome():
     assert 'data-chrome="background"' in svg
     assert 'data-chrome="title_bar"' in svg
     assert "3 / 8" in svg
-    assert "实践路径" in svg
+    assert 'data-chrome="page_title"' not in svg
+    assert "实践路径" not in svg
+
+
+def test_prepare_design_keeps_draft_panel_fill_when_model_drops_rect():
+    draft = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+      <rect x="900" y="140" width="280" height="96" rx="12" fill="#f0fdfa"/>
+      <text x="920" y="190" font-size="20">4-5 小时</text>
+    </svg>
+    """
+    design = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+      <text x="920" y="190" class="t-kpi" data-node-id="kpi-1" data-text-role="kpi">4-5 小时</text>
+    </svg>
+    """
+    prepared = prepare_page_svg(
+        design,
+        stage="design",
+        style_pack=STYLE_PACKS["consulting"],
+        chrome={"page_title": "半日游路线总览", "page_index": 4, "page_count": 10},
+        draft_svg=draft,
+    )
+    assert 'data-retained-panel="1"' in prepared
+    assert 'class="c-accent-8"' in prepared
+    assert 'fill-opacity="0.08"' in prepared
+    assert 'x="900"' in prepared
+    assert 'y="140"' in prepared
+
+
+def test_prepare_design_remaps_white_panel_to_tinted_token():
+    draft = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+      <rect x="900" y="140" width="280" height="96" rx="12" fill="#ccfbf1"/>
+      <text x="920" y="190">4-5 小时</text>
+    </svg>
+    """
+    design = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+      <rect x="900" y="140" width="280" height="96" rx="12" class="c-white"/>
+      <text x="920" y="190" class="t-kpi" data-node-id="kpi-1" data-text-role="kpi">4-5 小时</text>
+    </svg>
+    """
+    prepared = prepare_page_svg(
+        design,
+        stage="design",
+        style_pack=STYLE_PACKS["consulting"],
+        chrome={"page_title": "半日游路线总览", "page_index": 4, "page_count": 10},
+        draft_svg=draft,
+    )
+    assert 'class="c-accent-8"' in prepared
+    assert 'class="c-white"' not in prepared
+    assert 'fill-opacity="0.08"' in prepared
+
+
+def test_prepare_design_upgrades_css_card_bg_to_visible_surface():
+    draft = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+      <style>.card-bg { fill: #ffffff; stroke: #e2e8f0; } .inner-panel { fill: #f8fafc; }</style>
+      <rect class="card-bg" x="60" y="122" width="750" height="288" rx="14"/>
+      <rect class="inner-panel" x="84" y="182" width="160" height="64" rx="8"/>
+    </svg>
+    """
+    design = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+      <rect class="c-surface" x="60" y="122" width="750" height="288" rx="14"/>
+      <text x="108" y="156" class="t-card-title" data-node-id="block-1-title" data-text-role="card-title">推荐主线</text>
+    </svg>
+    """
+    prepared = prepare_page_svg(
+        design,
+        stage="design",
+        style_pack=STYLE_PACKS["consulting"],
+        chrome={"page_title": "半日游路线总览", "page_index": 4, "page_count": 10},
+        draft_svg=draft,
+    )
+    assert prepared.count("c-surface-alt") >= 2
+    assert 'width="750"' in prepared
+    assert 'width="160"' in prepared
+
+
+def test_prepare_design_applies_draft_badge_size_to_label():
+    draft = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+      <style>.t-badge { font-size: 12px; }</style>
+      <rect x="60" y="44" width="80" height="22" rx="4" fill="#ccfbf1"/>
+      <text class="t-badge" x="68" y="59">经典半日游</text>
+    </svg>
+    """
+    design = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+      <rect x="60" y="44" width="80" height="22" rx="4" class="c-accent-16"/>
+      <text class="t-label" x="68" y="59">经典半日游</text>
+    </svg>
+    """
+    prepared = prepare_page_svg(
+        design,
+        stage="design",
+        style_pack=STYLE_PACKS["consulting"],
+        chrome={"page_title": "半日游路线总览", "page_index": 4, "page_count": 10},
+        draft_svg=draft,
+    )
+    label = re.search(r"<text[^>]*>经典半日游</text>", prepared)
+    assert label is not None
+    assert 'font-size="12px"' in label.group(0)
 
 
 def test_flatten_shifts_tspan_x_under_translate():

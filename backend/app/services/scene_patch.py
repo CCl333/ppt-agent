@@ -5,13 +5,7 @@ from copy import deepcopy
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from app.services.content_plan import (
-    MAX_LABEL_CHARS,
-    MAX_NOTE_CHARS,
-    MAX_SUBTITLE_CHARS,
-    compact_char_count,
-    normalize_text,
-)
+from app.services.content_plan import normalize_text
 from app.services.layout_validator import SAFE_AREA, _inside
 from app.services.page_scene import (
     CORE_TEXT_ROLES,
@@ -139,8 +133,6 @@ def _write_text_ref(plan: dict[str, Any], text_ref: str, text: str, *, node_id: 
         plan["title"] = text
         return
     if text_ref == "content_plan.subtitle":
-        if compact_char_count(text) > MAX_SUBTITLE_CHARS:
-            raise ScenePatchError(f"subtitle 超过 {MAX_SUBTITLE_CHARS} 字")
         plan["subtitle"] = text
         return
     if text_ref.startswith("content_plan.blocks."):
@@ -155,15 +147,7 @@ def _write_text_ref(plan: dict[str, Any], text_ref: str, text: str, *, node_id: 
         blocks = plan.setdefault("blocks", [])
         if not isinstance(blocks, list) or index < 0 or index >= len(blocks) or not isinstance(blocks[index], dict):
             raise ScenePatchError(f"{node_id} 没有对应的内容模块")
-        if field == "label":
-            compact = compact_char_count(text)
-            if compact < 2:
-                raise ScenePatchError("内容策划 label 过短")
-            if compact > MAX_LABEL_CHARS:
-                raise ScenePatchError(f"内容策划 label 超过 {MAX_LABEL_CHARS} 字")
-        elif field == "note" and compact_char_count(text) > MAX_NOTE_CHARS:
-            raise ScenePatchError(f"内容策划 note 超过 {MAX_NOTE_CHARS} 字")
-        elif field not in {"label", "note"}:
+        if field not in {"label", "note"}:
             raise ScenePatchError(f"不允许修改 {text_ref}")
         blocks[index][field] = text
         return

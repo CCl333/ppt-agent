@@ -165,6 +165,54 @@ def test_browser_bbox_does_not_fake_pass_without_playwright():
         assert payload["nodes"] == []
 
 
+def test_draft_extra_kpi_is_warning_not_hard_fail():
+    proposed = propose_layout_plan(
+        {"title": "核心景点怎么选", "blocks": [{"label": "三潭印月", "note": "必看亮点"}]}
+    )
+    svg = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+      <style>.t-page-title { font-size: 28px; } .t-card-title { font-size: 18px; } .t-body { font-size: 14px; } .t-kpi { font-size: 28px; }</style>
+      <text class="t-page-title" data-node-id="page-title" data-text-role="page-title" x="80" y="140">核心景点怎么选</text>
+      <text class="t-card-title" data-node-id="block-1-title" data-text-role="card-title" x="80" y="220">三潭印月</text>
+      <text class="t-body" data-node-id="block-1-body" data-text-role="body" x="80" y="260">必看亮点</text>
+      <text class="t-kpi" data-node-id="kpi-ticket" data-text-role="kpi" x="900" y="220">80元</text>
+    </svg>
+    """
+    report = evaluate_page_quality(svg, stage="draft", layout_plan=proposed)
+    codes = {
+        violation.get("code")
+        for check in report["checks"]
+        if check.get("status") == "fail"
+        for violation in check.get("violations") or []
+    }
+    assert "SCENE_NODE_ADDED" not in codes
+    assert report["hard_fail"] is False
+    assert any(item.get("code") == "SCENE_NODE_ADDED" for item in report.get("warnings") or [])
+
+
+def test_draft_cover_display_role_is_compatible_with_page_title_svg():
+    proposed = propose_layout_plan({"title": "杭州西湖半日游攻略"}, page_role="cover")
+    svg = """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+      <style>.t-page-title { font-size: 32px; }</style>
+      <g transform="translate(64, 72)">
+        <text class="t-page-title" data-node-id="page-title" data-text-role="page-title"
+              data-layout-box="64,72,1152,52" x="0" y="32">杭州西湖半日游攻略</text>
+      </g>
+    </svg>
+    """
+    report = evaluate_page_quality(svg, stage="draft", layout_plan=proposed)
+    codes = {
+        violation.get("code")
+        for check in report["checks"]
+        for violation in check.get("violations") or []
+    }
+    assert "SCENE_ROLE_CHANGED" not in codes
+    assert "FONT_BELOW_MINIMUM" not in codes
+    assert "TEXT_OUTSIDE_CANVAS" not in codes
+    assert report["hard_fail"] is False
+
+
 def test_scene_diff_detects_role_change():
     left = extract_page_scene(DRAFT_SVG)
     right_svg = """

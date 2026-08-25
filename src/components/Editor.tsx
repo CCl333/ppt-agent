@@ -6,6 +6,7 @@ import {
   Eye,
   FileText,
   LoaderCircle,
+  Pencil,
   Play,
   RefreshCw,
   Search,
@@ -125,6 +126,7 @@ export default function Editor({
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [isDataModalOpen, setIsDataModalOpen] = useState(false);
+  const [isDraftEditing, setIsDraftEditing] = useState(false);
   const [isStoryboardOpen, setIsStoryboardOpen] = useState(false);
   const [isSavingStoryboard, setIsSavingStoryboard] = useState(false);
   const [isPreparingPresentation, setIsPreparingPresentation] = useState(false);
@@ -232,6 +234,10 @@ export default function Editor({
   useEffect(() => {
     activePageIdRef.current = activePage?.page_id ?? null;
   }, [activePage?.page_id]);
+
+  useEffect(() => {
+    setIsDraftEditing(false);
+  }, [activePage?.page_id, surface]);
 
   useEffect(() => {
     let cancelled = false;
@@ -693,9 +699,29 @@ export default function Editor({
     }
   };
 
-  const previewMarkup = surface === 'design' ? activePage?.design?.design_svg_markup ?? null : surface === 'draft' ? activePage?.draft?.draft_svg_markup ?? null : null;
+  const previewMarkup = surface === 'design' ? activePage?.design?.design_svg_markup ?? null : surface === 'draft' ? activePage?.draft_preview_svg_markup ?? activePage?.draft?.draft_svg_markup ?? null : null;
   const searchDisabled = activePage?.page_role !== 'content' || project.current_stage !== 'search';
   const canPresent = surface !== 'search' && surface !== 'outline' && pages.length > 0;
+  const draftStats = useMemo(() => {
+    const total = pages.length;
+    let preview = 0;
+    let ready = 0;
+    let failed = 0;
+    let empty = 0;
+    for (const page of pages) {
+      if (page.draft_status === 'ready' || page.draft_status === 'confirmed') {
+        ready += 1;
+      } else if (page.draft_status === 'failed') {
+        failed += 1;
+      } else {
+        empty += 1;
+      }
+      if (page.draft_preview_svg_markup || page.draft_status === 'ready' || page.draft_status === 'confirmed' || page.draft_status === 'failed') {
+        preview += 1;
+      }
+    }
+    return {total, preview, ready, failed, empty};
+  }, [pages]);
 
   if (project.current_stage === 'outline' && !outline) {
     const retryBusy = isRetryingOutline || isOutlineGenerating;
@@ -934,9 +960,31 @@ export default function Editor({
                   <div className="rounded-[2rem] border border-slate-200 bg-white px-6 py-4 shadow-sm flex items-center justify-between gap-4">
                     <div>
                       <div className="text-lg font-semibold text-slate-800">策划稿</div>
-                      <div className="text-sm text-slate-500 mt-1">改文案、开关 optional 槽、拖拽布局盒。保存后会生成新的 LayoutPlan，设计稿按这版对齐。</div>
+                      {isDraftEditing ? (
+                        <div className="text-sm text-slate-500 mt-1">改文案、开关 optional 槽、拖拽布局盒。保存后会生成新的 LayoutPlan，设计稿按这版对齐。</div>
+                      ) : (
+                        <div className="text-sm text-slate-500 mt-1">
+                          默认只展示和左侧缩略图同一份预览。已有预览 {draftStats.preview}/{draftStats.total} 张，闸门通过 {draftStats.ready} 张，失败 {draftStats.failed} 张，未生成 {draftStats.empty} 张。
+                        </div>
+                      )}
                     </div>
-                    <button onClick={() => setIsDataModalOpen(true)} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"><FileText size={14} className="inline mr-1" />原始数据</button>
+                    <div className="flex flex-wrap gap-2 shrink-0">
+                      {isDraftEditing ? (
+                        <>
+                          <button onClick={() => setIsDraftEditing(false)} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">退出编辑</button>
+                          <button onClick={() => setIsDataModalOpen(true)} className="rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"><FileText size={14} className="inline mr-1" />原始数据</button>
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={!activePage || replay.active}
+                          onClick={() => setIsDraftEditing(true)}
+                          className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-40"
+                        >
+                          <Pencil size={14} className="inline mr-1" />修改策划稿
+                        </button>
+                      )}
+                    </div>
                   </div>
                 ) : null}
                 {surface === 'design' ? (
@@ -951,13 +999,17 @@ export default function Editor({
                   />
                 ) : null}
                 {surface === 'draft' ? (
-                  <DraftCanvas
-                    page={activePage}
-                    readOnly={replay.active}
-                    saving={isSavingScene}
-                    onSave={handleSaveScene}
-                    onOpenRaw={() => setIsDataModalOpen(true)}
-                  />
+                  isDraftEditing ? (
+                    <DraftCanvas
+                      page={activePage}
+                      readOnly={replay.active}
+                      saving={isSavingScene}
+                      onSave={handleSaveScene}
+                      onOpenRaw={() => setIsDataModalOpen(true)}
+                    />
+                  ) : (
+                    <SvgCanvas markup={previewMarkup} placeholder={activePage?.draft_status === 'failed' ? '策划稿生成失败' : activePage?.draft_status === 'running' ? '策划稿生成中' : '策划稿尚未生成'} />
+                  )
                 ) : (
                   <SvgCanvas markup={previewMarkup} placeholder="当前页设计稿尚未生成" />
                 )}

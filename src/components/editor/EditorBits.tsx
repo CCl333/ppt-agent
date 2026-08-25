@@ -419,7 +419,7 @@ export const DataModal: FC<{
               ) : null}
               <div>
                 <div className="font-semibold text-slate-800">策划稿 SVG（排障）</div>
-                <div className="mt-1 text-xs text-slate-500">结构化画布是默认编辑方式。这里只用于开发者/设计师改原始 SVG。</div>
+                <div className="mt-1 text-xs text-slate-500">点「修改策划稿」进入结构化画布。这里只用于开发者/设计师改原始 SVG。</div>
               </div>
               <textarea value={draftSvgDraft} onChange={(event) => onDraftSvgChange(event.target.value)} rows={14} className="w-full rounded-2xl border border-slate-200 px-4 py-3 text-xs font-mono text-slate-700 outline-none resize-none focus:border-blue-500" placeholder="在这里粘贴或修改策划稿 SVG。" />
               <div className="flex justify-end">

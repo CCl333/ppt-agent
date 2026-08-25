@@ -198,15 +198,30 @@ def test_apply_scene_patch_rejects_unknown_node():
     assert exc.value.error_code == "SCENE_NODE_UNKNOWN"
 
 
-def test_apply_scene_patch_rejects_overlong_label():
-    with pytest.raises(ScenePatchError):
-        apply_scene_patch(
-            svg_markup=DRAFT_SVG,
-            content_plan=_content_plan(),
-            visual_plan=_none_visual(),
-            layout_plan=propose_layout_plan(_content_plan()),
-            text_edits=[{"node_id": "block-1-title", "text": "一二三四五六七八九十一二三四五六七八九十超出了"}],
-        )
+def test_apply_scene_patch_allows_overlong_body_like_raw_svg():
+    long_note = "岛上特色：呈田字布局，岛中有湖、园中有园。顺路技巧：游览后可乘船直达花港码头离岛。"
+    result = apply_scene_patch(
+        svg_markup=DRAFT_SVG,
+        content_plan=_content_plan(),
+        visual_plan=_none_visual(),
+        layout_plan=propose_layout_plan(_content_plan()),
+        text_edits=[{"node_id": "block-1-body", "text": long_note}],
+    )
+    assert result["content_plan"]["blocks"][0]["note"] == long_note
+    assert long_note in result["svg_markup"]
+
+
+def test_apply_scene_patch_allows_overlong_label():
+    long_label = "一二三四五六七八九十一二三四五六七八九十超出了"
+    result = apply_scene_patch(
+        svg_markup=DRAFT_SVG,
+        content_plan=_content_plan(),
+        visual_plan=_none_visual(),
+        layout_plan=propose_layout_plan(_content_plan()),
+        text_edits=[{"node_id": "block-1-title", "text": long_label}],
+    )
+    assert result["content_plan"]["blocks"][0]["label"] == long_label
+    assert long_label in result["svg_markup"]
 
 
 def test_apply_scene_patch_rejects_box_outside_safe_area():

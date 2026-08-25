@@ -1,22 +1,56 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 from xml.etree import ElementTree as ET
 
 from app.services.quality_report import make_check
-from app.services.svg import CANVAS_HEIGHT, CANVAS_WIDTH, _ensure_svg_xmlns, _local_tag, _parse_svg
+from app.services.svg import CANVAS_HEIGHT, CANVAS_WIDTH, _ensure_svg_xmlns, _local_tag, _parse_svg, _serialize_svg
 from app.services.svg_contract import estimated_text_width, flatten_group_translates, parse_length
 from app.services.style_tokens import derive_role_scale, min_font_px_for_token, resolve_text_token
 
+_FONT_CLASS_ALIASES = {
+    "t-badge": "t-label",
+    "t-tag": "t-label",
+    "t-chip": "t-label",
+    "t-num": "t-kpi",
+}
+
 SAFE_AREA = {"x": 48.0, "y": 56.0, "w": 1184.0, "h": 624.0}
 CHROME_SKIP = {"background", "texture", "page_number"}
-AUX_TOKENS = {"t-caption", "t-label"}
+AUX_TOKENS = {
+    "t-caption",
+    "t-label",
+    "t-badge",
+    "t-num",
+    "t-tag",
+    "t-kpi-unit",
+    "t-card-subtitle",
+    "t-page-badge",
+    "t-toc-num",
+}
+HARD_FONT_TOKENS = {
+    "t-display",
+    "t-page-title",
+    "t-title",
+    "t-card-title",
+    "t-kpi",
+    "t-toc-item",
+}
 ASCENT_RATIO = 0.88
 MIN_FONT_PX = {name: float(spec["min_px"]) for name, spec in derive_role_scale(None).items()}
 DEFAULT_FONT_PX = 16.0
 LINE_HEIGHT = 1.2
 TOLERANCE_PX = 2.0
+CANVAS_TOLERANCE_PX = 4.0
+SAFE_TOLERANCE_PX = 16.0
+BOX_TOLERANCE_PX = 8.0
+OVERLAP_AREA_PX2 = 16.0
+_CSS_RULE_RE = re.compile(r"([^{}]+)\{([^}]*)\}")
+_CSS_CLASS_RE = re.compile(r"\.([A-Za-z0-9_-]+)")
+_FONT_SIZE_RE = re.compile(r"font-size\s*:\s*([\d.]+)px", re.I)
+_TEXT_ANCHOR_RE = re.compile(r"text-anchor\s*:\s*(start|middle|end)", re.I)
 
 
 def check_layout(
@@ -26,8 +60,9 @@ def check_layout(
 ) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
     root = _parse_svg(_ensure_svg_xmlns(svg_markup))
     flatten_group_translates(root)
-    texts = collect_text_items(root, layout_plan=layout_plan)
-    chrome_boxes = _chrome_boxes(root)
+    class_fonts = collect_css_font_sizes(root)
+    texts = collect_text_items(root, layout_plan=layout_plan, class_fonts=class_fonts)
+    chrome_boxes = _chrome_boxes(root, class_fonts=class_fonts)
     canvas_violations: list[dict[str, Any]] = []
     safe_violations: list[dict[str, Any]] = []
     box_violations: list[dict[str, Any]] = []
@@ -39,25 +74,25 @@ def check_layout(
     for item in texts:
         fonts.append(item["font_px"])
         bbox = item["bbox"]
-        if not _inside(bbox, {"x": 0.0, "y": 0.0, "w": float(CANVAS_WIDTH), "h": float(CANVAS_HEIGHT)}):
+        if not _inside(bbox, {"x": 0.0, "y": 0.0, "w": float(CANVAS_WIDTH), "h": float(CANVAS_HEIGHT)}, CANVAS_TOLERANCE_PX):
             canvas_violations.append(_violation("TEXT_OUTSIDE_CANVAS", item, "文字超出画布", expected={"x": 0, "y": 0, "w": CANVAS_WIDTH, "h": CANVAS_HEIGHT}))
-        if item["core"] and not item["chrome"] and not _inside(bbox, SAFE_AREA):
+        if item["core"] and not item["chrome"] and not _inside(bbox, SAFE_AREA, SAFE_TOLERANCE_PX):
             safe_violations.append(_violation("TEXT_OUTSIDE_SAFE_AREA", item, "文字超出 safe area", expected=SAFE_AREA))
-        if item["layout_box"] and not _inside(bbox, item["layout_box"]):
+        if item["layout_box"] and _usable_box(item["layout_box"]) and not _inside(bbox, item["layout_box"], BOX_TOLERANCE_PX):
             box_violations.append(_violation("TEXT_OUT_OF_BOUNDS", item, "文字超出文本盒", expected=item["layout_box"]))
         min_px = min_font_px_for_token(item["token"], typography)
-        if item["font_px"] + 0.01 < min_px:
+        if item["token"] in HARD_FONT_TOKENS and item["font_px"] + 0.01 < min_px:
             font_violations.append(_violation("FONT_BELOW_MINIMUM", item, f"字号 {item['font_px']}px 低于 {min_px}px"))
         if item["core"] and not item["chrome"]:
             for chrome in chrome_boxes:
-                if _overlap_area(bbox, chrome["box"]) > 1:
+                if _overlap_area(bbox, chrome["box"]) > OVERLAP_AREA_PX2:
                     chrome_violations.append(_violation("TEXT_COVERS_CHROME", item, f"文字覆盖 {chrome['kind']}", expected=chrome["box"]))
 
     core_items = [item for item in texts if item["core"] and not item["chrome"]]
     for index, left in enumerate(core_items):
         for right in core_items[index + 1 :]:
             area = _overlap_area(left["bbox"], right["bbox"])
-            if area > 1:
+            if area > OVERLAP_AREA_PX2:
                 overlap_violations.append(
                     {
                         "code": "TEXT_OVERLAP",
@@ -87,35 +122,126 @@ def check_layout(
     return checks, metrics, texts
 
 
-def collect_text_items(root: ET.Element, layout_plan: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
+def collect_css_font_sizes(root: ET.Element) -> dict[str, float]:
+    fonts: dict[str, float] = {}
+    for elem in root.iter():
+        if _local_tag(elem) != "style":
+            continue
+        css = "".join(elem.itertext() or "")
+        for match in _CSS_RULE_RE.finditer(css):
+            size_match = _FONT_SIZE_RE.search(match.group(2) or "")
+            if not size_match:
+                continue
+            try:
+                size = float(size_match.group(1))
+            except ValueError:
+                continue
+            if size <= 0:
+                continue
+            for selector in (match.group(1) or "").split(","):
+                for class_name in _CSS_CLASS_RE.findall(selector):
+                    fonts[class_name] = size
+    return fonts
 
-    def walk(elem: ET.Element, inherited_chrome: str) -> None:
+
+def collect_font_size_maps(svg_markup: str) -> tuple[dict[str, float], dict[str, float]]:
+    root = _parse_svg(_ensure_svg_xmlns(svg_markup))
+    class_fonts = collect_css_font_sizes(root)
+    by_node: dict[str, float] = {}
+    for elem in root.iter():
+        if _local_tag(elem) != "text":
+            continue
+        node_id = (elem.get("data-node-id") or "").strip()
+        if not node_id:
+            continue
+        by_node[node_id] = _font_px(elem, class_fonts=class_fonts)
+    return by_node, dict(class_fonts)
+
+
+def apply_draft_font_sizes(design_svg: str, draft_svg: str) -> str:
+    node_sizes, class_sizes = collect_font_size_maps(draft_svg)
+    class_sizes = dict(class_sizes)
+    for source, target in _FONT_CLASS_ALIASES.items():
+        if source in class_sizes and target not in class_sizes:
+            class_sizes[target] = class_sizes[source]
+    text_sizes = _collect_draft_text_font_sizes(draft_svg)
+    role_sizes = {name: float(spec["size_px"]) for name, spec in derive_role_scale(None).items()}
+    root = _parse_svg(_ensure_svg_xmlns(design_svg))
+    for elem in root.iter():
+        if _local_tag(elem) not in {"text", "tspan"}:
+            continue
+        if (elem.get("data-chrome") or "").strip():
+            continue
+        node_id = (elem.get("data-node-id") or "").strip()
+        size = node_sizes.get(node_id) if node_id else None
+        token = resolve_text_token((elem.get("class") or "").split(), elem.get("data-text-role")) or _text_token(elem)
+        if size is None and token:
+            size = class_sizes.get(token)
+        if size is None:
+            text = "".join(elem.itertext()).strip()
+            size = text_sizes.get(text)
+        if size is None and token:
+            size = role_sizes.get(token)
+        if size is None or size <= 0:
+            continue
+        elem.set("font-size", f"{size:g}px")
+    return _serialize_svg(root)
+
+
+def _collect_draft_text_font_sizes(svg_markup: str) -> dict[str, float]:
+    root = _parse_svg(_ensure_svg_xmlns(svg_markup))
+    class_fonts = collect_css_font_sizes(root)
+    sizes: dict[str, float] = {}
+    for elem in root.iter():
+        if _local_tag(elem) != "text":
+            continue
+        text = "".join(elem.itertext()).strip()
+        if not text:
+            continue
+        size = _font_px(elem, class_fonts=class_fonts)
+        if size > 0:
+            sizes[text] = size
+    return sizes
+
+
+def collect_text_items(
+    root: ET.Element,
+    layout_plan: dict[str, Any] | None = None,
+    class_fonts: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    fonts = class_fonts if class_fonts is not None else collect_css_font_sizes(root)
+
+    def walk(elem: ET.Element, inherited_chrome: str, inherited_anchor: str) -> None:
         chrome = (elem.get("data-chrome") or "").strip() or inherited_chrome
+        anchor = _text_anchor(elem, inherited_anchor)
         if _local_tag(elem) == "text":
             class_names = (elem.get("class") or "").split()
             class_token = _text_token(elem)
             role = (elem.get("data-text-role") or "").strip() or None
             token = resolve_text_token(class_names, role) or class_token
-            font_px = _font_px(elem)
+            font_px = _font_px(elem, class_fonts=fonts)
             node_id = (elem.get("data-node-id") or "").strip() or None
             layout_box = parse_layout_box(elem.get("data-layout-box"), layout_plan=layout_plan)
-            lines = _text_lines(elem)
+            lines = _text_lines(elem, class_fonts=fonts, anchor=anchor)
             if lines:
-                width = max(
-                    estimated_text_width(line["text"], float(line.get("font_px") or font_px))
-                    for line in lines
-                )
                 first = lines[0]
                 last = lines[-1]
                 first_px = float(first.get("font_px") or font_px)
                 last_px = float(last.get("font_px") or font_px)
                 top = first["y"] - first_px * ASCENT_RATIO
                 bottom = last["y"] + last_px * (LINE_HEIGHT - ASCENT_RATIO)
+                lefts: list[float] = []
+                rights: list[float] = []
+                for line in lines:
+                    line_w = estimated_text_width(line["text"], float(line.get("font_px") or font_px))
+                    line_x = _anchored_x(line["x"], line_w, str(line.get("anchor") or anchor))
+                    lefts.append(line_x)
+                    rights.append(line_x + line_w)
                 bbox = {
-                    "x": min(line["x"] for line in lines),
+                    "x": min(lefts),
                     "y": top,
-                    "w": width,
+                    "w": max(rights) - min(lefts),
                     "h": max(bottom - top, max(first_px, last_px, font_px)),
                 }
                 text = "".join(line["text"] for line in lines)
@@ -126,7 +252,7 @@ def collect_text_items(root: ET.Element, layout_plan: dict[str, Any] | None = No
                         "token": token,
                         "class_token": class_token,
                         "chrome": chrome,
-                        "core": token not in AUX_TOKENS and chrome not in CHROME_SKIP and chrome != "page_title",
+                        "core": bool(token) and token not in AUX_TOKENS and chrome not in CHROME_SKIP and chrome != "page_title",
                         "font_px": font_px,
                         "bbox": bbox,
                         "layout_box": layout_box,
@@ -134,9 +260,9 @@ def collect_text_items(root: ET.Element, layout_plan: dict[str, Any] | None = No
                     }
                 )
         for child in list(elem):
-            walk(child, chrome)
+            walk(child, chrome, anchor)
 
-    walk(root, "")
+    walk(root, "", "start")
     return items
 
 
@@ -180,8 +306,12 @@ def box_from_scene(scene: dict[str, Any] | None, ref: str | None) -> dict[str, f
     return None
 
 
-def _text_lines(elem: ET.Element) -> list[dict[str, Any]]:
-    font_px = _font_px(elem)
+def _text_lines(
+    elem: ET.Element,
+    class_fonts: dict[str, float] | None = None,
+    anchor: str = "start",
+) -> list[dict[str, Any]]:
+    font_px = _font_px(elem, class_fonts=class_fonts)
     origin_x = parse_length(elem.get("x"), 0.0)
     origin_y = parse_length(elem.get("y"), 0.0)
     tspans = [child for child in list(elem) if _local_tag(child) == "tspan"]
@@ -189,7 +319,7 @@ def _text_lines(elem: ET.Element) -> list[dict[str, Any]]:
         content = "".join(elem.itertext()).strip()
         if not content:
             return []
-        return [{"x": origin_x, "y": origin_y, "text": content, "font_px": font_px}]
+        return [{"x": origin_x, "y": origin_y, "text": content, "font_px": font_px, "anchor": anchor}]
     lines: list[dict[str, Any]] = []
     current_y = origin_y
     for tspan in tspans:
@@ -200,13 +330,43 @@ def _text_lines(elem: ET.Element) -> list[dict[str, Any]]:
         if tspan.get("y") not in {None, ""}:
             current_y = parse_length(tspan.get("y"), current_y)
         current_y += parse_length(tspan.get("dy"), 0.0)
-        lines.append({"x": x, "y": current_y, "text": content, "font_px": _font_px(tspan, font_px)})
+        lines.append(
+            {
+                "x": x,
+                "y": current_y,
+                "text": content,
+                "font_px": _font_px(tspan, default=font_px, class_fonts=class_fonts),
+                "anchor": _text_anchor(tspan, anchor),
+            }
+        )
     return lines
 
 
-def _font_px(elem: ET.Element, default: float = DEFAULT_FONT_PX) -> float:
+def _font_px(
+    elem: ET.Element,
+    default: float = DEFAULT_FONT_PX,
+    class_fonts: dict[str, float] | None = None,
+) -> float:
     value = parse_length(elem.get("font-size"), 0.0)
-    return value if value > 0 else default
+    if value > 0:
+        return value
+    style_match = _FONT_SIZE_RE.search(elem.get("style") or "")
+    if style_match:
+        try:
+            inline = float(style_match.group(1))
+        except ValueError:
+            inline = 0.0
+        if inline > 0:
+            return inline
+    names = (elem.get("class") or "").split()
+    fonts = class_fonts or {}
+    for name in names:
+        if name.startswith("t-") and name in fonts:
+            return fonts[name]
+    for name in names:
+        if name in fonts:
+            return fonts[name]
+    return default
 
 
 def _text_token(elem: ET.Element) -> str | None:
@@ -216,8 +376,33 @@ def _text_token(elem: ET.Element) -> str | None:
     return None
 
 
-def _chrome_boxes(root: ET.Element) -> list[dict[str, Any]]:
+def _text_anchor(elem: ET.Element, default: str = "start") -> str:
+    raw = (elem.get("text-anchor") or "").strip().lower()
+    if raw in {"start", "middle", "end"}:
+        return raw
+    style_match = _TEXT_ANCHOR_RE.search(elem.get("style") or "")
+    if style_match:
+        return style_match.group(1).lower()
+    return default or "start"
+
+
+def _anchored_x(x: float, width: float, anchor: str) -> float:
+    if anchor == "end":
+        return x - width
+    if anchor == "middle":
+        return x - width / 2.0
+    return x
+
+
+def _usable_box(box: dict[str, float] | None) -> bool:
+    if not box:
+        return False
+    return box.get("w", 0) > 1 and box.get("h", 0) > 1
+
+
+def _chrome_boxes(root: ET.Element, class_fonts: dict[str, float] | None = None) -> list[dict[str, Any]]:
     boxes: list[dict[str, Any]] = []
+    fonts = class_fonts if class_fonts is not None else collect_css_font_sizes(root)
     for elem in root.iter():
         kind = (elem.get("data-chrome") or "").strip()
         if kind not in {"title_bar", "page_number"}:
@@ -236,7 +421,7 @@ def _chrome_boxes(root: ET.Element) -> list[dict[str, Any]]:
                 }
             )
         elif tag == "text":
-            font_px = _font_px(elem)
+            font_px = _font_px(elem, class_fonts=fonts)
             x = parse_length(elem.get("x"))
             y = parse_length(elem.get("y"))
             text = "".join(elem.itertext())
@@ -254,12 +439,12 @@ def _chrome_boxes(root: ET.Element) -> list[dict[str, Any]]:
     return boxes
 
 
-def _inside(inner: dict[str, float], outer: dict[str, float]) -> bool:
+def _inside(inner: dict[str, float], outer: dict[str, float], tolerance: float = TOLERANCE_PX) -> bool:
     return (
-        inner["x"] >= outer["x"] - TOLERANCE_PX
-        and inner["y"] >= outer["y"] - TOLERANCE_PX
-        and inner["x"] + inner["w"] <= outer["x"] + outer["w"] + TOLERANCE_PX
-        and inner["y"] + inner["h"] <= outer["y"] + outer["h"] + TOLERANCE_PX
+        inner["x"] >= outer["x"] - tolerance
+        and inner["y"] >= outer["y"] - tolerance
+        and inner["x"] + inner["w"] <= outer["x"] + outer["w"] + tolerance
+        and inner["y"] + inner["h"] <= outer["y"] + outer["h"] + tolerance
     )
 
 

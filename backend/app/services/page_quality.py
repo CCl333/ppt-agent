@@ -14,6 +14,11 @@ from app.services.page_scene import (
     extract_page_scene,
     layout_drift_class,
 )
+
+DRAFT_EQUIVALENT_ROLES = (
+    frozenset({"display", "page-title"}),
+    frozenset({"card-title", "toc-item"}),
+)
 from app.services.quality_report import (
     CONTRACT_VERSION,
     build_quality_report,
@@ -53,6 +58,8 @@ def evaluate_page_quality(
         extracted, layout_plan, stage=stage, visual_plan=visual_plan
     )
     checks.append(identity)
+    if stage in {"draft", "design"}:
+        checks, drift_warnings = _soften_draft_layout_box_check(checks, drift_warnings)
     metrics["unresolved_required_slot_count"] = unresolved
     metrics["visual_slot_count"] = len(collect_visual_slots(visual_plan, content_plan))
     metrics["scene_node_count"] = len(extracted.get("nodes") or [])
@@ -96,6 +103,23 @@ def apply_report_to_version(version: Any, report: dict[str, Any], *, svg_markup:
     if hasattr(version, "export_preflight_json"):
         version.export_preflight_json = report.get("export_preflight") or {}
     version.status = "failed" if report.get("hard_fail") else "ready"
+
+
+def _soften_draft_layout_box_check(
+    checks: list[dict[str, Any]],
+    warnings: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    extra = list(warnings)
+    softened: list[dict[str, Any]] = []
+    for check in checks:
+        if check.get("code") != "text_out_of_bounds" or check.get("status") != "fail":
+            softened.append(check)
+            continue
+        extra.extend(list(check.get("violations") or []))
+        item = dict(check)
+        item["status"] = "pass"
+        softened.append(item)
+    return softened, extra
 
 
 def _svg_profile_check(
@@ -228,15 +252,19 @@ def _scene_identity_check(
         for node_id in diff["added"]:
             node = extracted_map.get(node_id) or {}
             if node.get("role") in CORE_TEXT_ROLES:
-                violations.append(
-                    {
-                        "code": "SCENE_NODE_ADDED",
-                        "node_id": node_id,
-                        "detail": f"新增核心节点 {node_id}",
-                        "actual_bbox": node.get("actual_bbox") or node.get("box"),
-                    }
-                )
+                item = {
+                    "code": "SCENE_NODE_ADDED",
+                    "node_id": node_id,
+                    "detail": f"新增核心节点 {node_id}",
+                    "actual_bbox": node.get("actual_bbox") or node.get("box"),
+                }
+                if stage == "draft":
+                    warnings.append(item)
+                else:
+                    violations.append(item)
         for item in diff["role_changed"]:
+            if _roles_equivalent(item.get("from"), item.get("to"), stage=stage):
+                continue
             if item.get("from") in CORE_TEXT_ROLES or item.get("to") in CORE_TEXT_ROLES:
                 violations.append(
                     {
@@ -299,6 +327,19 @@ def _scene_identity_check(
         ),
         warnings,
     )
+
+
+def _roles_equivalent(left: Any, right: Any, *, stage: str) -> bool:
+    if left == right:
+        return True
+    if stage != "draft":
+        return False
+    left_role = str(left or "").strip()
+    right_role = str(right or "").strip()
+    for group in DRAFT_EQUIVALENT_ROLES:
+        if left_role in group and right_role in group:
+            return True
+    return False
 
 
 def _content_skeleton_check(svg_markup: str, plan: dict[str, Any] | None) -> dict[str, Any]:

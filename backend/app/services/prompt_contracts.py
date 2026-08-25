@@ -653,8 +653,8 @@ Bento Grid 规则：
 3. 画布必须保持 `viewBox="0 0 1280 720"`。
 4. 颜色只能用输入中给出的 class 令牌，禁止任何字面色值（包括 fill="#..."、stroke="#..."、rgb()、named color、inline style）。
 5. 文本必须带语义字阶 class：`t-display` / `t-page-title` / `t-card-title` / `t-kpi` / `t-kpi-unit` / `t-body` / `t-caption` / `t-label` / `t-table-header` / `t-toc-item`。禁止用 `t-title` 同时当页标题、卡标题、KPI 或目录项。图形必须带 `c-*` 色板 class。核心文本必须带 `data-node-id` 和 `data-text-role`。
-6. 不要设置 font-size / font-family / font-weight / fill / stroke 属性，这些由系统按令牌展开。
-7. 背景色条、顶栏小标题和页码由系统合成。不要画全幅背景矩形，不要引用本地文件路径。内容区从 y=56 到 y=680。系统不会补副标题或 badge，这两项必须留在内容区。
+6. 不要改字号，也不要改 x/y、data-layout-box 或阅读顺序来迁就风格。不要设置 font-size 属性。font-family / font-weight / fill / stroke 由系统按令牌展开；系统会保留 draft 的字号，只换字体风格和颜色。
+7. 系统只合成顶栏色条和页码，不再写入顶栏页标题文字。不要画顶栏小标题，不要画全幅背景矩形，不要引用本地文件路径。页标题只保留内容区那一个。内容区从 y=56 到 y=680。系统不会补副标题或 badge，这两项必须留在内容区。
 8. 只允许这些图元：`<rect>`（可含 rx）/ `<circle>` / `<ellipse>` / `<line>` / `<polygon>` / `<path>`（仅 M L H V Z）/ `<text>` + `<tspan>` / `<image>` / `<g>`。
 9. 禁止 `<filter>` 及任何 fe*、渐变、`<clipPath>` / `<mask>` / `<pattern>` / `<use>` / `<textPath>` / `<foreignObject>`。
 10. `<g>` 只允许 `translate`，禁止 rotate / skew / matrix。
@@ -662,9 +662,11 @@ Bento Grid 规则：
 12. 保留 draft 的卡标题、阅读顺序和主次；不要新增或删除 content_plan.blocks.label 对应的模块；卡片内部短句以 draft 为准，不要改回 content_plan.note，也不要另起一套数字。draft 里已有的 title、subtitle、badge 字符串必须原样保留（含标点、空格、大小写），禁止同义改写或删掉副标题/徽章。
 13. 若 draft 有占位且 page_images 非空，改成 `<image data-image-id>`；已有 image 则保留 id。仍禁止 http/file href。
 14. 这是受限视觉增强，不是整页重排。必须保留 draft/layout_plan 的 `data-node-id`、`data-text-role`、`data-layout-box` 和核心阅读顺序。不要新增或删除核心节点。
+15. 设计稿只换配色、字体家族和字重。字号必须与 draft 一致。
+16. 必须保留 draft 里所有非全幅的卡片/色块矩形（含 CSS 类 card-bg/inner-panel、浅底、色条、KPI 底、徽章底）。卡片底用 `c-surface-alt`（必须看得出浅底），禁止只用接近背景的 `c-surface` 当唯一卡片底。徽章/标签底用 `c-accent-8`。不要改这些 rect 的 x/y/width/height/rx，也不要把文字放进与色块不一致的 translate。t-label/徽章保持 12px 量级，避免文字撑出色块。
 """.strip(),
     "design.svg_generate.user": """
-任务：在 draft SVG 上做视觉增强，不改卡标题、副标题、badge、节点身份和模块结构。
+任务：在 draft SVG 上做视觉增强。只换颜色和字体风格，不改字号、坐标、文案、卡标题、副标题、badge、节点身份和模块结构。保留所有卡片/色块底矩形（含 CSS 浅底），卡片底用能看见的 c-surface-alt，页标题只出现在内容区，不要再画顶栏小标题。
 
 输入数据(JSON)：
 {

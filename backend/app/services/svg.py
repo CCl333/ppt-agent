@@ -82,7 +82,7 @@ def inject_fixed_chrome(
     *,
     tokens: dict[str, dict[str, str]],
     background_path: str | Path | None = None,
-    page_title: str = "",
+    page_title: str = "",  # kept for callers; content title stays in the page body
     page_index: int = 1,
     page_count: int = 1,
     page_role: str = "content",
@@ -115,17 +115,6 @@ def inject_fixed_chrome(
         bar.set("fill", accent.get("fill") or "#111111")
         bar.set("data-chrome", "title_bar")
         layers.append(bar)
-        label = _token_attrs(tokens, "t-label")
-        if page_title.strip():
-            title = ET.Element(f"{{{SVG_NS}}}text")
-            title.set("x", "48")
-            title.set("y", "36")
-            title.text = page_title.strip()
-            title.set("data-chrome", "page_title")
-            title.set("data-text-role", "label")
-            for key, value in label.items():
-                title.set(key, value)
-            layers.append(title)
 
     if page_role != "cover":
         caption = _token_attrs(tokens, "t-caption")
@@ -153,10 +142,12 @@ def prepare_page_svg(
     style_pack: dict | None = None,
     chrome: dict | None = None,
     page_images: list | None = None,
+    draft_svg: str | None = None,
 ) -> str:
+    from app.services.layout_validator import apply_draft_font_sizes
     from app.services.page_images import resolve_image_refs
     from app.services.style_tokens import build_token_map
-    from app.services.svg_contract import expand_token_classes, validate_svg_contract
+    from app.services.svg_contract import expand_token_classes, restore_draft_panel_shapes, validate_svg_contract
 
     svg = extract_and_validate_svg(svg_markup)
     validate_svg_contract(svg, stage=stage, style_pack=style_pack)
@@ -164,7 +155,11 @@ def prepare_page_svg(
     if stage == "design":
         if style_pack is None:
             raise RuntimeError("设计稿缺少 style_pack")
-        svg = expand_token_classes(svg, style_pack)
+        if draft_svg:
+            svg = restore_draft_panel_shapes(svg, draft_svg)
+        svg = expand_token_classes(svg, style_pack, preserve_font_size=bool(draft_svg))
+        if draft_svg:
+            svg = apply_draft_font_sizes(svg, draft_svg)
         svg = apply_cjk_fonts(svg)
         chrome = chrome or {}
         svg = inject_fixed_chrome(

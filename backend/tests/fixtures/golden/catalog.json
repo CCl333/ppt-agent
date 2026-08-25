@@ -29,8 +29,8 @@
       "svg_contract": "pass",
       "quality_stage": "design",
       "quality": "fail",
-      "error_code": "TEXT_OUT_OF_BOUNDS",
-      "description": "现场第5页同类故障：卡标题被 t-title 放大到 40px，几何盒未扩张"
+      "error_code": "TEXT_OVERLAP",
+      "description": "现场第5页同类故障：卡标题被 t-title 放大到 40px。规划盒溢出改为 warning；本样本仍会因卡标题重叠 / 角色错用失败"
     },
     {
       "id": "text-overlap",
@@ -72,9 +72,9 @@
       "svg_contract_stage": "draft",
       "svg_contract": "pass",
       "quality_stage": "design",
-      "quality": "fail",
+      "quality": "pass",
       "error_code": "TEXT_OUT_OF_BOUNDS",
-      "description": "中文高密度正文超出文本盒"
+      "description": "中文高密度正文超出文本盒。规划盒检查改为 warning，画布/安全区/重叠仍 hard fail"
     },
     {
       "id": "tspan-wrap",

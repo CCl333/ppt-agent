@@ -513,12 +513,12 @@ class GenerationService:
                     "style_pack_json": style_pack_for_prompt(style_pack),
                     "background_asset_json": {
                         "composited_by_system": True,
-                        "note": "系统会在 SVG 底层嵌入底色、纹理、标题栏和页码。不要引用本地文件路径，不要再画一层全幅背景，并保证正文不透明、可读。",
+                        "note": "系统会在 SVG 底层嵌入底色、纹理、顶栏色条和页码，不会再写一遍页标题。不要引用本地文件路径，不要再画一层全幅背景，不要在顶栏重复页标题，并保证正文不透明、可读。",
                     }
                     if background_asset_path
                     else {
                         "composited_by_system": True,
-                        "note": "系统会在 SVG 底层嵌入底色、标题栏和页码。不要再画一层全幅背景。",
+                        "note": "系统会在 SVG 底层嵌入底色、顶栏色条和页码，不会再写一遍页标题。不要再画一层全幅背景，不要在顶栏重复页标题。",
                     },
                 },
             ),
@@ -531,6 +531,7 @@ class GenerationService:
             style_pack=style_pack,
             chrome=chrome,
             page_images=page_images,
+            draft_svg=draft_svg,
         )
         assert_svg_matches_plan(prepared, content_plan)
         assert_svg_uses_images(
